@@ -30,8 +30,55 @@ def _generate_request_id():
     return candidate
 
 
+class CatalogCategory(models.Model):
+
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=200, unique=True)
+    description = models.TextField(blank=True, default="")
+    icon = models.CharField(max_length=100, blank=True, default="")
+    image = models.CharField(max_length=500, blank=True, default="")
+    jobs_count_str = models.CharField(max_length=50, blank=True, default="")
+    rating = models.CharField(max_length=10, blank=True, default="4.8")
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=0)
+
+    class Meta:
+        managed = False
+        db_table = "service_requests_catalogcategory"
+        ordering = ["sort_order", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class Service(models.Model):
+    category = models.ForeignKey(
+        CatalogCategory,
+        on_delete=models.CASCADE,
+        related_name="services",
+        db_column="category_id"
+    )
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=200)
+    description = models.TextField(blank=True, default="")
+    icon = models.CharField(max_length=100, blank=True, default="")
+    image = models.CharField(max_length=500, blank=True, default="")
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True, null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True, null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = "service_requests_service"
+        ordering = ["sort_order", "id"]
+
+    def __str__(self):
+        return f"{self.name} ({self.category.name if self.category else 'No Category'})"
+
 
 class ServiceRequest(models.Model):
+
     class Status(models.TextChoices):
         DRAFT                 = "draft",                 "Draft"
         NEW_REQUEST           = "new_request",           "New Request"

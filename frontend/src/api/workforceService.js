@@ -14,14 +14,18 @@ export async function apiWorkforceSignup(payload) {
 }
 
 export async function apiWorkforceLogin(identifier, password) {
+  const trimmed = (identifier || '').trim();
   return await apiRequest('/auth/login/', {
     method: 'POST',
     json: {
-      email: identifier,
+      identifier: trimmed,
+      email: trimmed,
+      username: trimmed,
       password: password,
     },
   });
 }
+
 
 export async function apiFetchMe() {
   return await apiRequest('/auth/me/');

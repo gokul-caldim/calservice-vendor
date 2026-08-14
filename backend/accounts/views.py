@@ -18,24 +18,44 @@ class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        identifier = (request.data.get("username") or request.data.get("email") or "").strip()
-        password = (request.data.get("password") or "").strip()
+        identifier = (
+            request.data.get("identifier")
+            or request.data.get("username")
+            or request.data.get("email")
+            or request.data.get("employee_id")
+            or ""
+        ).strip()
+        password = str(request.data.get("password") or "")
 
         if not identifier or not password:
-            return Response({"error": "Identifier and password required."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Identifier and password required.", "code": "CREDENTIALS_REQUIRED"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        # Look up user by email, username, or mobile
+        # Look up user by email, username, mobile number, or employee ID
         user = User.objects.filter(email__iexact=identifier).first()
         if not user:
             user = User.objects.filter(username__iexact=identifier).first()
         if not user:
             user = User.objects.filter(mobile_number=identifier).first()
+        if not user:
+            emp = Employee.objects.filter(employee_id__iexact=identifier).select_related("user").first()
+            if emp and emp.user:
+                user = emp.user
 
         if not user or not user.check_password(password):
-            return Response({"error": "Invalid credentials. Please verify your email/password."}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response(
+                {"error": "Invalid credentials. Please verify your email/password.", "code": "INVALID_CREDENTIALS"},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
 
         if not user.is_active:
-            return Response({"error": "Account is inactive."}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {"error": "Account is inactive.", "code": "ACCOUNT_INACTIVE"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
 
         refresh = RefreshToken.for_user(user)
         refresh["company_id"] = user.company_id

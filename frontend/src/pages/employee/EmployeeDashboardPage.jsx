@@ -788,8 +788,8 @@ export function EmployeeDashboardPage() {
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {leaves.length > 0 ? (
-                    leaves.map((l) => (
-                      <tr key={l.id} className="hover:bg-slate-50">
+                    leaves.map((l, idx) => (
+                      <tr key={l.id ? `leave-${l.id}` : `leave-idx-${idx}`} className="hover:bg-slate-50">
                         <td className="px-4 py-3 font-semibold text-slate-800">{l.leave_type}</td>
                         <td className="px-4 py-3 text-slate-700">{l.start_date}</td>
                         <td className="px-4 py-3 text-slate-700">{l.end_date}</td>

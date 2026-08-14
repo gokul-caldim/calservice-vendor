@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthProvider.jsx';
-import { Wrench, Smartphone, Mail, Lock, User } from 'lucide-react';
+import { Wrench, Smartphone, Mail, Lock, User, Eye, EyeOff } from 'lucide-react';
 import { ErrorState } from '../../components/enterprise/ErrorState.jsx';
 
 export function SignupPage() {
@@ -17,6 +17,8 @@ export function SignupPage() {
     confirmPassword: '',
   });
 
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [error, setError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -156,15 +158,27 @@ export function SignupPage() {
                 </label>
                 <div className="relative">
                   <input
-                    type="password"
+                    type={showPassword ? 'text' : 'password'}
                     name="password"
                     value={formData.password}
                     onChange={handleChange}
                     placeholder="••••••••"
-                    className="w-full pl-8 pr-2.5 py-1.5"
+                    className="w-full pl-8 pr-7 py-1.5"
                     required
                   />
                   <Lock className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-400" />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-2 top-2 text-slate-400 hover:text-slate-600 focus:outline-none"
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showPassword ? (
+                      <EyeOff className="w-3.5 h-3.5" />
+                    ) : (
+                      <Eye className="w-3.5 h-3.5" />
+                    )}
+                  </button>
                 </div>
               </div>
               <div>
@@ -173,15 +187,27 @@ export function SignupPage() {
                 </label>
                 <div className="relative">
                   <input
-                    type="password"
+                    type={showConfirmPassword ? 'text' : 'password'}
                     name="confirmPassword"
                     value={formData.confirmPassword}
                     onChange={handleChange}
                     placeholder="••••••••"
-                    className="w-full pl-8 pr-2.5 py-1.5"
+                    className="w-full pl-8 pr-7 py-1.5"
                     required
                   />
                   <Lock className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-400" />
+                  <button
+                    type="button"
+                    onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                    className="absolute right-2 top-2 text-slate-400 hover:text-slate-600 focus:outline-none"
+                    aria-label={showConfirmPassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showConfirmPassword ? (
+                      <EyeOff className="w-3.5 h-3.5" />
+                    ) : (
+                      <Eye className="w-3.5 h-3.5" />
+                    )}
+                  </button>
                 </div>
               </div>
             </div>
@@ -194,6 +220,7 @@ export function SignupPage() {
               {isSubmitting ? 'Creating Account...' : 'Create Account & Start Onboarding'}
             </button>
           </form>
+
 
           <div className="pt-3 border-t border-slate-100 text-center">
             <p className="text-xs text-slate-500">

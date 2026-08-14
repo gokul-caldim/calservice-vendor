@@ -84,8 +84,11 @@ export async function apiRequest(path, options = {}) {
     if (response.status === 401) {
       sessionStorage.removeItem('wf_token');
       sessionStorage.removeItem('wf_refresh_token');
+      localStorage.removeItem('wf_token');
+      localStorage.removeItem('wf_refresh_token');
     }
   }
+
 
 
   if (response.status === 204) {

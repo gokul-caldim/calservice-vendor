@@ -84,8 +84,8 @@ export function AdminLeavePage() {
             </thead>
             <tbody className="divide-y divide-slate-100">
               {leaves.length > 0 ? (
-                leaves.map((l) => (
-                  <tr key={l.id} className="hover:bg-slate-50">
+                leaves.map((l, idx) => (
+                  <tr key={`${l.employee_pk || l.employee_id || 'emp'}-${l.id || idx}`} className="hover:bg-slate-50">
                     <td className="px-4 py-3 font-bold text-slate-900">{l.employee_name || `Emp #${l.employee_id}`}</td>
                     <td className="px-4 py-3 text-slate-700">{l.leave_type}</td>
                     <td className="px-4 py-3 font-mono text-slate-700">{l.start_date}</td>

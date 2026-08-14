@@ -15,13 +15,20 @@ export function AuthProvider({ children }) {
   const [employee, setEmployee] = useState(null);
   const inFlightRefreshRef = React.useRef(null);
 
-  const refreshProfile = useCallback(async () => {
-    if (inFlightRefreshRef.current) {
+  const refreshProfile = useCallback(async (force = false) => {
+    if (inFlightRefreshRef.current && !force) {
       return inFlightRefreshRef.current;
     }
 
     inFlightRefreshRef.current = (async () => {
       try {
+        const token = sessionStorage.getItem('wf_token') || localStorage.getItem('wf_token');
+        if (!token) {
+          setUser(null);
+          setEmployee(null);
+          return null;
+        }
+
         const me = await apiFetchMe();
 
         if (me && me.username) {
@@ -64,6 +71,8 @@ export function AuthProvider({ children }) {
         sessionStorage.removeItem('wf_token');
         sessionStorage.removeItem('wf_refresh_token');
         sessionStorage.removeItem('wf_tab_id');
+        localStorage.removeItem('wf_token');
+        localStorage.removeItem('wf_refresh_token');
         setUser(null);
         setEmployee(null);
         return null;
@@ -80,21 +89,34 @@ export function AuthProvider({ children }) {
     if (res) {
       const token = res.access_token || res.token;
       const refresh = res.refresh_token;
-      if (token) sessionStorage.setItem('wf_token', token);
-      if (refresh) sessionStorage.setItem('wf_refresh_token', refresh);
+      if (token) {
+        sessionStorage.setItem('wf_token', token);
+        localStorage.setItem('wf_token', token);
+      }
+      if (refresh) {
+        sessionStorage.setItem('wf_refresh_token', refresh);
+        localStorage.setItem('wf_refresh_token', refresh);
+      }
       const tabId = 'tab_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now();
       sessionStorage.setItem('wf_tab_id', tabId);
     }
-    return await refreshProfile();
+    return await refreshProfile(true);
   }, [refreshProfile]);
+
 
   const signup = useCallback(async (payload) => {
     const res = await apiWorkforceSignup(payload);
     if (res) {
       const token = res.access_token || res.token;
       const refresh = res.refresh_token;
-      if (token) sessionStorage.setItem('wf_token', token);
-      if (refresh) sessionStorage.setItem('wf_refresh_token', refresh);
+      if (token) {
+        sessionStorage.setItem('wf_token', token);
+        localStorage.setItem('wf_token', token);
+      }
+      if (refresh) {
+        sessionStorage.setItem('wf_refresh_token', refresh);
+        localStorage.setItem('wf_refresh_token', refresh);
+      }
       const tabId = 'tab_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now();
       sessionStorage.setItem('wf_tab_id', tabId);
     }
@@ -106,6 +128,8 @@ export function AuthProvider({ children }) {
     sessionStorage.removeItem('wf_token');
     sessionStorage.removeItem('wf_refresh_token');
     sessionStorage.removeItem('wf_tab_id');
+    localStorage.removeItem('wf_token');
+    localStorage.removeItem('wf_refresh_token');
     if (typeof BroadcastChannel !== 'undefined') {
       try {
         const channel = new BroadcastChannel('wf_tab_channel');
@@ -119,6 +143,7 @@ export function AuthProvider({ children }) {
     setUser(null);
     setEmployee(null);
   }, []);
+
 
   const togglePresence = useCallback(async (desiredOnlineState = null) => {
     try {

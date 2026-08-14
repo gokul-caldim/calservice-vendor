@@ -9,8 +9,10 @@ from django.conf import settings
 
 from django.contrib.auth import get_user_model
 from django.core.files.storage import default_storage
-from django.db import transaction
+from django.db import models, transaction
 from django.db.models import Q
+
+
 from django.utils import timezone
 from rest_framework import permissions, status
 from rest_framework.exceptions import ValidationError
@@ -77,53 +79,8 @@ from django.http import StreamingHttpResponse, JsonResponse, HttpResponse
 
 User = get_user_model()
 
-# Curated catalog categories and services for technician onboarding & dispatch
-WORKFORCE_SERVICE_CATALOG = [
-    {
-        "id": 1,
-        "name": "HVAC & Air Conditioning",
-        "icon": "Wrench",
-        "services": [
-            {"id": 101, "name": "AC Regular Servicing & Jet Clean", "price": 599.00, "duration": 45},
-            {"id": 102, "name": "AC Deep Cleaning & Anti-Bacterial Foam", "price": 899.00, "duration": 60},
-            {"id": 103, "name": "AC Repair & Gas Refill", "price": 1499.00, "duration": 90},
-            {"id": 104, "name": "AC Installation & Copper Piping", "price": 1299.00, "duration": 120},
-        ],
-    },
-    {
-        "id": 2,
-        "name": "Electrical & Wiring",
-        "icon": "Zap",
-        "services": [
-            {"id": 201, "name": "Switchboard Repair & Installation", "price": 199.00, "duration": 30},
-            {"id": 202, "name": "Ceiling Fan Installation & Repair", "price": 249.00, "duration": 30},
-            {"id": 203, "name": "Complete Home Wiring Inspection", "price": 799.00, "duration": 90},
-            {"id": 204, "name": "Inverter & Battery Setup", "price": 499.00, "duration": 60},
-        ],
-    },
-    {
-        "id": 3,
-        "name": "Plumbing & Sanitation",
-        "icon": "Droplet",
-        "services": [
-            {"id": 301, "name": "Water Tap & Mixer Repair", "price": 149.00, "duration": 30},
-            {"id": 302, "name": "Toilet Flush & Commode Installation", "price": 499.00, "duration": 60},
-            {"id": 303, "name": "Drainage Pipe Blockage Removal", "price": 399.00, "duration": 45},
-            {"id": 304, "name": "Water Tank Cleaning & Sanitization", "price": 999.00, "duration": 90},
-        ],
-    },
-    {
-        "id": 4,
-        "name": "Home Appliance Repair",
-        "icon": "Tv",
-        "services": [
-            {"id": 401, "name": "Washing Machine Diagnostic & Repair", "price": 499.00, "duration": 60},
-            {"id": 402, "name": "Refrigerator Gas Charging & Repair", "price": 899.00, "duration": 75},
-            {"id": 403, "name": "Microwave Oven Repair", "price": 399.00, "duration": 45},
-            {"id": 404, "name": "Water Purifier / RO Service & Filter Change", "price": 449.00, "duration": 45},
-        ],
-    },
-]
+# ─── Tenant Isolation Helper ──────────────────────────────────────────────────
+
 
 
 def get_request_company(request):
@@ -412,30 +369,42 @@ class WorkforceCatalogListView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        try:
-            db_services = WorkforceServiceCatalog.objects.filter(is_active=True)
-            if db_services.exists():
-                categories_map = {}
-                for item in db_services:
-                    cat_name = item.category
-                    if cat_name not in categories_map:
-                        categories_map[cat_name] = {
-                            "id": len(categories_map) + 1,
-                            "name": cat_name,
-                            "icon": "Wrench",
-                            "services": []
-                        }
-                    categories_map[cat_name]["services"].append({
-                        "id": item.id,
-                        "name": item.name,
-                        "price": float(item.price),
-                        "duration": item.duration_minutes,
-                    })
-                return Response(list(categories_map.values()), status=status.HTTP_200_OK)
-        except Exception:
-            pass
+        """
+        Returns the single source of truth database service catalog from PostgreSQL (shared with Customer app).
+        Strictly reads from database tables (CatalogCategory & Service) with zero hardcoding or mock fallbacks.
+        """
+        from service_requests.models import CatalogCategory, Service
 
-        return Response(WORKFORCE_SERVICE_CATALOG, status=status.HTTP_200_OK)
+        categories = CatalogCategory.objects.filter(is_active=True).prefetch_related(
+            models.Prefetch("services", queryset=Service.objects.filter(is_active=True).order_by("sort_order", "id"))
+        ).order_by("sort_order", "id")
+
+        catalog_data = []
+        for cat in categories:
+            cat_services = []
+            for svc in cat.services.all():
+                cat_services.append({
+                    "id": svc.id,
+                    "name": svc.name,
+                    "slug": svc.slug,
+                    "description": svc.description or "",
+                    "icon": svc.icon or cat.icon or "Wrench",
+                    "category_id": cat.id,
+                    "category_name": cat.name,
+                })
+
+            if cat_services:
+                catalog_data.append({
+                    "id": cat.id,
+                    "name": cat.name,
+                    "slug": cat.slug,
+                    "description": cat.description or "",
+                    "icon": cat.icon or "Wrench",
+                    "services": cat_services,
+                })
+
+        return Response(catalog_data, status=status.HTTP_200_OK)
+
 
 
 # ─── 6. Admin Verification Queue & Dossier Review ─────────────────────────────
@@ -527,24 +496,14 @@ class WorkforceEmployeeServiceRequestView(APIView):
         if not service_id:
             return Response({"error": "service_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Validate against catalog
-        catalog_entry = None
-        for cat in WORKFORCE_SERVICE_CATALOG:
-            for s in cat.get("services", []):
-                if str(s["id"]) == str(service_id):
-                    catalog_entry = s
-                    break
-            if catalog_entry:
-                break
+        # Validate against database catalog
+        from service_requests.models import Service
+        db_service = Service.objects.filter(pk=service_id, is_active=True).select_related("category").first()
+        if not db_service:
+            return Response({"error": f"Invalid service_id '{service_id}'. Not found in database catalog."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not catalog_entry:
-            db_entry = WorkforceServiceCatalog.objects.filter(pk=service_id).first()
-            if db_entry:
-                catalog_entry = {"id": db_entry.id, "name": db_entry.name}
-            else:
-                return Response({"error": f"Invalid service_id '{service_id}'. Not found in catalog."}, status=status.HTTP_400_BAD_REQUEST)
-
-        final_name = catalog_entry.get("name") or service_name
+        final_name = db_service.name
+        cat_name = db_service.category.name if db_service.category else "General"
 
         bank_details = emp.bank_details or {}
         onboarding = bank_details.get("onboarding", {})
@@ -559,12 +518,14 @@ class WorkforceEmployeeServiceRequestView(APIView):
             existing["status"] = "pending"
             existing["request_type"] = "add"
             existing["name"] = final_name
+            existing["category_name"] = cat_name
             existing["requested_at"] = timezone.now().isoformat()
             existing["rejection_reason"] = ""
         else:
             services.append({
                 "id": int(service_id),
                 "name": final_name,
+                "category_name": cat_name,
                 "status": "pending",
                 "request_type": "add",
                 "requested_at": timezone.now().isoformat(),
@@ -575,6 +536,7 @@ class WorkforceEmployeeServiceRequestView(APIView):
         bank_details["onboarding"] = onboarding
         emp.bank_details = bank_details
         emp.save()
+
 
         return Response({
             "message": f"Service authorization request for '{final_name}' submitted to Admin for review.",
