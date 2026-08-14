@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useLocation } from 'react-router-dom';
 import { useAuth } from '../../context/AuthProvider.jsx';
 import {
@@ -29,7 +29,9 @@ import {
   apiRequestService,
   apiRemoveService,
 } from '../../api/workforceService.js';
+import { apiClockIn } from '../../api/clockInApi.js';
 import { ClockInCard } from '../../components/employee/ClockInCard.jsx';
+
 import { AppShell } from '../../components/common/AppShell.jsx';
 import { StatusBadge } from '../../components/enterprise/StatusBadge.jsx';
 import { Modal } from '../../components/enterprise/Modal.jsx';
@@ -80,6 +82,28 @@ export function EmployeeDashboardPage() {
   const [complianceRecords, setComplianceRecords] = useState([]);
   const [skills, setSkills] = useState([]);
 
+  const isOnline = Boolean(user?.isOnline || employee?.is_online);
+  const isClockedIn = Boolean(timeTracking?.is_clocked_in);
+  const isBreak = timeTracking?.shift_status === 'on_break';
+
+  // ── Live GPS Tracking ────────────────────────────────────────────────────────
+  // Start tracking when employee is ONLINE, stop when OFFLINE.
+  // Pushes real browser GPS to /workforce/presence/location/ (User.last_known_location).
+  // No mock coordinates. Errors are silent — GPS denial does not block the dashboard.
+  const handleGPSPosition = useCallback(
+    async ({ latitude, longitude, accuracy }) => {
+      try {
+        await apiUpdateLocationFull(latitude, longitude, accuracy);
+      } catch (_) {
+        // Silent — GPS update failure should not disrupt the employee dashboard UI
+      }
+    },
+    [],
+  );
+
+  useLocationTracker(isOnline, handleGPSPosition);
+  // ────────────────────────────────────────────────────────────────────────────
+
   const [isLoading, setIsLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(null);
   const [error, setError] = useState('');
@@ -98,6 +122,7 @@ export function EmployeeDashboardPage() {
     is_complete: false,
   });
   const [otpInput, setOtpInput] = useState('');
+
 
   useEffect(() => {
     if (selectedJob?.id) {
@@ -171,7 +196,43 @@ export function EmployeeDashboardPage() {
     }
   };
 
+  const handleDirectJobClockIn = () => {
+    if (!selectedJob) return;
+    if (!navigator.geolocation) {
+      setError('Browser Geolocation is not supported by your browser.');
+      return;
+    }
+    setActionLoading(selectedJob.id);
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        try {
+          const res = await apiClockIn({
+            lat: pos.coords.latitude,
+            lon: pos.coords.longitude,
+            accuracy: pos.coords.accuracy,
+            timestamp: pos.timestamp || Date.now(),
+            address: selectedJob.address || 'GPS Verified Customer Location',
+          });
+          setSuccessMsg(res.message || 'Clocked in successfully! Job is now IN PROGRESS.');
+          await loadDashboard();
+          setSelectedJob((prev) => (prev ? { ...prev, status: 'in_progress' } : null));
+          setTimeout(() => setSuccessMsg(''), 4000);
+        } catch (err) {
+          setError(err.message || 'Clock-in failed');
+        } finally {
+          setActionLoading(null);
+        }
+      },
+      (err) => {
+        setActionLoading(null);
+        setError(`Location Error: ${err.message || 'GPS location denied or unavailable'}`);
+      },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
+    );
+  };
+
   // Modals
+
   const [proofModalJob, setProofModalJob] = useState(null);
   const [beforeFile, setBeforeFile] = useState(null);
   const [afterFile, setAfterFile] = useState(null);
@@ -231,6 +292,42 @@ export function EmployeeDashboardPage() {
     loadDashboard();
   }, []);
 
+  // Request browser notification permission when employee is online
+  useEffect(() => {
+    if (isOnline && typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission().catch(() => {});
+    }
+  }, [isOnline]);
+
+  // Silent background job queue polling when technician is ONLINE
+  useEffect(() => {
+    if (!isOnline) return;
+    const interval = setInterval(async () => {
+      try {
+        const jobsData = await apiGetWorkforceJobs().catch(() => null);
+        if (jobsData) {
+          setJobs(jobsData);
+          // If a new offer is available, auto-focus it in the workspace
+          const offeredJob = jobsData.find((j) => j.offer_status === 'OFFERED');
+          if (offeredJob) {
+            setSelectedJob((prev) => (!prev || prev.offer_status !== 'OFFERED' ? offeredJob : prev));
+            if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+              try {
+                new Notification('⚡ New Job Offer Available!', {
+                  body: `Job #${offeredJob.request_id || offeredJob.id}: ${offeredJob.issue_title || offeredJob.service_category}. Accept within 5 minutes.`,
+                  icon: '/favicon.ico',
+                });
+              } catch (_) {}
+            }
+          }
+        }
+      } catch (_) {}
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [isOnline]);
+
+
+
   // Fetch module specific data depending on active path
   useEffect(() => {
     if (pathname.includes('/schedule')) {
@@ -280,27 +377,6 @@ export function EmployeeDashboardPage() {
     }
   };
 
-  const isOnline = Boolean(user?.isOnline || employee?.is_online);
-  const isClockedIn = Boolean(timeTracking?.is_clocked_in);
-  const isBreak = timeTracking?.shift_status === 'on_break';
-
-  // ── Live GPS Tracking ────────────────────────────────────────────────────────
-  // Start tracking when employee is ONLINE, stop when OFFLINE.
-  // Pushes real browser GPS to /workforce/presence/location/ (User.last_known_location).
-  // No mock coordinates. Errors are silent — GPS denial does not block the dashboard.
-  const handleGPSPosition = React.useCallback(
-    async ({ latitude, longitude, accuracy }) => {
-      try {
-        await apiUpdateLocationFull(latitude, longitude, accuracy);
-      } catch (_) {
-        // Silent — GPS update failure should not disrupt the employee dashboard UI
-      }
-    },
-    [],
-  );
-
-  useLocationTracker(isOnline, handleGPSPosition);
-  // ────────────────────────────────────────────────────────────────────────────
 
   const handleToggleOnline = async () => {
     try {
@@ -1203,20 +1279,31 @@ export function EmployeeDashboardPage() {
                             <span>Email: <a href={`mailto:${selectedJob.email}`} className="text-blue-600 hover:underline">{selectedJob.email}</a></span>
                           </p>
                         )}
-                        <p className="flex items-center gap-2">
-                          <MapPin className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                          <span>Address: <strong className="text-slate-800">{selectedJob.address}</strong></span>
+                        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2 pt-1 border-t border-slate-200/80">
+                          <div className="flex items-start gap-2">
+                            <MapPin className="w-3.5 h-3.5 text-blue-600 shrink-0 mt-0.5" />
+                            <div>
+                              <span className="text-slate-500">Customer Location:</span>{' '}
+                              <strong className="text-slate-800">{selectedJob.address}</strong>
+                              {selectedJob.latitude != null && selectedJob.longitude != null && (
+                                <p className="text-[10px] text-slate-500 font-mono mt-0.5">
+                                  Coordinates: {Number(selectedJob.latitude).toFixed(6)}, {Number(selectedJob.longitude).toFixed(6)}
+                                </p>
+                              )}
+                            </div>
+                          </div>
                           {selectedJob.latitude != null && selectedJob.longitude != null && (
                             <a
-                              href={`https://www.google.com/maps/search/?api=1&query=${selectedJob.latitude},${selectedJob.longitude}`}
+                              href={`https://www.google.com/maps/dir/?api=1&destination=${selectedJob.latitude},${selectedJob.longitude}`}
                               target="_blank"
                               rel="noreferrer"
-                              className="ml-auto text-[10px] bg-blue-100 text-blue-700 hover:bg-blue-200 px-1.5 py-0.5 rounded font-semibold"
+                              className="shrink-0 text-[11px] bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-1 rounded font-bold transition-colors inline-flex items-center gap-1 shadow-sm"
                             >
-                              Open Map ↗
+                              <span>Navigate ↗</span>
                             </a>
                           )}
-                        </p>
+                        </div>
+
                         <p className="flex items-center gap-2">
                           <Calendar className="w-3.5 h-3.5 text-slate-500 shrink-0" />
                           <span>Schedule: <strong className="text-slate-800">
@@ -1267,16 +1354,27 @@ export function EmployeeDashboardPage() {
                           Action Steps
                         </h3>
                         <div className="flex flex-wrap gap-2">
-                          {selectedJob.status === 'assigned' && (
-                            <button
-                              type="button"
-                              disabled={actionLoading === selectedJob.id}
-                              onClick={() => handleJobAction(selectedJob.id, 'accepted')}
-                              className="px-3.5 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs shadow-sm transition-colors"
-                            >
-                              Accept Job
-                            </button>
+                          {(selectedJob.status === 'assigned' || selectedJob.active_offer?.status === 'OFFERED' || selectedJob.status === 'job_offered') && (
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={actionLoading === selectedJob.id}
+                                onClick={() => handleAcceptOffer(selectedJob.id)}
+                                className="px-4 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm transition-colors"
+                              >
+                                {actionLoading === selectedJob.id ? 'Accepting...' : 'Accept Job Offer'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={actionLoading === selectedJob.id}
+                                onClick={() => handleRejectOffer(selectedJob.id)}
+                                className="px-3 py-1.5 rounded border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold text-xs transition-colors"
+                              >
+                                Decline
+                              </button>
+                            </div>
                           )}
+
 
                           {(selectedJob.status === 'accepted' || selectedJob.status === 'on_the_way' || selectedJob.status === 'arrived') && (
                             <div className="w-full space-y-3.5 border border-slate-200 rounded-lg p-3.5 bg-slate-50/50 mt-1">
@@ -1432,23 +1530,34 @@ export function EmployeeDashboardPage() {
 
                               {/* Service Gate Banner */}
                               {preServiceState.is_complete ? (
-                                <div className="p-3 bg-emerald-50 border border-emerald-200 rounded text-emerald-900 flex items-center justify-between">
+                                <div className="p-3 bg-emerald-50 border border-emerald-200 rounded text-emerald-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                                   <div>
                                     <h4 className="text-xs font-bold text-emerald-800 flex items-center gap-1.5">
                                       <CheckCircle2 className="w-4 h-4 text-emerald-600" />
                                       Pre-Service Verification Complete!
                                     </h4>
                                     <p className="text-[10px] text-emerald-700 mt-0.5">
-                                      Use the top <strong>ClockInCard</strong> to start service shift and record time.
+                                      All arrival, OTP, and evidence verified. Click below to verify fresh GPS and clock in.
                                     </p>
                                   </div>
+                                  <button
+                                    type="button"
+                                    onClick={handleDirectJobClockIn}
+                                    disabled={actionLoading === selectedJob.id}
+                                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs shadow transition-colors flex items-center gap-1.5 shrink-0 justify-center"
+                                  >
+                                    <Play className="w-3.5 h-3.5" />
+                                    <span>{actionLoading === selectedJob.id ? 'Verifying GPS & Clocking In...' : 'CLOCK IN & START WORK'}</span>
+                                  </button>
                                 </div>
                               ) : (
-                                <div className="p-2 bg-amber-50 border border-amber-200 rounded text-amber-900 text-[11px] font-medium">
-                                  Clock-In is locked until all 4 verification items and GPS arrival are completed.
+                                <div className="p-2.5 bg-amber-50 border border-amber-200 rounded text-amber-900 text-[11px] font-medium flex items-center gap-2">
+                                  <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
+                                  <span>Clock-In is locked: Complete GPS arrival verification, Customer OTP, and mandatory photo evidence above.</span>
                                 </div>
                               )}
                             </div>
+
                           )}
 
                           {/* Active Scope Extensions Subsystem */}

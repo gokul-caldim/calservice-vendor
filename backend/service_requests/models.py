@@ -22,14 +22,13 @@ SERVICE_CATEGORIES = [
 
 def _generate_request_id():
     last = ServiceRequest.objects.order_by("-id").first()
-    if last and last.request_id:
-        try:
-            num = int(last.request_id.split("-")[1]) + 1
-        except (IndexError, ValueError):
-            num = 1
-    else:
-        num = 1
-    return f"SR-{str(num).zfill(4)}"
+    num = (last.id + 1) if last and last.id else 1
+    candidate = f"SR-{str(num).zfill(4)}"
+    while ServiceRequest.objects.filter(request_id=candidate).exists():
+        num += 1
+        candidate = f"SR-{str(num).zfill(4)}"
+    return candidate
+
 
 
 class ServiceRequest(models.Model):
@@ -133,30 +132,8 @@ class ServiceRequest(models.Model):
         db_table = "service_requests_servicerequest"
         ordering = ["-created_at"]
 
-
-class EmployeeJob(models.Model):
-    service_request = models.ForeignKey(
-        ServiceRequest,
-        on_delete=models.CASCADE,
-        related_name="employee_jobs",
-        db_column="service_request_id"
-    )
-    employee = models.ForeignKey(
-        "employees.Employee",
-        on_delete=models.CASCADE,
-        related_name="employee_jobs",
-        db_column="employee_id"
-    )
-    status = models.CharField(max_length=50, default="ASSIGNED")
-    assigned_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        managed = False
-        db_table = "service_requests_employeejob"
-
     def __str__(self):
-        return f"EmployeeJob SR-{self.service_request_id} -> Emp {self.employee_id} ({self.status})"
+        return f"{self.request_id or f'SR #{self.pk}'} - {self.issue_title} ({self.status})"
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
@@ -170,6 +147,8 @@ class EmployeeJob(models.Model):
                 run_automatic_dispatch(self)
             except Exception:
                 pass
+
+
 
     def is_ready_to_complete(self):
         """
@@ -210,7 +189,7 @@ class EmployeeJob(models.Model):
                 f"Work extension #{ext.id} ('{ext.title}') is still in '{ext.status}' state."
             )
 
-        # 3. Check specialist secondary jobs linked via cart_data or foreign keys
+        # 3. Check specialist secondary jobs linked via cart_data or extension foreign keys
         cart_data = self.cart_data or []
         for item in cart_data:
             if item.get("type") == "specialist_job" and item.get("job_id"):
@@ -220,9 +199,54 @@ class EmployeeJob(models.Model):
                         f"Secondary specialist job #{s_job.id} is still in '{s_job.status}' state."
                     )
 
+        for ext in WorkforceWorkExtension.objects.filter(job=self, specialist_job__isnull=False):
+            if ext.specialist_job and ext.specialist_job.status not in ["completed", "cancelled"]:
+                msg = f"Secondary specialist job #{ext.specialist_job.id} (Extension #{ext.id}) is still in '{ext.specialist_job.status}' state."
+                if msg not in pending_dependencies:
+                    pending_dependencies.append(msg)
+
         is_ready = len(pending_dependencies) == 0
         reason = "Ready for completion." if is_ready else f"Cannot complete ServiceRequest: {'; '.join(pending_dependencies)}"
         return is_ready, reason, pending_dependencies
 
+
+
+class EmployeeJob(models.Model):
+    service_request = models.ForeignKey(
+        ServiceRequest,
+        on_delete=models.CASCADE,
+        related_name="employee_jobs",
+        db_column="service_request_id"
+    )
+    employee = models.ForeignKey(
+        "employees.Employee",
+        on_delete=models.CASCADE,
+        related_name="employee_jobs",
+        db_column="employee_id"
+    )
+    status = models.CharField(max_length=50, default="ASSIGNED")
+    notes = models.TextField(blank=True, default="")
+    assigned_date = models.DateTimeField(auto_now_add=True, null=True, blank=True)
+    accepted_date = models.DateTimeField(null=True, blank=True)
+    started_date = models.DateTimeField(null=True, blank=True)
+    completed_date = models.DateTimeField(null=True, blank=True)
+    is_primary = models.BooleanField(default=True)
+    assigned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="assigned_employee_jobs",
+        db_column="assigned_by_id"
+    )
+
+    uncompletion_reason = models.TextField(blank=True, default="")
+    source_work_extension_id = models.BigIntegerField(null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = "service_requests_employeejob"
+
     def __str__(self):
-        return f"{self.request_id or f'SR #{self.pk}'} - {self.issue_title} ({self.status})"
+        return f"EmployeeJob SR-{self.service_request_id} -> Emp {self.employee_id} ({self.status})"
+
+

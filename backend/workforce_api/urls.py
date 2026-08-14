@@ -172,6 +172,8 @@ urlpatterns = [
 
     # Shift Attendance & Geofenced Time Tracking (Phase 18)
     path("time-tracking/", include("time_tracking.urls")),
+    path("time/", include("time_tracking.urls")),
+
 
     # Leave Management (Phase 19)
     path("leaves/", WorkforceLeaveListView.as_view(), name="workforce-leaves"),

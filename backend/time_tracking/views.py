@@ -7,6 +7,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.decorators import action
 
+from accounts.permissions import is_admin_role
 from workforce_api.permissions import IsApprovedTechnician, IsWorkforceAdmin
 from .models import TimeLog, Break, Location, JobSite, LocationZone, EmployeeLocation, TimeLogPhoto
 from .serializers import (
@@ -17,32 +18,68 @@ from .geo import evaluate
 from .utils import generate_shift_summary_pdf
 
 
+class IsWorkforceAdminOrReadOnly(permissions.BasePermission):
+    """
+    Allows authenticated users read-only access to company locations.
+    Write operations (create, update, delete) strictly require Admin authorization.
+    """
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return is_admin_role(request.user)
+
+
+
+
+
 class LocationViewSet(viewsets.ModelViewSet):
     queryset = Location.objects.all()
     serializer_class = LocationSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsWorkforceAdminOrReadOnly]
+
+    def _get_company(self):
+        user = self.request.user
+        emp = getattr(user, "employee_profile", None)
+        return emp.company if emp else getattr(user, "company", None)
 
     def get_queryset(self):
-        qs = Location.objects.all()
-        if hasattr(self.request.user, "company") and self.request.user.company:
-            qs = qs.filter(company=self.request.user.company)
-        return qs
+        company = self._get_company()
+        if not company:
+            return Location.objects.none()
+        return Location.objects.filter(company=company)
+
+    def perform_create(self, serializer):
+        company = self._get_company()
+        serializer.save(company=company)
 
 
 class JobSiteViewSet(viewsets.ModelViewSet):
     queryset = JobSite.objects.all()
     serializer_class = JobSiteSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsWorkforceAdminOrReadOnly]
+
+    def _get_company(self):
+        user = self.request.user
+        emp = getattr(user, "employee_profile", None)
+        return emp.company if emp else getattr(user, "company", None)
 
     def get_queryset(self):
-        qs = JobSite.objects.all()
-        if hasattr(self.request.user, "company") and self.request.user.company:
-            qs = qs.filter(company=self.request.user.company)
-        return qs
+        company = self._get_company()
+        if not company:
+            return JobSite.objects.none()
+        return JobSite.objects.filter(company=company)
+
+    def perform_create(self, serializer):
+        company = self._get_company()
+        serializer.save(company=company)
+
 
 
 class TimeLogViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = TimeLogSerializer
+
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
@@ -72,23 +109,43 @@ class ClockInView(APIView):
     permission_classes = [IsApprovedTechnician]
 
     def post(self, request):
+        # 1. Authenticated employee is valid and active
         emp = getattr(request.user, "employee_profile", None)
-        if not emp or not emp.is_active:
+        if not emp or not emp.is_active or not getattr(request.user, "is_active", True):
             return Response({
                 "error": "Employee record not found or account is inactive.",
                 "code": "EMPLOYEE_INACTIVE"
             }, status=status.HTTP_403_FORBIDDEN)
 
         company = emp.company
+        if not company:
+            return Response({
+                "error": "Company context missing.",
+                "code": "NO_COMPANY"
+            }, status=status.HTTP_403_FORBIDDEN)
 
-        # Phase 2 Gate: Verify active accepted job assignment and complete pre-service verification
-        from service_requests.models import ServiceRequest
+        # Check if technician already has an open TimeLog / active shift
+        open_log = TimeLog.objects.filter(employee=emp, clock_out__isnull=True).first()
+        if open_log:
+            return Response({
+                "error": "Technician is already clocked in.",
+                "code": "ALREADY_CLOCKED_IN",
+                "details": {"time_log": TimeLogSerializer(open_log).data}
+            }, status=status.HTTP_409_CONFLICT)
+
+        from service_requests.models import ServiceRequest, EmployeeJob
         from workforce_api.models import PreServiceVerification
+        from django.db.models import Q
+        from .geo import haversine_distance, GeofenceDecision, evaluate
 
+        # 2 & 3 & 4. Verify active accepted primary job assignment owned by this employee
+        emp_job_sr_ids = list(EmployeeJob.objects.filter(employee=emp).values_list("service_request_id", flat=True))
         active_job = ServiceRequest.objects.filter(
-            assigned_employee=emp,
+            Q(assigned_employee=emp) | Q(id__in=emp_job_sr_ids),
+            company=company,
             status__in=["accepted", "on_the_way", "arrived"]
         ).first()
+
 
         if not active_job:
             return Response({
@@ -96,30 +153,129 @@ class ClockInView(APIView):
                 "code": "NO_ACCEPTED_JOB"
             }, status=status.HTTP_400_BAD_REQUEST)
 
+        # 5. Customer destination coordinates must exist
+        if active_job.latitude is None or active_job.longitude is None:
+            return Response({
+                "error": "Clock-In rejected: Customer job destination coordinates are missing.",
+                "code": "CUSTOMER_COORDINATES_MISSING"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 6, 7, 8. Pre-Service Verification Gate (Arrival, OTP, and 3 Photos)
         verification = PreServiceVerification.objects.filter(job=active_job).first()
         if not verification or not verification.is_complete:
             missing_items = []
             if not verification:
                 missing_items = ["GPS Arrival Geofence", "Presence Photo", "Customer OTP", "Appliance Photo", "Work Area Photo"]
-            else:
-                if not verification.geofence_passed:
-                    missing_items.append("GPS Arrival Geofence")
-                if not verification.presence_photo:
-                    missing_items.append("Presence Photo")
-                if not verification.otp_verified:
-                    missing_items.append("Customer OTP")
-                if not verification.appliance_photo:
-                    missing_items.append("Before Appliance Photo")
-                if not verification.work_area_photo:
-                    missing_items.append("Before Work Area Photo")
+                return Response({
+                    "error": "Clock-In rejected: Pre-service verification incomplete. Arrival, OTP and evidence required.",
+                    "code": "ARRIVAL_REQUIRED",
+                    "details": {"missing_items": missing_items}
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            if not verification.geofence_passed:
+                return Response({
+                    "error": "Clock-In rejected: Real GPS arrival verification at customer destination is required first.",
+                    "code": "ARRIVAL_REQUIRED",
+                    "details": {"missing_items": ["GPS Arrival Geofence"]}
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            if not verification.otp_verified:
+                return Response({
+                    "error": "Clock-In rejected: Customer Work Start OTP verification is required first.",
+                    "code": "OTP_REQUIRED",
+                    "details": {"missing_items": ["Customer OTP"]}
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            if not verification.presence_photo:
+                missing_items.append("Presence Photo")
+            if not verification.appliance_photo:
+                missing_items.append("Before Appliance Photo")
+            if not verification.work_area_photo:
+                missing_items.append("Before Work Area Photo")
 
             return Response({
-                "error": f"Clock-In rejected: Pre-service verification incomplete. Missing: {', '.join(missing_items)}.",
-                "code": "PRE_SERVICE_INCOMPLETE",
+                "error": f"Clock-In rejected: Pre-service evidence incomplete. Missing: {', '.join(missing_items)}.",
+                "code": "PRE_SERVICE_VERIFICATION_REQUIRED",
                 "details": {"missing_items": missing_items}
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Concurrency & Active Shift Lock
+        # 9. Extract and validate device GPS coordinates
+        lat = request.data.get("lat") if request.data.get("lat") is not None else request.data.get("latitude")
+        lon = request.data.get("lon") if request.data.get("lon") is not None else (request.data.get("longitude") or request.data.get("lng"))
+        accuracy = request.data.get("accuracy")
+        gps_timestamp = request.data.get("timestamp") or request.data.get("gps_timestamp")
+        address = request.data.get("address", "")
+        notes = request.data.get("notes", "")
+        photo = request.FILES.get("photo")
+
+        # Real Browser GPS enforcement (No fake / fallback coordinates allowed)
+        if lat in (None, "") or lon in (None, ""):
+            return Response({
+                "error": "Real device GPS coordinates (latitude and longitude) are required for clock-in.",
+                "code": "GPS_REQUIRED"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            lat_val = float(lat)
+            lon_val = float(lon)
+        except (ValueError, TypeError):
+            return Response({
+                "error": "Invalid GPS coordinate format.",
+                "code": "INVALID_COORDINATES"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if not (-90.0 <= lat_val <= 90.0 and -180.0 <= lon_val <= 180.0):
+            return Response({
+                "error": "GPS coordinates out of valid range (-90..90, -180..180).",
+                "code": "INVALID_COORDINATES"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        now = timezone.now()
+
+        # 10. Validate GPS Freshness if timestamp is provided
+        if gps_timestamp:
+            try:
+                from django.utils.dateparse import parse_datetime
+                if isinstance(gps_timestamp, (int, float)) or (isinstance(gps_timestamp, str) and gps_timestamp.isdigit()):
+                    ts_num = float(gps_timestamp)
+                    if ts_num > 1e11:  # milliseconds
+                        ts_num /= 1000.0
+                    from datetime import datetime, timezone as dt_tz
+                    gps_dt = datetime.fromtimestamp(ts_num, tz=dt_tz.utc)
+                else:
+                    gps_dt = parse_datetime(str(gps_timestamp))
+                    if gps_dt and timezone.is_naive(gps_dt):
+                        gps_dt = timezone.make_aware(gps_dt)
+
+                if gps_dt:
+                    age_seconds = (now - gps_dt).total_seconds()
+                    # Reject if older than 5 minutes (300 seconds) or > 60s in future
+                    if age_seconds > 300 or age_seconds < -60:
+                        return Response({
+                            "error": f"Clock-In rejected: Device GPS fix is stale ({int(age_seconds)}s old). Please capture a fresh GPS fix.",
+                            "code": "GPS_STALE",
+                            "details": {"gps_age_seconds": round(age_seconds, 1)}
+                        }, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                pass
+
+        # 11. Customer Job Geofence (Haversine distance <= 300m)
+        dist_to_job = haversine_distance(lat_val, lon_val, float(active_job.latitude), float(active_job.longitude))
+        ARRIVAL_RADIUS_METERS = 300.0
+
+        if dist_to_job > ARRIVAL_RADIUS_METERS:
+            return Response({
+                "error": f"Clock-In failed: You are {int(dist_to_job)}m away from customer destination. You must be within 300m to clock in.",
+                "code": "OUTSIDE_GEOFENCE",
+                "details": {
+                    "distance_m": round(dist_to_job, 1),
+                    "threshold_m": ARRIVAL_RADIUS_METERS,
+                    "customer_lat": float(active_job.latitude),
+                    "customer_lng": float(active_job.longitude),
+                }
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # 12 & 13. Concurrency Protection & Atomic Clock-In Transaction
         with db_transaction.atomic():
             open_log = (
                 TimeLog.objects
@@ -134,77 +290,70 @@ class ClockInView(APIView):
                     "details": {"time_log": TimeLogSerializer(open_log).data}
                 }, status=status.HTTP_409_CONFLICT)
 
-        lat = request.data.get("lat")
-        lon = request.data.get("lon")
-        address = request.data.get("address", "")
-        notes = request.data.get("notes", "")
-        photo = request.FILES.get("photo")
+            # Re-lock active job
+            locked_job = ServiceRequest.objects.select_for_update().filter(pk=active_job.pk).first()
+            if not locked_job or locked_job.status not in ["accepted", "on_the_way", "arrived"]:
+                return Response({
+                    "error": f"Job #{active_job.id} is in status '{locked_job.status if locked_job else 'unknown'}' and cannot be clocked in.",
+                    "code": "INVALID_JOB_STATE"
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Real Browser GPS enforcement (No fake / fallback coordinates allowed)
-        if lat in (None, "") or lon in (None, ""):
-            return Response({
-                "error": "GPS coordinates (lat and lon) are required for clock-in.",
-                "code": "GPS_REQUIRED"
-            }, status=status.HTTP_400_BAD_REQUEST)
+            # Create TimeLog
+            time_log = TimeLog.objects.create(
+                employee=emp,
+                company=company,
+                user=request.user,
+                work_date=timezone.localdate(),
+                clock_in=now,
+                clock_in_lat=lat_val,
+                clock_in_lon=lon_val,
+                clock_in_address=address or locked_job.address or "",
+                clock_in_notes=notes,
+                clock_in_photo=photo,
+                distance_from_site_meters=int(dist_to_job),
+                geofence_passed=True,
+                admin_override_used=False,
+                location=None,
+                status="draft",
+            )
 
-        try:
-            lat_val = float(lat)
-            lon_val = float(lon)
-        except (ValueError, TypeError):
-            return Response({
-                "error": "Invalid GPS coordinate format.",
-                "code": "INVALID_GPS"
-            }, status=status.HTTP_400_BAD_REQUEST)
+            # Transition ServiceRequest to in_progress
+            locked_job.status = "in_progress"
+            locked_job.assigned_employee = emp
+            locked_job.save(update_fields=["status", "assigned_employee"])
 
-        # Fetch permitted locations for employee or company active locations
-        permitted_loc_rels = EmployeeLocation.objects.filter(employee=emp).select_related("location")
-        permitted_locs = [rel.location for rel in permitted_loc_rels]
-        if not permitted_locs:
-            permitted_locs = list(Location.objects.filter(company=company, is_active=True))
+            # Transition or create EmployeeJob to IN_PROGRESS
+            emp_job = EmployeeJob.objects.select_for_update().filter(service_request=locked_job, employee=emp).first()
+            if emp_job:
+                emp_job.status = "IN_PROGRESS"
+                if not emp_job.started_date:
+                    emp_job.started_date = now
+                emp_job.save(update_fields=["status", "started_date"])
+            else:
+                EmployeeJob.objects.create(
+                    service_request=locked_job,
+                    employee=emp,
+                    status="IN_PROGRESS",
+                    is_primary=True,
+                    started_date=now,
+                    accepted_date=now,
+                )
 
-        geofence_enabled = getattr(company, "geofence_enabled", True) if company else True
-        allow_all_locs = getattr(emp, "allow_all_locations", False) or not geofence_enabled
-
-        if not permitted_locs and not allow_all_locs:
-            return Response({
-                "error": "Your company has not configured an authorized clock-in location. Please contact your administrator.",
-                "code": "NO_GEOFENCE_LOCATION",
-                "details": {"geofence_passed": False}
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        decision = evaluate(
-            lat=lat_val,
-            lng=lon_val,
-            permitted_locations=permitted_locs,
-            is_admin=getattr(request.user, "is_staff", False),
-            request_admin_override=request.data.get("admin_override", False),
-            allow_all_locations=allow_all_locs,
-        )
-
-        if not decision.allowed:
-            return Response(decision.to_block_response(), status=status.HTTP_403_FORBIDDEN)
-
-        now = timezone.now()
-        time_log = TimeLog.objects.create(
-            employee=emp,
-            company=company,
-            user=request.user,
-            work_date=timezone.localdate(),
-            clock_in=now,
-            clock_in_lat=lat_val,
-            clock_in_lon=lon_val,
-            clock_in_address=address,
-            clock_in_notes=notes,
-            clock_in_photo=photo,
-            distance_from_site_meters=decision.distance_m,
-            geofence_passed=decision.geofence_passed,
-            admin_override_used=decision.admin_override_used,
-            location=decision.matched_location,
-        )
-
-        # Transition job state to in_progress
-        active_job.status = "in_progress"
-        active_job.save()
+            # Update User.last_known_location
+            user_loc = {
+                "latitude": round(lat_val, 7),
+                "longitude": round(lon_val, 7),
+                "updated_at": now.isoformat(),
+            }
+            if accuracy is not None:
+                try:
+                    acc_f = float(accuracy)
+                    if acc_f >= 0:
+                        user_loc["accuracy"] = round(acc_f, 2)
+                except (ValueError, TypeError):
+                    pass
+            request.user.last_known_location = user_loc
+            request.user.save(update_fields=["last_known_location"])
 
         return Response({
             "message": "Clock-in successful. Job is now IN PROGRESS.",
@@ -212,6 +361,8 @@ class ClockInView(APIView):
             "shift_status": "clocked_in",
             "time_log": TimeLogSerializer(time_log).data
         }, status=status.HTTP_201_CREATED)
+
+
 
 
 class ClockOutView(APIView):
@@ -386,51 +537,3 @@ class GeofenceCheckView(APIView):
             "matched_location": decision.matched_location.name if decision.matched_location else None
         }, status=status.HTTP_200_OK)
 
-
-class LocationViewSet(viewsets.ModelViewSet):
-    """Admin & Manager CRUD endpoint for company geofenced locations."""
-    permission_classes = [permissions.IsAuthenticated]
-    serializer_class = LocationSerializer
-
-    def get_queryset(self):
-        user = self.request.user
-        emp = getattr(user, "employee_profile", None)
-        company = emp.company if emp else getattr(user, "company", None)
-        if not company:
-            return Location.objects.none()
-        return Location.objects.filter(company=company)
-
-    def perform_create(self, serializer):
-        user = self.request.user
-        emp = getattr(user, "employee_profile", None)
-        company = emp.company if emp else getattr(user, "company", None)
-        serializer.save(company=company)
-
-
-class JobSiteViewSet(viewsets.ModelViewSet):
-    """Admin & Manager endpoint for JobSite location overrides."""
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        user = self.request.user
-        emp = getattr(user, "employee_profile", None)
-        company = emp.company if emp else getattr(user, "company", None)
-        if not company:
-            return JobSite.objects.none()
-        return JobSite.objects.filter(company=company)
-
-
-class TimeLogViewSet(viewsets.ReadOnlyModelViewSet):
-    """Read-only viewset for shift time log history."""
-    permission_classes = [permissions.IsAuthenticated]
-    serializer_class = TimeLogSerializer
-
-    def get_queryset(self):
-        user = self.request.user
-        emp = getattr(user, "employee_profile", None)
-        if getattr(user, "is_staff", False):
-            company = getattr(user, "company", None)
-            return TimeLog.objects.filter(company=company).prefetch_related("breaks", "photos")
-        if emp:
-            return TimeLog.objects.filter(employee=emp).prefetch_related("breaks", "photos")
-        return TimeLog.objects.none()

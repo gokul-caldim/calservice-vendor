@@ -885,9 +885,13 @@ class WorkforceJobListView(APIView):
     def get(self, request):
         user = request.user
         emp = getattr(user, "employee_profile", None)
+        company = emp.company if emp else getattr(user, "company", None)
 
-        if str(getattr(user, "role", "")).lower() in ["admin", "manager"] or getattr(user, "is_superuser", False):
-            jobs = ServiceRequest.objects.all().order_by("-created_at")[:50]
+        if is_admin_role(user):
+            if company:
+                jobs = ServiceRequest.objects.filter(company=company).order_by("-created_at")[:50]
+            else:
+                jobs = ServiceRequest.objects.all().order_by("-created_at")[:50]
         elif emp:
             offered_job_ids = WorkforceJobOffer.objects.filter(
                 employee=emp,
@@ -900,14 +904,19 @@ class WorkforceJobListView(APIView):
             except Exception:
                 emp_job_sr_ids = []
 
-            jobs = ServiceRequest.objects.filter(
+            qs = ServiceRequest.objects.filter(
                 Q(assigned_employee=emp) | Q(id__in=offered_job_ids) | Q(id__in=emp_job_sr_ids)
-            ).exclude(status__in=["completed", "cancelled"]).order_by("-created_at")
+            )
+            if emp.company:
+                qs = qs.filter(company=emp.company)
+
+            jobs = qs.exclude(status__in=["completed", "cancelled"]).order_by("-created_at")
         else:
             jobs = ServiceRequest.objects.none()
 
         serializer = WorkforceJobSerializer(jobs, many=True, context={"request": request})
         return Response(serializer.data, status=status.HTTP_200_OK)
+
 
 
 class WorkforceJobTransitionView(APIView):
@@ -1276,20 +1285,24 @@ def run_automatic_dispatch(job):
     """
     Executes Automatic Dispatch Engine for a ServiceRequest:
     1. Locks ServiceRequest row with select_for_update inside transaction.atomic()
-    2. Evaluates all candidate employees using check_technician_eligibility()
-    3. Calculates Rank Score for each eligible candidate:
-       - Verified skill proficiency (+30 for EXPERT, +20 for INTERMEDIATE, +10 for BEGINNER)
+    2. Validates customer latitude & longitude coordinates exist on ServiceRequest.
+    3. Filters candidate employees strictly scoped to the same Company tenant.
+    4. Evaluates candidate eligibility using check_technician_eligibility()
+    5. Retrieves real live GPS coordinates from candidate's User.last_known_location.
+    6. Calculates Haversine proximity distance in kilometers between customer and candidate.
+    7. Computes combined rank score:
+       - Proximity score (higher for closer, max 100.0)
+       - Verified skill proficiency (+30 EXPERT, +20 INTERMEDIATE, +10 BEGINNER)
        - Workload penalty (-15 points per active assigned job)
-       - City/territory match (+25 points)
        - Live shift clock-in (+10 points)
-    4. Ranks candidates descending by score.
-    5. Filters out candidates who have already rejected or been offered this job.
-    6. If no candidates remain:
+    8. Ranks candidates primarily by nearest distance (ascending), with highest score as tiebreaker.
+    9. Filters out candidates who have already rejected or been offered this job.
+    10. If no candidates remain:
        - Set job.status = "unassigned"
        - Create notification for Admin & log event.
-    7. If eligible candidate found:
+    11. If eligible candidate found:
        - Create WorkforceJobOffer(job=job, employee=candidate, status="OFFERED", expires_at=now+5min, rank_score=score)
-       - Set job.status = "job_offered"
+       - Keep job.status = "assigned" (or dispatchable)
        - Trigger create_notification() for candidate user & broadcast event.
     """
     with transaction.atomic():
@@ -1297,11 +1310,21 @@ def run_automatic_dispatch(job):
         if not job_obj or job_obj.status in ["completed", "cancelled"]:
             return False, "Job is not in a dispatchable state."
 
+        # Validate customer booking coordinates
+        if job_obj.latitude is None or job_obj.longitude is None:
+            job_obj.status = "unassigned"
+            job_obj.save()
+            return False, "Customer booking is missing valid GPS coordinates (latitude/longitude) for geographic dispatch."
+
         service_name = job_obj.issue_title or job_obj.service_category
         candidates = Employee.objects.filter(is_active=True).select_related("user", "company")
+        if job_obj.company_id:
+            candidates = candidates.filter(company_id=job_obj.company_id)
 
         # Exclude candidates who rejected or currently have an active offer for this job
         previous_offers = list(WorkforceJobOffer.objects.filter(job=job_obj).values_list("employee_id", flat=True))
+
+        from time_tracking.geo import haversine_distance
 
         ranked_candidates = []
 
@@ -1309,45 +1332,100 @@ def run_automatic_dispatch(job):
             if emp.id in previous_offers:
                 continue
 
-            is_eligible, reason = check_technician_eligibility(emp, service_name)
+            # Check eligibility against service_category, then issue_title
+            is_eligible, reason = check_technician_eligibility(emp, job_obj.service_category)
+            if not is_eligible and job_obj.issue_title:
+                is_eligible, reason = check_technician_eligibility(emp, job_obj.issue_title)
+
             if not is_eligible:
                 continue
 
-            # Compute rank score
-            score = 50.0  # Base eligible score
+            # Real live GPS from User.last_known_location
+            last_loc = getattr(emp.user, "last_known_location", None) or {}
+            emp_lat = last_loc.get("latitude") if last_loc.get("latitude") is not None else last_loc.get("lat")
+            emp_lon = last_loc.get("longitude") if last_loc.get("longitude") is not None else (last_loc.get("lng") or last_loc.get("lon"))
+
+            if emp_lat is None or emp_lon is None:
+                # No live GPS telemetry available
+                continue
+
+            try:
+                emp_lat_f = float(emp_lat)
+                emp_lon_f = float(emp_lon)
+            except (ValueError, TypeError):
+                continue
+
+            # Location Freshness Gate: Candidate must have transmitted GPS within the last 30 minutes
+            updated_at_str = last_loc.get("updated_at")
+            if not updated_at_str:
+                # Missing timestamp -> Stale GPS
+                continue
+
+            try:
+                from django.utils.dateparse import parse_datetime
+                loc_dt = parse_datetime(str(updated_at_str))
+                if not loc_dt:
+                    continue
+                if timezone.is_naive(loc_dt):
+                    loc_dt = timezone.make_aware(loc_dt)
+                gps_age_seconds = (timezone.now() - loc_dt).total_seconds()
+                MAX_GPS_AGE_SECONDS = 1800  # 30 minutes maximum age for live dispatch
+                if gps_age_seconds > MAX_GPS_AGE_SECONDS or gps_age_seconds < -60:
+                    # GPS is stale (> 30 minutes old) -> Skip candidate
+                    continue
+            except Exception:
+                continue
+
+            # Real distance calculation in km
+            dist_m = haversine_distance(float(job_obj.latitude), float(job_obj.longitude), emp_lat_f, emp_lon_f)
+            dist_km = dist_m / 1000.0
+
+
+            # Proximity score (closer = higher score, max 100)
+            proximity_score = max(0.0, 100.0 - (dist_km * 2.0))
 
             # 1. Skill proficiency score
             skills = WorkforceEmployeeSkill.objects.filter(employee=emp, is_verified=True).select_related("skill")
             max_prof = 0
             for sk in skills:
-                if service_name and (service_name.lower() in sk.skill.name.lower() or sk.skill.name.lower() in service_name.lower()):
+                sk_name = sk.skill.name.lower()
+                matches = False
+                for term in [job_obj.service_category, job_obj.issue_title]:
+                    if term and (term.lower() in sk_name or sk_name in term.lower()):
+                        matches = True
+                        break
+                if matches:
                     if sk.proficiency_level == "EXPERT":
                         max_prof = max(max_prof, 30)
                     elif sk.proficiency_level == "INTERMEDIATE":
                         max_prof = max(max_prof, 20)
                     else:
                         max_prof = max(max_prof, 10)
-            score += max_prof
+
 
             # 2. Active workload penalty
             active_jobs_count = ServiceRequest.objects.filter(
                 assigned_employee=emp,
                 status__in=["assigned", "accepted", "on_the_way", "in_progress"]
             ).count()
-            score -= (active_jobs_count * 15.0)
+            workload_penalty = active_jobs_count * 15.0
 
             # 3. Territory match
             city = (emp.bank_details or {}).get("onboarding", {}).get("draft", {}).get("personal", {}).get("city", "")
-            if job_obj.address and city and city.lower() in job_obj.address.lower():
-                score += 25.0
+            territory_bonus = 15.0 if (job_obj.address and city and city.lower() in job_obj.address.lower()) else 0.0
 
             # 4. Shift clock-in active
             bank_details = emp.bank_details or {}
             is_clocked_in = bank_details.get("attendance", {}).get("is_clocked_in", False)
-            if is_clocked_in:
-                score += 10.0
+            clock_in_bonus = 10.0 if is_clocked_in else 0.0
 
-            ranked_candidates.append((score, emp))
+            total_score = proximity_score + max_prof + territory_bonus - workload_penalty + clock_in_bonus
+
+            ranked_candidates.append({
+                "score": total_score,
+                "distance_km": dist_km,
+                "employee": emp,
+            })
 
         if not ranked_candidates:
             job_obj.status = "unassigned"
@@ -1356,17 +1434,20 @@ def run_automatic_dispatch(job):
             if admin_user:
                 create_notification(
                     recipient=admin_user,
-                    title="Automatic Dispatch Failed: Job Unassigned",
-                    message=f"No eligible technician accepted or qualified for Job #{job_obj.id} ({service_name}). Requires manual assignment.",
+                    title="Automatic Dispatch: Awaiting Technician",
+                    message=f"No eligible nearby technician available for Job #{job_obj.id} ({service_name}). Job remains unassigned.",
                     notification_type="DISPATCH_UNASSIGNED",
                     company=job_obj.company,
                     related_object_id=job_obj.id,
                 )
             return False, "No eligible technicians available for automatic dispatch."
 
-        # Sort descending by score
-        ranked_candidates.sort(key=lambda x: x[0], reverse=True)
-        top_score, top_emp = ranked_candidates[0]
+        # Rank primarily by nearest distance (ascending), then by highest score (descending)
+        ranked_candidates.sort(key=lambda x: (x["distance_km"], -x["score"]))
+        top_candidate = ranked_candidates[0]
+        top_score = top_candidate["score"]
+        top_dist_km = top_candidate["distance_km"]
+        top_emp = top_candidate["employee"]
 
         # Expire any previous pending offers for this job
         WorkforceJobOffer.objects.filter(job=job_obj, status="OFFERED").update(status="EXPIRED")
@@ -1381,16 +1462,27 @@ def run_automatic_dispatch(job):
             expires_at=expires_at,
         )
 
+        if job_obj.status in ["draft", "new_request", "confirmed", "unassigned"]:
+            job_obj.status = "assigned"
+            job_obj.save()
+
+        loc_str = f" at {job_obj.address}" if job_obj.address else ""
+        req_id_str = f" ({job_obj.request_id})" if job_obj.request_id else f" #{job_obj.id}"
+        service_label = job_obj.issue_title or job_obj.service_category or "Service Request"
+        expiry_str = expires_at.strftime("%H:%M:%S UTC")
+
         create_notification(
             recipient=top_emp.user,
-            title="New Job Offer Received!",
-            message=f"You have received an exclusive job offer for Job #{job_obj.id} ({service_name}). Accept within 5 minutes.",
-            notification_type="JOB_OFFERED",
+            title="New Job Offer Available!",
+            message=f"You have a new exclusive job offer for '{service_label}'{req_id_str}{loc_str} ({top_dist_km:.1f} km away). Expiry: {expiry_str}. Open your dashboard to Accept or Decline.",
+            notification_type="JOB_OFFER",
             company=job_obj.company,
-            related_object_id=job_obj.id,
+            related_object_id=str(job_obj.id),
         )
 
-        return True, f"Job #{job_obj.id} offered to {top_emp.user.get_full_name()} (Score: {top_score:.1f})."
+        return True, f"Job #{job_obj.id} offered to {top_emp.user.get_full_name() or top_emp.user.username} ({top_dist_km:.1f}km away, Score: {top_score:.1f})."
+
+
 
 
 class WorkforceJobAcceptOfferView(APIView):
@@ -1411,20 +1503,49 @@ class WorkforceJobAcceptOfferView(APIView):
 
         with transaction.atomic():
             job_obj = ServiceRequest.objects.select_for_update().filter(pk=pk).first()
+            if not job_obj:
+                return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+
+            # Prevent duplicate acceptance by the same employee
+            if job_obj.assigned_employee == emp and job_obj.status in ["accepted", "on_the_way", "arrived", "in_progress"]:
+                return Response({
+                    "message": f"Job #{job_obj.id} is already accepted by you.",
+                    "job_id": job_obj.id,
+                    "status": job_obj.status,
+                }, status=status.HTTP_200_OK)
+
+            # Reject acceptance if assigned to another employee
+            if job_obj.assigned_employee and job_obj.assigned_employee != emp and job_obj.status in ["accepted", "on_the_way", "arrived", "in_progress", "completed"]:
+                return Response({
+                    "error": "Cannot accept job: Job has already been assigned and accepted by another technician.",
+                    "code": "ALREADY_ACCEPTED_BY_ANOTHER"
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            from service_requests.models import EmployeeJob
+
             offer = WorkforceJobOffer.objects.select_for_update().filter(
                 job=job_obj,
                 employee=emp,
                 status="OFFERED"
             ).first()
 
-            if not offer:
-                return Response({"error": "No active job offer found for this technician."}, status=status.HTTP_400_BAD_REQUEST)
+            has_employee_job = EmployeeJob.objects.filter(service_request=job_obj, employee=emp).exists()
+            is_direct_assigned = (job_obj.assigned_employee == emp)
 
-            if offer.expires_at < timezone.now():
-                offer.status = "EXPIRED"
+            if not offer and not has_employee_job and not is_direct_assigned:
+                return Response({
+                    "error": "No active job offer or assignment found for this technician.",
+                    "code": "NO_ACTIVE_OFFER"
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            if offer:
+                if offer.expires_at < timezone.now():
+                    offer.status = "EXPIRED"
+                    offer.save()
+                    run_automatic_dispatch(job_obj)
+                    return Response({"error": "Job offer has expired."}, status=status.HTTP_400_BAD_REQUEST)
+                offer.status = "ACCEPTED"
                 offer.save()
-                run_automatic_dispatch(job_obj)
-                return Response({"error": "Job offer has expired."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Check if employee has a conflicting active job
             conflicting = ServiceRequest.objects.filter(
@@ -1432,35 +1553,46 @@ class WorkforceJobAcceptOfferView(APIView):
                 status__in=["accepted", "on_the_way", "in_progress"]
             ).exclude(pk=job_obj.pk).first()
             if conflicting:
-                return Response({"error": f"Cannot accept offer: Technician already has an active assigned Job #{conflicting.id}."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"error": f"Cannot accept job: Technician already has an active assigned Job #{conflicting.id}."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Verify technician eligibility
-            service_name = job_obj.issue_title or job_obj.service_category
-            is_eligible, reason = check_technician_eligibility(emp, service_name)
+            is_eligible, reason = check_technician_eligibility(emp, job_obj.service_category)
+            if not is_eligible and job_obj.issue_title:
+                is_eligible, reason = check_technician_eligibility(emp, job_obj.issue_title)
             if not is_eligible:
                 return Response({"error": f"Cannot accept offer: {reason}"}, status=status.HTTP_400_BAD_REQUEST)
 
-            offer.status = "ACCEPTED"
-            offer.save()
 
             job_obj.assigned_employee = emp
             job_obj.status = "accepted"
             job_obj.save()
 
+            EmployeeJob.objects.update_or_create(
+                service_request=job_obj,
+                employee=emp,
+                defaults={
+                    "status": "ACCEPTED",
+                    "is_primary": True,
+                    "accepted_date": timezone.now(),
+                }
+            )
+
+
             create_notification(
                 recipient=emp.user,
                 title="Job Offer Accepted",
-                message=f"You have accepted Job #{job_obj.id}. Proceed to job location when scheduled.",
+                message=f"You have accepted Job #{job_obj.id}. Proceed to customer location at {job_obj.address or 'scheduled site'}.",
                 notification_type="JOB_ASSIGNMENT",
                 company=job_obj.company,
                 related_object_id=job_obj.id,
             )
 
             return Response({
-                "message": f"Job #{job_obj.id} offer accepted successfully.",
+                "message": f"Job #{job_obj.id} accepted successfully.",
                 "job_id": job_obj.id,
                 "status": job_obj.status,
             }, status=status.HTTP_200_OK)
+
 
 
 class WorkforceJobRejectOfferView(APIView):
@@ -1589,10 +1721,13 @@ class WorkforceJobExtensionView(APIView):
         if requested_amount <= 0:
             return Response({"error": "Extension requested amount must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
 
-        requires_specialist = bool(request.data.get("requires_specialist", False))
-        is_critical = bool(request.data.get("is_critical", False))
+        raw_spec = request.data.get("requires_specialist", False)
+        requires_specialist = raw_spec is True or str(raw_spec).lower() in ["true", "1"]
+        raw_crit = request.data.get("is_critical", False)
+        is_critical = raw_crit is True or str(raw_crit).lower() in ["true", "1"]
         supporting_notes = str(request.data.get("supporting_notes", "")).strip()
         supporting_photo = request.FILES.get("supporting_photo") or request.FILES.get("photo")
+
 
         required_skill = None
         skill_id = request.data.get("required_skill")
@@ -2037,11 +2172,23 @@ class WorkforceAdminAssignSpecialistView(APIView):
                 }],
             )
 
+            from service_requests.models import EmployeeJob
+            EmployeeJob.objects.create(
+                service_request=secondary_job,
+                employee=specialist_emp,
+                status="ASSIGNED",
+                is_primary=False,
+                notes=f"Specialist assignment for Extension #{extension.id}",
+                assigned_by=request.user,
+            )
+
+
             # Link secondary job to extension
             extension.specialist_technician = specialist_emp
             extension.specialist_job = secondary_job
             extension.status = WorkforceWorkExtension.Status.IN_PROGRESS
             extension.save()
+
 
             # Record secondary job link on parent job's cart_data
             cart_data = list(job.cart_data or [])
@@ -2728,42 +2875,57 @@ class WorkforceAdminLeaveDecideView(APIView):
 # ─── 14. Real-Time Fleet Map & Live Location ──────────────────────────────────
 
 class WorkforceFleetMapView(APIView):
+    """
+    Returns live fleet telemetry for technicians belonging strictly to the
+    authenticated admin's company. Cross-tenant access is rejected.
+    """
     permission_classes = [IsWorkforceAdmin]
 
     def get(self, request):
-        technicians = list(Employee.objects.filter(is_active=True).select_related("user"))
+        user = request.user
+        emp = getattr(user, "employee_profile", None)
+        company = emp.company if emp else getattr(user, "company", None)
+        if not company:
+            return Response(
+                {"error": "Company context required.", "code": "NO_COMPANY"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        technicians = list(
+            Employee.objects.filter(is_active=True, company=company).select_related("user")
+        )
         tech_ids = [e.id for e in technicians]
 
         active_jobs_map = {}
         if tech_ids:
             active_jobs = ServiceRequest.objects.filter(
                 assigned_employee_id__in=tech_ids,
-                status__in=["accepted", "on_the_way", "in_progress"]
+                status__in=["accepted", "on_the_way", "in_progress"],
             )
             for j in active_jobs:
                 if j.assigned_employee_id not in active_jobs_map:
                     active_jobs_map[j.assigned_employee_id] = j.request_id
 
         fleet = []
-        for emp in technicians:
-            onboarding = (emp.bank_details or {}).get("onboarding", {})
+        for emp_item in technicians:
+            onboarding = (emp_item.bank_details or {}).get("onboarding", {})
             reg_status = onboarding.get("status", "not_started")
-            loc = emp.user.last_known_location or {}
+            loc = emp_item.user.last_known_location or {}
 
             has_location = bool(
                 loc.get("latitude") is not None and loc.get("longitude") is not None
             )
             lat = float(loc["latitude"]) if has_location else None
             lng = float(loc["longitude"]) if has_location else None
-            active_job_id = active_jobs_map.get(emp.id)
+            active_job_id = active_jobs_map.get(emp_item.id)
 
             fleet.append({
-                "id": emp.id,
-                "employee_id": emp.employee_id,
-                "name": emp.user.get_full_name() or emp.user.username,
-                "phone": emp.user.mobile_number or emp.user.phone,
-                "is_online": emp.is_online,
-                "current_availability": emp.current_availability,
+                "id": emp_item.id,
+                "employee_id": emp_item.employee_id,
+                "name": emp_item.user.get_full_name() or emp_item.user.username,
+                "phone": emp_item.user.mobile_number or emp_item.user.phone,
+                "is_online": emp_item.is_online,
+                "current_availability": emp_item.current_availability,
                 "registration_status": reg_status,
                 "has_location": has_location,
                 "latitude": lat,
@@ -2782,13 +2944,21 @@ class WorkforceLocationUpdateView(APIView):
     Receives real device GPS coordinates from an online employee.
     Stores latitude, longitude, accuracy, and timestamp in User.last_known_location.
     Only the authenticated user's own location is updated — no frontend-supplied IDs accepted.
+    Automatically evaluates GPS geofence against active accepted customer jobs and confirms arrival with ZERO Admin intervention.
     """
     permission_classes = [IsApprovedTechnician]
 
     def post(self, request):
         user = request.user
-        lat = request.data.get("latitude")
-        lng = request.data.get("longitude")
+        emp = getattr(user, "employee_profile", None)
+        if not emp or not emp.is_active:
+            return Response(
+                {"error": "Active employee profile required.", "code": "EMPLOYEE_INACTIVE"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        lat = request.data.get("latitude") if request.data.get("latitude") is not None else request.data.get("lat")
+        lng = request.data.get("longitude") if request.data.get("longitude") is not None else (request.data.get("lon") or request.data.get("lng"))
         accuracy = request.data.get("accuracy")  # metres, from browser Geolocation API
 
         if lat is None or lng is None:
@@ -2806,24 +2976,121 @@ class WorkforceLocationUpdateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Strict coordinate range validation
+        if not (-90.0 <= lat_f <= 90.0) or not (-180.0 <= lng_f <= 180.0):
+            return Response(
+                {"error": "Coordinates out of range (-90..90, -180..180).", "code": "COORDINATES_OUT_OF_RANGE"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        now = timezone.now()
         location_data = {
-            "latitude": lat_f,
-            "longitude": lng_f,
-            "updated_at": timezone.now().isoformat(),
+            "latitude": round(lat_f, 7),
+            "longitude": round(lng_f, 7),
+            "updated_at": now.isoformat(),
         }
         if accuracy is not None:
             try:
-                location_data["accuracy"] = float(accuracy)
+                acc_f = float(accuracy)
+                if acc_f >= 0:
+                    location_data["accuracy"] = round(acc_f, 2)
             except (ValueError, TypeError):
                 pass
 
         user.last_known_location = location_data
         user.save(update_fields=["last_known_location"])
 
+        # ── Automatic Real GPS Arrival & Geofence Evaluation (Zero-Admin Intervention) ──
+        from service_requests.models import ServiceRequest, EmployeeJob
+        from workforce_api.models import PreServiceVerification
+        from time_tracking.geo import haversine_distance
+        from django.db.models import Q
+        import secrets
+        from datetime import timedelta
+
+        ARRIVAL_RADIUS_METERS = 300.0
+        arrived_events = []
+
+        # Find active accepted / en-route jobs owned by this technician
+        emp_job_sr_ids = list(EmployeeJob.objects.filter(employee=emp).values_list("service_request_id", flat=True))
+        active_jobs = ServiceRequest.objects.filter(
+            Q(assigned_employee=emp) | Q(id__in=emp_job_sr_ids),
+            company=emp.company,
+            status__in=["accepted", "on_the_way", "en_route"],
+            latitude__isnull=False,
+            longitude__isnull=False,
+        )
+
+        for job in active_jobs:
+            try:
+                cust_lat = float(job.latitude)
+                cust_lon = float(job.longitude)
+                dist_m = haversine_distance(lat_f, lng_f, cust_lat, cust_lon)
+
+                if dist_m <= ARRIVAL_RADIUS_METERS:
+                    verification, _ = PreServiceVerification.objects.get_or_create(
+                        job=job,
+                        defaults={"employee": emp}
+                    )
+                    verification.employee = emp
+                    verification.geofence_passed = True
+                    verification.arrival_lat = lat_f
+                    verification.arrival_lon = lng_f
+                    if not verification.arrived_at:
+                        verification.arrived_at = now
+
+                    # Generate random 6-digit OTP if not already generated or expired
+                    if not verification.otp_code or (verification.otp_expires_at and verification.otp_expires_at < now):
+                        new_otp = f"{secrets.randbelow(900000) + 100000}"
+                        verification.otp_code = new_otp
+                        verification.otp_generated_at = now
+                        verification.otp_expires_at = now + timedelta(minutes=15)
+                        verification.otp_attempts = 0
+                        verification.otp_verified = False
+
+                        if job.customer:
+                            create_notification(
+                                recipient=job.customer,
+                                title="Technician Arrived — Work Start OTP",
+                                message=f"Technician {user.get_full_name() or user.username} has arrived. Share OTP {new_otp} to start service.",
+                                notification_type="WORK_START_OTP",
+                                company=job.company,
+                                related_object_id=str(job.id),
+                            )
+
+                    verification.check_completion()
+                    verification.save()
+
+                    # Transition status to arrived
+                    job.status = "arrived"
+                    job.save(update_fields=["status"])
+                    EmployeeJob.objects.filter(service_request=job, employee=emp).update(status="ARRIVED")
+
+                    create_notification(
+                        recipient=user,
+                        title="Arrival Verified Automatically!",
+                        message=f"You have arrived at Job #{job.id} ({int(dist_m)}m away). Work Start OTP is ready for verification.",
+                        notification_type="AUTOMATIC_ARRIVAL",
+                        company=job.company,
+                        related_object_id=str(job.id),
+                    )
+
+                    arrived_events.append({
+                        "job_id": job.id,
+                        "distance_m": round(dist_m, 1),
+                        "geofence_passed": True,
+                        "status": "arrived",
+                    })
+            except Exception:
+                pass
+
         return Response({
             "message": "Live GPS coordinates updated.",
             "location": user.last_known_location,
+            "arrived_events": arrived_events,
         }, status=status.HTTP_200_OK)
+
+
 
 
 # ─── 21. Notification Engine & Event Triggers ────────────────────────────────
@@ -3637,8 +3904,9 @@ class WorkforceJobArriveView(APIView):
                 "error": f"Job #{job.id} is in status '{job.status}'. Expected 'accepted' or 'on_the_way'."
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        lat = request.data.get("lat")
-        lon = request.data.get("lon")
+        lat = request.data.get("lat") if request.data.get("lat") is not None else request.data.get("latitude")
+        lon = request.data.get("lon") if request.data.get("lon") is not None else (request.data.get("longitude") or request.data.get("lng"))
+
 
         try:
             lat_val = float(lat)
@@ -3648,21 +3916,49 @@ class WorkforceJobArriveView(APIView):
                 "error": "Real browser GPS coordinates (lat and lon) are required for arrival verification."
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        permitted_locs = list(Location.objects.filter(company=emp.company, is_active=True))
-        decision = evaluate(
-            lat=lat_val,
-            lng=lon_val,
-            permitted_locations=permitted_locs,
-            is_admin=getattr(request.user, "is_staff", False),
-            allow_all_locations=getattr(emp, "allow_all_locations", False) or not getattr(emp.company, "geofence_enabled", True)
-        )
-
-        if not decision.allowed:
+        if not (-90.0 <= lat_val <= 90.0 and -180.0 <= lon_val <= 180.0):
             return Response({
-                "error": f"Arrival failed: {decision.reason}",
-                "geofence_passed": False,
-                "code": "OUTSIDE_GEOFENCE"
-            }, status=status.HTTP_403_FORBIDDEN)
+                "error": "GPS coordinates out of valid range (-90 to 90 lat, -180 to 180 lon)."
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Real GPS Arrival Geofencing: Compare Employee GPS against Customer Job Location
+        from time_tracking.geo import haversine_distance, evaluate
+        ARRIVAL_RADIUS_METERS = 300.0
+
+        if job.latitude is not None and job.longitude is not None:
+            distance_m = haversine_distance(lat_val, lon_val, float(job.latitude), float(job.longitude))
+            if distance_m > ARRIVAL_RADIUS_METERS:
+                return Response({
+                    "error": f"Arrival failed: You are {int(distance_m)}m away from the customer address. You must be within 300m to confirm arrival.",
+                    "geofence_passed": False,
+                    "code": "OUTSIDE_GEOFENCE",
+                    "details": {
+                        "distance_m": round(distance_m, 1),
+                        "threshold_m": ARRIVAL_RADIUS_METERS,
+                        "customer_lat": job.latitude,
+                        "customer_lng": job.longitude,
+                    }
+                }, status=status.HTTP_403_FORBIDDEN)
+            matched_location = f"Customer Destination ({job.address[:40]}...)" if job.address else "Customer Job Location"
+        else:
+            # Fallback to company locations if customer booking coordinates were not populated
+            permitted_locs = list(Location.objects.filter(company=emp.company, is_active=True))
+            decision = evaluate(
+                lat=lat_val,
+                lng=lon_val,
+                permitted_locations=permitted_locs,
+                is_admin=getattr(request.user, "is_staff", False),
+                allow_all_locations=getattr(emp, "allow_all_locations", False) or not getattr(emp.company, "geofence_enabled", True)
+            )
+            if not decision.allowed:
+                return Response({
+                    "error": f"Arrival failed: {decision.reason}",
+                    "geofence_passed": False,
+                    "code": "OUTSIDE_GEOFENCE",
+                    "details": {"distance_m": decision.distance_m}
+                }, status=status.HTTP_403_FORBIDDEN)
+            distance_m = decision.distance_m
+            matched_location = decision.matched_location.name if decision.matched_location else "Job Site"
 
         now = timezone.now()
         # Production random 6-digit OTP (100000 - 999999)
@@ -3688,9 +3984,14 @@ class WorkforceJobArriveView(APIView):
         verification.check_completion()
         verification.save()
 
-        if job.status == "accepted":
-            job.status = "on_the_way"
-            job.save()
+        job.status = "arrived"
+        job.save()
+
+        try:
+            from service_requests.models import EmployeeJob
+            EmployeeJob.objects.filter(service_request=job, employee=emp).update(status="ARRIVED")
+        except Exception:
+            pass
 
         # Send notification to customer with Work Start OTP
         if job.customer:
@@ -3703,16 +4004,16 @@ class WorkforceJobArriveView(APIView):
                 related_object_id=str(job.id),
             )
 
-        # NOTE: Do NOT leak the OTP to technician response
         return Response({
             "message": "Arrival verified! Fresh Customer Work Start OTP generated and sent to customer.",
             "geofence_passed": True,
-            "matched_location": decision.matched_location.name if decision.matched_location else "Job Site",
-            "distance_m": decision.distance_m,
+            "matched_location": matched_location,
+            "distance_m": round(distance_m, 1),
             "status": job.status,
             "otp_generated": True,
             "otp_expires_in_minutes": 15,
         }, status=status.HTTP_200_OK)
+
 
 
 class WorkforceJobVerifyOTPView(APIView):
@@ -3727,9 +4028,10 @@ class WorkforceJobVerifyOTPView(APIView):
         if not emp or job.assigned_employee != emp:
             return Response({"error": "Unauthorized: Job is not assigned to you."}, status=status.HTTP_403_FORBIDDEN)
 
-        otp_input = str(request.data.get("otp", "")).strip()
+        otp_input = str(request.data.get("otp") or request.data.get("otp_code") or "").strip()
         if not otp_input:
             return Response({"error": "Customer OTP code required."}, status=status.HTTP_400_BAD_REQUEST)
+
 
         verification = PreServiceVerification.objects.filter(job=job).first()
         if not verification or not verification.otp_code:

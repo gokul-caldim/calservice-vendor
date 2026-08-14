@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 
 import { Modal } from '../enterprise/Modal.jsx';
+import { apiGetNotifications, apiMarkNotificationRead } from '../../api/workforceService.js';
 
 export function TopHeader({ onToggleSidebar = () => {} }) {
   const { user, logout, togglePresence, isAdmin, isEmployee, registrationStatus } = useAuth();
@@ -24,9 +25,54 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
   const [isToggling, setIsToggling] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showHelpModal, setShowHelpModal] = useState(false);
+  const [showNotifMenu, setShowNotifMenu] = useState(false);
+  const [notifications, setNotifications] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
   const [globalSearch, setGlobalSearch] = useState('');
 
+  // 10s silent background notification polling
+  useEffect(() => {
+    if (!user) return;
+    const fetchNotifs = async () => {
+      try {
+        const res = await apiGetNotifications().catch(() => null);
+        if (res) {
+          setNotifications(res.notifications || []);
+          setUnreadCount(res.unread_count || 0);
+        }
+      } catch (_) {}
+    };
+    fetchNotifs();
+    const interval = setInterval(fetchNotifs, 10000);
+    return () => clearInterval(interval);
+  }, [user]);
+
+  const handleMarkAllRead = async () => {
+    try {
+      await apiMarkNotificationRead();
+      setUnreadCount(0);
+      setNotifications((prev) => prev.map((n) => ({ ...n, is_read: true })));
+    } catch (_) {}
+  };
+
+  const handleNotifClick = async (notif) => {
+    try {
+      if (!notif.is_read) {
+        await apiMarkNotificationRead(notif.id);
+        setUnreadCount((prev) => Math.max(0, prev - 1));
+        setNotifications((prev) =>
+          prev.map((n) => (n.id === notif.id ? { ...n, is_read: true } : n))
+        );
+      }
+      setShowNotifMenu(false);
+      if (notif.notification_type === 'JOB_OFFER' || notif.notification_type === 'JOB_OFFERED') {
+        navigate('/workforce/employee/dashboard');
+      }
+    } catch (_) {}
+  };
+
   const handleLogout = async () => {
+
     await logout();
     navigate('/workforce/login');
   };
@@ -132,14 +178,89 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
                   <HelpCircle className="w-4 h-4" />
                 </button>
 
-                {/* Notifications Bell */}
-                <button
-                  type="button"
-                  className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors relative"
-                  title="Notifications"
-                >
-                  <Bell className="w-4 h-4" />
-                </button>
+                {/* Notifications Bell & Dropdown */}
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowNotifMenu(!showNotifMenu);
+                      setShowUserMenu(false);
+                    }}
+                    className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors relative"
+                    title="Notifications"
+                  >
+                    <Bell className="w-4 h-4" />
+                    {unreadCount > 0 && (
+                      <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-0.5 rounded-full bg-red-600 text-white text-[9px] font-bold flex items-center justify-center animate-pulse">
+                        {unreadCount > 9 ? '9+' : unreadCount}
+                      </span>
+                    )}
+                  </button>
+
+                  {showNotifMenu && (
+                    <div className="absolute right-0 mt-1.5 w-80 bg-white text-slate-900 rounded-lg border border-slate-200 shadow-xl py-1 z-50 text-xs">
+                      <div className="px-3 py-2 border-b border-slate-100 flex items-center justify-between">
+                        <div className="flex items-center gap-1.5 font-bold text-slate-900">
+                          <Bell className="w-3.5 h-3.5 text-blue-600" />
+                          <span>Notifications</span>
+                          {unreadCount > 0 && (
+                            <span className="px-1.5 py-0.2 rounded-full bg-blue-100 text-blue-700 text-[10px] font-bold">
+                              {unreadCount} new
+                            </span>
+                          )}
+                        </div>
+                        {unreadCount > 0 && (
+                          <button
+                            type="button"
+                            onClick={handleMarkAllRead}
+                            className="text-[10px] text-blue-600 hover:text-blue-800 font-medium hover:underline"
+                          >
+                            Mark all read
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="max-h-72 overflow-y-auto divide-y divide-slate-100">
+                        {notifications.length === 0 ? (
+                          <div className="py-6 text-center text-slate-400 text-xs">
+                            No notifications yet
+                          </div>
+                        ) : (
+                          notifications.map((n) => {
+                            const isJobOffer = n.notification_type === 'JOB_OFFER' || n.notification_type === 'JOB_OFFERED';
+                            return (
+                              <div
+                                key={n.id}
+                                onClick={() => handleNotifClick(n)}
+                                className={`px-3 py-2.5 hover:bg-slate-50 cursor-pointer transition-colors ${
+                                  !n.is_read ? (isJobOffer ? 'bg-amber-50/60 border-l-2 border-amber-500' : 'bg-blue-50/40 border-l-2 border-blue-500') : ''
+                                }`}
+                              >
+                                <div className="flex items-start justify-between gap-1">
+                                  <p className={`font-semibold ${isJobOffer ? 'text-amber-900' : 'text-slate-900'}`}>
+                                    {n.title}
+                                  </p>
+                                  <span className="text-[10px] text-slate-400 shrink-0">
+                                    {new Date(n.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                  </span>
+                                </div>
+                                <p className="text-slate-600 text-[11px] mt-0.5 line-clamp-2">
+                                  {n.message}
+                                </p>
+                                {isJobOffer && (
+                                  <div className="mt-1.5 flex items-center gap-1 text-[10px] font-bold text-amber-700">
+                                    <span>👉 Tap to view offer in dashboard</span>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
 
                 {/* User Dropdown */}
                 <div className="relative">

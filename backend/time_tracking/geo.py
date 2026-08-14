@@ -12,10 +12,12 @@ from typing import Optional, Tuple
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calculate distance in meters between two lat/lng pairs on Earth."""
     R = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
+    f_lat1, f_lon1 = float(lat1), float(lon1)
+    f_lat2, f_lon2 = float(lat2), float(lon2)
+    phi1 = math.radians(f_lat1)
+    phi2 = math.radians(f_lat2)
+    delta_phi = math.radians(f_lat2 - f_lat1)
+    delta_lambda = math.radians(f_lon2 - f_lon1)
 
     a = (
         math.sin(delta_phi / 2.0) ** 2
@@ -23,6 +25,7 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     )
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     return R * c
+
 
 
 def point_in_polygon(point: Tuple[float, float], polygon: list) -> bool:

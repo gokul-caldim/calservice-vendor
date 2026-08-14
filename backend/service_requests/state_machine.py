@@ -76,8 +76,23 @@ def apply_transition(service_request, target_status: str, actor=None) -> str:
 
     service_request.status = target
     service_request.save()
+
+    # Sync EmployeeJob status and timestamps
+    try:
+        from service_requests.models import EmployeeJob
+        from django.utils import timezone
+        emp_job_updates = {"status": target.upper()}
+        if target == "completed":
+            emp_job_updates["completed_date"] = timezone.now()
+        elif target == "in_progress":
+            emp_job_updates["started_date"] = timezone.now()
+        EmployeeJob.objects.filter(service_request=service_request).update(**emp_job_updates)
+    except Exception:
+        pass
+
     return target
 
 
 transition = apply_transition
+
 
