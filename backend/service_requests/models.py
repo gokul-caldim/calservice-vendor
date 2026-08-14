@@ -1,0 +1,228 @@
+"""
+workforce-app/backend/service_requests/models.py
+ServiceRequest model pointing to shared Supabase table service_requests_servicerequest (managed=False).
+"""
+from django.conf import settings
+from django.db import models
+from common.models import CompanyScopedManager
+
+SERVICE_CATEGORIES = [
+    ("hvac", "HVAC & Air Conditioning"),
+    ("electrical", "Electrical & Wiring"),
+    ("plumbing", "Plumbing & Sanitation"),
+    ("appliance_repair", "Home Appliance Repair"),
+    ("cleaning", "Cleaning & Sanitization"),
+    ("carpentry", "Carpentry & Furniture"),
+    ("painting", "Painting & Waterproofing"),
+    ("pest_control", "Pest Control"),
+    ("security", "Security & CCTV"),
+    ("general", "General Maintenance"),
+]
+
+
+def _generate_request_id():
+    last = ServiceRequest.objects.order_by("-id").first()
+    if last and last.request_id:
+        try:
+            num = int(last.request_id.split("-")[1]) + 1
+        except (IndexError, ValueError):
+            num = 1
+    else:
+        num = 1
+    return f"SR-{str(num).zfill(4)}"
+
+
+class ServiceRequest(models.Model):
+    class Status(models.TextChoices):
+        DRAFT                 = "draft",                 "Draft"
+        NEW_REQUEST           = "new_request",           "New Request"
+        PENDING_PAYMENT       = "pending_payment",       "Pending Payment"
+        CONFIRMED             = "confirmed",             "Confirmed"
+        ASSIGNED              = "assigned",              "Assigned"
+        RECEIVED              = "received",              "Received"
+        ACCEPTED              = "accepted",              "Accepted"
+        ON_THE_WAY            = "on_the_way",            "On The Way"
+        EN_ROUTE              = "en_route",              "En Route"
+        ARRIVED               = "arrived",               "Arrived"
+        IN_PROGRESS           = "in_progress",           "In Progress"
+        COMPLETED             = "completed",             "Completed"
+        CANCELLED             = "cancelled",             "Cancelled"
+        UNABLE_TO_COMPLETE    = "unable_to_complete",    "Unable To Complete"
+        FOLLOW_UP_REQUIRED    = "follow_up_required",    "Follow Up Required"
+
+    class Priority(models.TextChoices):
+        LOW    = "low",    "Low"
+        NORMAL = "normal", "Normal"
+        HIGH   = "high",   "High"
+        URGENT = "urgent", "Urgent"
+
+    class PaymentMethod(models.TextChoices):
+        COD    = "COD",    "Cash on Service"
+        ONLINE = "ONLINE", "Online Payment"
+
+    class PaymentStatus(models.TextChoices):
+        PENDING   = "pending",   "Pending"
+        COLLECTED = "collected", "Collected"
+        PAID      = "paid",      "Paid"
+        FAILED    = "failed",    "Failed"
+        CANCELLED = "cancelled", "Cancelled"
+
+    request_id = models.CharField(max_length=20, unique=True, blank=True)
+    company = models.ForeignKey(
+        "companies.Company",
+        on_delete=models.CASCADE,
+        related_name="service_requests",
+        null=True, blank=True,
+    )
+    customer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="service_requests_as_customer",
+        null=True, blank=True,
+    )
+    customer_name = models.CharField(max_length=200, blank=True, default="")
+    phone = models.CharField(max_length=30, blank=True, default="")
+    email = models.EmailField(blank=True, null=True)
+
+    service_category = models.CharField(max_length=150)
+    issue_title = models.CharField(max_length=300)
+    description = models.TextField(blank=True, default="")
+    address = models.TextField()
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
+    preferred_date = models.DateField(null=True, blank=True)
+    preferred_time = models.CharField(max_length=50, blank=True, null=True)
+    photo = models.ImageField(upload_to="service_requests/photos/", null=True, blank=True)
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    cart_data = models.JSONField(default=list, blank=True)
+
+    drop_address = models.TextField(blank=True, default="")
+    payment_method = models.CharField(
+        max_length=20,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.COD,
+        blank=True,
+    )
+    payment_status = models.CharField(
+        max_length=30,
+        choices=PaymentStatus.choices,
+        default=PaymentStatus.PENDING,
+        blank=True,
+    )
+    transaction_id = models.CharField(max_length=200, blank=True, null=True)
+    payment_gateway = models.CharField(max_length=50, blank=True, null=True)
+    invoice_id = models.CharField(max_length=50, blank=True, null=True)
+
+    status = models.CharField(max_length=30, choices=Status.choices, default=Status.NEW_REQUEST)
+    priority = models.CharField(max_length=20, choices=Priority.choices, default=Priority.NORMAL)
+
+    assigned_employee = models.ForeignKey(
+        "employees.Employee",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="assigned_service_requests",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = CompanyScopedManager()
+
+    class Meta:
+        managed = False
+        db_table = "service_requests_servicerequest"
+        ordering = ["-created_at"]
+
+
+class EmployeeJob(models.Model):
+    service_request = models.ForeignKey(
+        ServiceRequest,
+        on_delete=models.CASCADE,
+        related_name="employee_jobs",
+        db_column="service_request_id"
+    )
+    employee = models.ForeignKey(
+        "employees.Employee",
+        on_delete=models.CASCADE,
+        related_name="employee_jobs",
+        db_column="employee_id"
+    )
+    status = models.CharField(max_length=50, default="ASSIGNED")
+    assigned_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        managed = False
+        db_table = "service_requests_employeejob"
+
+    def __str__(self):
+        return f"EmployeeJob SR-{self.service_request_id} -> Emp {self.employee_id} ({self.status})"
+
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        if not self.request_id:
+            self.request_id = _generate_request_id()
+        super().save(*args, **kwargs)
+
+        if is_new and self.status in ["new_request", "confirmed", "draft"]:
+            try:
+                from workforce_api.views import run_automatic_dispatch
+                run_automatic_dispatch(self)
+            except Exception:
+                pass
+
+    def is_ready_to_complete(self):
+        """
+        Authoritative completion aggregation check for a ServiceRequest.
+        A ServiceRequest can become COMPLETED only when:
+        1. Required proof of work is submitted.
+        2. All accepted work extensions for this job are COMPLETED or RESOLVED.
+        3. All specialist secondary jobs linked to this request are COMPLETED.
+        4. No unresolved operational dependencies remain.
+        Returns:
+            (is_ready: bool, reason: str, pending_dependencies: list)
+        """
+        pending_dependencies = []
+
+        # 1. Check post-service proof
+        proof = getattr(self, "post_service_proof", None)
+        if not proof:
+            from workforce_api.models import PostServiceProof
+            proof = PostServiceProof.objects.filter(job=self).first()
+
+        if not proof or not proof.is_submitted:
+            pending_dependencies.append("Post-service proof (photos and completion notes) has not been submitted.")
+
+        # 2. Check accepted work extensions
+        from workforce_api.models import WorkforceWorkExtension
+        open_extensions = WorkforceWorkExtension.objects.filter(
+            job=self,
+            status__in=[
+                WorkforceWorkExtension.Status.REQUESTED,
+                WorkforceWorkExtension.Status.ADMIN_APPROVED,
+                WorkforceWorkExtension.Status.PENDING_ASSIGNMENT,
+                WorkforceWorkExtension.Status.CUSTOMER_ACCEPTED,
+                WorkforceWorkExtension.Status.IN_PROGRESS,
+            ]
+        )
+        for ext in open_extensions:
+            pending_dependencies.append(
+                f"Work extension #{ext.id} ('{ext.title}') is still in '{ext.status}' state."
+            )
+
+        # 3. Check specialist secondary jobs linked via cart_data or foreign keys
+        cart_data = self.cart_data or []
+        for item in cart_data:
+            if item.get("type") == "specialist_job" and item.get("job_id"):
+                s_job = ServiceRequest.objects.filter(pk=item["job_id"]).first()
+                if s_job and s_job.status not in ["completed", "cancelled"]:
+                    pending_dependencies.append(
+                        f"Secondary specialist job #{s_job.id} is still in '{s_job.status}' state."
+                    )
+
+        is_ready = len(pending_dependencies) == 0
+        reason = "Ready for completion." if is_ready else f"Cannot complete ServiceRequest: {'; '.join(pending_dependencies)}"
+        return is_ready, reason, pending_dependencies
+
+    def __str__(self):
+        return f"{self.request_id or f'SR #{self.pk}'} - {self.issue_title} ({self.status})"

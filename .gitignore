@@ -1,0 +1,70 @@
+# ==========================================
+# Environment & Secret Files (CRITICAL SECURITY)
+# ==========================================
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env
+*.pem
+*.key
+*.crt
+
+# ==========================================
+# Python / Django Backend
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/venv/
+backend/env/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Django media & database
+backend/media/
+*.sqlite3
+*.sqlite3-journal
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ==========================================
+# Node.js / React Frontend
+# ==========================================
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+dist/
+build/
+.next/
+.out/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==========================================
+# IDE & System Files
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Archives & Temp Files
+*.zip
+*.tar.gz
+*.rar

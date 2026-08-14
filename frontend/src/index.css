@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-100 text-slate-900 font-sans text-xs antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  /* Form controls density */
+  input[type="text"],
+  input[type="email"],
+  input[type="password"],
+  input[type="number"],
+  input[type="tel"],
+  input[type="date"],
+  select,
+  textarea {
+    @apply bg-white border border-slate-300 text-slate-900 text-xs rounded shadow-sm focus:ring-1 focus:ring-blue-600 focus:border-blue-600 transition-colors;
+  }
+}
+
+/* Enterprise Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Enterprise panel and table classes */
+.enterprise-card {
+  @apply bg-white border border-slate-200 rounded shadow-sm;
+}
+
+.enterprise-header {
+  @apply bg-slate-900 text-white;
+}
+
+.table-header {
+  @apply bg-slate-50 text-slate-700 text-[11px] font-semibold uppercase tracking-wider border-b border-slate-200;
+}
+
+.table-row {
+  @apply hover:bg-slate-50/80 transition-colors border-b border-slate-100;
+}
+
