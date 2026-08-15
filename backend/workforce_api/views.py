@@ -2725,6 +2725,31 @@ class WorkforceLocationUpdateView(APIView):
                         "geofence_passed": True,
                         "status": "arrived",
                     })
+
+                # Publish real-time JOB_LOCATION_UPDATE event for customer tracking stream
+                if job.customer:
+                    try:
+                        from workforce_api.models import WorkforceEventLog
+                        WorkforceEventLog.objects.create(
+                            user=job.customer,
+                            event_type="JOB_LOCATION_UPDATE",
+                            payload={
+                                "type": "JOB_LOCATION_UPDATE",
+                                "job_id": job.id,
+                                "employee_id": emp.id,
+                                "employee_name": user.get_full_name() or user.username,
+                                "employee_location": {
+                                    "latitude": round(lat_f, 7),
+                                    "longitude": round(lng_f, 7),
+                                    "accuracy": round(float(accuracy), 2) if accuracy is not None else None,
+                                    "updated_at": now.isoformat(),
+                                },
+                                "status": job.status.upper(),
+                                "distance_m": round(dist_m, 1),
+                            }
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -2739,6 +2764,80 @@ class WorkforceLocationUpdateView(APIView):
             "message": "Live GPS coordinates updated.",
             "location": user.last_known_location,
             "arrived_events": arrived_events,
+        }, status=status.HTTP_200_OK)
+
+
+class WorkforceJobLiveTrackingView(APIView):
+    """
+    Returns live tracking coordinates and metadata for an assigned job.
+    Accessible only to the authorized customer who owns the booking,
+    the assigned technician, or company admin.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        user = request.user
+        from service_requests.models import ServiceRequest
+        job = ServiceRequest.objects.filter(pk=pk).select_related("assigned_employee__user", "customer", "company").first()
+        if not job:
+            return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+        is_owner_customer = (job.customer == user)
+        is_assigned_tech = (job.assigned_employee and job.assigned_employee.user == user)
+        is_company_admin = (is_admin_role(user) and job.company == getattr(user, "company", None))
+
+        if not (is_owner_customer or is_assigned_tech or is_company_admin):
+            return Response({
+                "error": "Unauthorized to view tracking for this job.",
+                "code": "UNAUTHORIZED_TRACKING"
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        tech = job.assigned_employee
+        tech_loc = None
+        if tech and tech.user and tech.user.last_known_location:
+            tech_loc = tech.user.last_known_location
+
+        cust_lat = float(job.latitude) if job.latitude else None
+        cust_lon = float(job.longitude) if job.longitude else None
+
+        distance_m = None
+        if tech_loc and tech_loc.get("latitude") and tech_loc.get("longitude") and cust_lat and cust_lon:
+            try:
+                from time_tracking.geo import haversine_distance
+                distance_m = round(haversine_distance(
+                    float(tech_loc["latitude"]),
+                    float(tech_loc["longitude"]),
+                    cust_lat,
+                    cust_lon
+                ), 1)
+            except Exception:
+                pass
+
+        verification = getattr(job, "pre_service_verification", None)
+        if not verification:
+            from workforce_api.models import PreServiceVerification
+            verification = PreServiceVerification.objects.filter(job=job).first()
+        geofence_passed = bool(verification and verification.geofence_passed)
+
+        return Response({
+            "job_id": job.id,
+            "request_id": job.request_id,
+            "status": job.status,
+            "customer_location": {
+                "latitude": cust_lat,
+                "longitude": cust_lon,
+                "address": job.address or "",
+            },
+            "assigned_technician": {
+                "id": tech.id if tech else None,
+                "name": (tech.user.get_full_name() or tech.user.username) if tech and tech.user else None,
+                "phone": tech.phone if tech else "",
+                "location": tech_loc,
+            } if tech else None,
+            "distance_m": distance_m,
+            "geofence_passed": geofence_passed,
+            "geofence_radius_meters": 300.0,
+            "updated_at": timezone.now().isoformat(),
         }, status=status.HTTP_200_OK)
 
 

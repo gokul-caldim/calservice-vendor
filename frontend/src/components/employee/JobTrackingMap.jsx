@@ -1,17 +1,19 @@
 /**
  * JobTrackingMap.jsx
  *
- * Swiggy / Uber Style Live Customer Location & Navigation Route Tracking Component.
+ * Ultra-Clear Swiggy / Rapido Style Live Customer Location & Navigation Route Tracking.
  *
  * Features:
- *  - Real road-network route calculation via Google Maps DirectionsService & DirectionsRenderer.
- *  - Live Driving ETA (e.g. "12 mins") and Driving Distance (e.g. "3.8 km") from Google Maps routing engine.
- *  - Swiggy-style delivery tracking UI with floating ETA pill, progress bar, and destination address.
- *  - Custom animated technician vehicle marker and pulsating customer site target pin.
- *  - 300m visual arrival geofence perimeter around customer location.
- *  - Dynamic route updates as technician moves physically (driven by workforce:location-updated event).
- *  - 1-tap Google Maps turn-by-turn navigation launcher.
- *  - Viewport controls: Fit Route, Follow Technician, Focus Customer, Refresh GPS.
+ *  - Instant automatic GPS detection on component mount (zero manual clicks required).
+ *  - Crystal-clear visual identification:
+ *      * 🏠 Custom Vivid Red Customer Pin with Home Badge & Floating Site Label.
+ *      * 🚗 Custom Electric Blue Moving Technician Vehicle Pin with Pulsing Radar Halo.
+ *      * 🟢 Translucent 300m Automatic Arrival Geofence Zone.
+ *  - Real road network turn-by-turn routing via Google Maps Directions API.
+ *  - Real-time Road Distance (e.g. "2.4 km") and Driving ETA (e.g. "8 min", "Arriving now").
+ *  - Prominent Floating Customer Identity & Action Card overlay.
+ *  - Follow-Me Mode (auto-tracks vehicle; pauses on map drag; 1-click resume).
+ *  - 1-Tap Google Maps Driving Navigation Launcher.
  *  - Zero manual arrival buttons (100% backend automatic geofence evaluation).
  */
 
@@ -32,6 +34,8 @@ import {
   Clock,
   Radio,
   Zap,
+  Phone,
+  LocateFixed,
 } from 'lucide-react';
 import { getGPSPosition } from '../../hooks/useGPSPosition.js';
 import { apiUpdateLocationFull } from '../../api/workforceService.js';
@@ -113,6 +117,7 @@ export function JobTrackingMap({
   technicianLocation,
   preServiceState = {},
   geofenceRadius = 300,
+  viewRole = 'technician', // 'technician' or 'customer'
 }) {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
@@ -124,6 +129,7 @@ export function JobTrackingMap({
   const fallbackPolylineRef = useRef(null);
   const infoWindowRef = useRef(null);
   const lastDirectionsTimeRef = useRef(0);
+  const lastRoutedCoordsRef = useRef({ lat: null, lng: null });
 
   const [apiLoaded, setApiLoaded] = useState(false);
   const [apiError, setApiError] = useState(null);
@@ -132,11 +138,44 @@ export function JobTrackingMap({
   const [roadEtaText, setRoadEtaText] = useState(null);
   const [roadDistanceText, setRoadDistanceText] = useState(null);
   const [isRefreshingGps, setIsRefreshingGps] = useState(false);
+  const [isFollowMe, setIsFollowMe] = useState(true);
+  const [lastUpdateSecondsAgo, setLastUpdateSecondsAgo] = useState(0);
 
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_KEY;
 
   const custLat = job?.latitude != null ? parseFloat(job.latitude) : null;
   const custLon = job?.longitude != null ? parseFloat(job.longitude) : null;
+
+  // 1. Auto-Acquire GPS immediately on mount if not provided via prop
+  useEffect(() => {
+    if (!liveTechCoords?.latitude) {
+      getGPSPosition(false)
+        .then((pos) => {
+          if (pos?.coords) {
+            const newCoords = {
+              latitude: pos.coords.latitude,
+              longitude: pos.coords.longitude,
+              accuracy: pos.coords.accuracy,
+              updated_at: new Date().toISOString(),
+            };
+            setLiveTechCoords(newCoords);
+            window.dispatchEvent(
+              new CustomEvent('workforce:location-updated', {
+                detail: {
+                  latitude: newCoords.latitude,
+                  longitude: newCoords.longitude,
+                  accuracy: newCoords.accuracy,
+                  timestamp: Date.now(),
+                  source: 'mount_auto_detect',
+                },
+              })
+            );
+            apiUpdateLocationFull(newCoords.latitude, newCoords.longitude, newCoords.accuracy).catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }
+  }, [liveTechCoords?.latitude]);
 
   // Load Google Maps API script
   useEffect(() => {
@@ -177,14 +216,40 @@ export function JobTrackingMap({
     }
   }, [custLat, custLon, liveTechCoords]);
 
+  // Location Freshness Timer
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (liveTechCoords?.updated_at) {
+        const diffSec = Math.max(0, Math.round((Date.now() - new Date(liveTechCoords.updated_at).getTime()) / 1000));
+        setLastUpdateSecondsAgo(diffSec);
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [liveTechCoords]);
+
   // Request road directions and ETA via Google Maps Directions API
-  const updateRoadRoute = useCallback((originLat, originLng, destLat, destLng) => {
+  const updateRoadRoute = useCallback((originLat, originLng, destLat, destLng, force = false) => {
     if (!window.google?.maps || !directionsServiceRef.current || !directionsRendererRef.current) return;
 
-    // Throttle directions requests to at most once every 6 seconds to respect rate limits
     const now = Date.now();
-    if (now - lastDirectionsTimeRef.current < 6000) return;
+    // Throttle directions requests to at most once every 4 seconds
+    if (!force && now - lastDirectionsTimeRef.current < 4000) return;
+
+    // Check if technician moved significantly (> 40 meters) from last routed point
+    if (!force && lastRoutedCoordsRef.current.lat != null && lastRoutedCoordsRef.current.lng != null) {
+      const movedDist = calculateDistanceMeters(
+        originLat,
+        originLng,
+        lastRoutedCoordsRef.current.lat,
+        lastRoutedCoordsRef.current.lng
+      );
+      if (movedDist != null && movedDist < 40 && now - lastDirectionsTimeRef.current < 20000) {
+        return;
+      }
+    }
+
     lastDirectionsTimeRef.current = now;
+    lastRoutedCoordsRef.current = { lat: originLat, lng: originLng };
 
     const origin = new window.google.maps.LatLng(originLat, originLng);
     const dest = new window.google.maps.LatLng(destLat, destLng);
@@ -214,8 +279,8 @@ export function JobTrackingMap({
               fallbackPolylineRef.current = new window.google.maps.Polyline({
                 geodesic: true,
                 strokeColor: '#2563EB',
-                strokeOpacity: 0.8,
-                strokeWeight: 4,
+                strokeOpacity: 0.85,
+                strokeWeight: 6,
                 map: mapRef.current,
               });
             }
@@ -227,7 +292,7 @@ export function JobTrackingMap({
     );
   }, []);
 
-  // Listen to live GPS location updates from useLocationTracker or TopHeader
+  // Listen to live GPS location updates from single global watcher or TopHeader
   useEffect(() => {
     const handleLocationUpdate = (e) => {
       const detail = e.detail;
@@ -246,6 +311,11 @@ export function JobTrackingMap({
             const latLng = new window.google.maps.LatLng(newCoords.latitude, newCoords.longitude);
             techMarkerRef.current.setPosition(latLng);
 
+            // Follow-me auto pan
+            if (isFollowMe && mapRef.current) {
+              mapRef.current.panTo(latLng);
+            }
+
             // Dynamically recalculate driving route and ETA
             if (custLat != null && custLon != null) {
               updateRoadRoute(newCoords.latitude, newCoords.longitude, custLat, custLon);
@@ -259,9 +329,9 @@ export function JobTrackingMap({
     return () => {
       window.removeEventListener('workforce:location-updated', handleLocationUpdate);
     };
-  }, [custLat, custLon, updateRoadRoute]);
+  }, [custLat, custLon, isFollowMe, updateRoadRoute]);
 
-  // Initialize interactive Google Map
+  // Initialize interactive Google Map with custom high-visibility SVG pins
   useEffect(() => {
     if (!apiLoaded || !mapContainerRef.current) return;
     if (!window.google?.maps?.Map || typeof window.google.maps.Map !== 'function') return;
@@ -269,8 +339,8 @@ export function JobTrackingMap({
     try {
       const google = window.google;
 
-      const defaultCenterLat = custLat ?? 12.9716;
-      const defaultCenterLng = custLon ?? 77.5946;
+      const defaultCenterLat = custLat ?? (liveTechCoords?.latitude != null ? liveTechCoords.latitude : 0);
+      const defaultCenterLng = custLon ?? (liveTechCoords?.longitude != null ? liveTechCoords.longitude : 0);
 
       const map = new google.maps.Map(mapContainerRef.current, {
         center: { lat: defaultCenterLat, lng: defaultCenterLng },
@@ -295,11 +365,16 @@ export function JobTrackingMap({
       mapRef.current = map;
       infoWindowRef.current = new google.maps.InfoWindow();
 
-      // Swiggy-Style Road Directions Service & Renderer
+      // Pause Follow-Me mode when user manually drags/pans map
+      map.addListener('dragstart', () => {
+        setIsFollowMe(false);
+      });
+
+      // Swiggy / Rapido Style Road Directions Service & Renderer
       const directionsService = new google.maps.DirectionsService();
       const directionsRenderer = new google.maps.DirectionsRenderer({
         map,
-        suppressMarkers: true, // We use our custom animated Swiggy pins
+        suppressMarkers: true, // Use custom high-contrast SVG pins
         polylineOptions: {
           strokeColor: '#2563EB', // Electric Blue Primary Route
           strokeWeight: 6,
@@ -311,38 +386,65 @@ export function JobTrackingMap({
 
       const bounds = new google.maps.LatLngBounds();
 
-      // 1. Customer Destination Marker (Home Icon Pin)
+      // ── 1. High-Visibility Customer Destination Marker (🏠 Vivid Red Pin with Home Icon) ──
       if (custLat != null && custLon != null) {
         const custPos = { lat: custLat, lng: custLon };
         bounds.extend(custPos);
+
+        // Custom High-Resolution SVG Customer Pin
+        const customerPinSvg = {
+          url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`
+            <svg xmlns="http://www.w3.org/2000/svg" width="46" height="54" viewBox="0 0 46 54">
+              <defs>
+                <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#000000" flood-opacity="0.4"/>
+                </filter>
+              </defs>
+              <g filter="url(#shadow)">
+                <path d="M23 0C10.3 0 0 10.3 0 23c0 15.2 20.4 30.1 21.3 30.8a2.5 2.5 0 0 0 3.4 0C25.6 53.1 46 38.2 46 23 46 10.3 35.7 0 23 0z" fill="#DC2626" stroke="#FFFFFF" stroke-width="2.5"/>
+                <circle cx="23" cy="21" r="14" fill="#FFFFFF"/>
+                <path d="M23 12l-8 7v9h5v-6h6v6h5v-9l-8-7z" fill="#DC2626"/>
+              </g>
+            </svg>
+          `)}`,
+          scaledSize: new google.maps.Size(42, 50),
+          anchor: new google.maps.Point(21, 50),
+        };
 
         const custMarker = new google.maps.Marker({
           position: custPos,
           map,
           title: `Customer Site: ${job.address || 'Service Location'}`,
-          icon: {
-            path: google.maps.SymbolPath.BACKWARD_CLOSED_ARROW,
-            scale: 7,
-            fillColor: '#EF4444', // Red
-            fillOpacity: 1,
-            strokeColor: '#FFFFFF',
-            strokeWeight: 2.5,
-          },
-          zIndex: 100,
+          icon: customerPinSvg,
+          zIndex: 150,
+          animation: google.maps.Animation.DROP,
         });
         custMarkerRef.current = custMarker;
 
         custMarker.addListener('click', () => {
           const content = `
-            <div style="font-family: system-ui, sans-serif; padding: 6px; max-width: 240px;">
-              <div style="font-size: 11px; font-weight: 700; color: #1E293B; margin-bottom: 2px;">
-                🏠 ${job.customer_name || 'Customer Site'}
+            <div style="font-family: system-ui, -apple-system, sans-serif; padding: 6px; max-width: 250px;">
+              <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">
+                <span style="background: #FEE2E2; color: #991B1B; font-weight: 800; font-size: 10px; padding: 2px 6px; border-radius: 4px; text-transform: uppercase;">
+                  Customer Site
+                </span>
+                <span style="font-weight: 700; font-size: 11px; color: #1E293B;">
+                  Job #${job.request_id || job.id}
+                </span>
               </div>
-              <div style="font-size: 10px; color: #64748B; margin-bottom: 4px;">
+              <div style="font-size: 12px; font-weight: 700; color: #0F172A; margin-bottom: 2px;">
+                ${job.customer_name || 'Customer Site'}
+              </div>
+              <div style="font-size: 11px; color: #64748B; margin-bottom: 6px; line-height: 1.3;">
                 ${job.address || 'Destination Address'}
               </div>
-              <div style="font-size: 10px; font-weight: 600; color: #2563EB;">
-                Job #${job.request_id || job.id} (${job.issue_title || job.service_category || 'Service'})
+              <div style="border-top: 1px solid #E2E8F0; padding-top: 4px; display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-size: 10px; font-weight: 600; color: #2563EB;">
+                  ${job.issue_title || job.service_category || 'Service Request'}
+                </span>
+                <span style="font-size: 10px; color: #10B981; font-weight: 700;">
+                  300m Arrival Zone
+                </span>
               </div>
             </div>
           `;
@@ -350,38 +452,51 @@ export function JobTrackingMap({
           infoWindowRef.current.open(map, custMarker);
         });
 
-        // 2. Geofence Arrival Radius Circle (300m visual guidance)
+        // ── 2. Geofence Arrival Radius Circle (300m visual guidance) ──
         const geofenceCircle = new google.maps.Circle({
           map,
           center: custPos,
           radius: geofenceRadius,
           strokeColor: '#10B981', // Emerald
-          strokeOpacity: 0.8,
-          strokeWeight: 2,
+          strokeOpacity: 0.85,
+          strokeWeight: 2.5,
           fillColor: '#10B981',
-          fillOpacity: 0.14,
+          fillOpacity: 0.12,
           zIndex: 10,
         });
         geofenceCircleRef.current = geofenceCircle;
       }
 
-      // 3. Technician Moving Vehicle Marker (Swiggy / Uber Vehicle Pin)
+      // ── 3. High-Visibility Technician Moving Vehicle Marker (🚗 Blue Van with Pulsing Radar Halo) ──
       if (liveTechCoords?.latitude != null && liveTechCoords?.longitude != null) {
         const techPos = { lat: liveTechCoords.latitude, lng: liveTechCoords.longitude };
         bounds.extend(techPos);
 
+        const technicianVehicleSvg = {
+          url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`
+            <svg xmlns="http://www.w3.org/2000/svg" width="54" height="54" viewBox="0 0 54 54">
+              <defs>
+                <filter id="carShadow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#1E3A8A" flood-opacity="0.45"/>
+                </filter>
+              </defs>
+              <!-- Outer Radar Ripple -->
+              <circle cx="27" cy="27" r="25" fill="#3B82F6" fill-opacity="0.2"/>
+              <!-- Core Badge -->
+              <circle cx="27" cy="27" r="18" fill="#2563EB" stroke="#FFFFFF" stroke-width="3" filter="url(#carShadow)"/>
+              <!-- Service Van / Car SVG -->
+              <path d="M20 29a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm14 0a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm-17-7l2-5h16l2 5h2a2 2 0 0 1 2 2v6h-2a3 3 0 0 1-6 0h-8a3 3 0 0 1-6 0h-2v-6a2 2 0 0 1 2-2h2zm2-1l-1.5 4h19l-1.5-4H21z" fill="#FFFFFF"/>
+            </svg>
+          `)}`,
+          scaledSize: new google.maps.Size(48, 48),
+          anchor: new google.maps.Point(24, 24),
+        };
+
         const techMarker = new google.maps.Marker({
           position: techPos,
           map,
-          title: 'You (Technician)',
-          icon: {
-            path: google.maps.SymbolPath.CIRCLE,
-            scale: 10,
-            fillColor: '#2563EB', // Electric Blue
-            fillOpacity: 1,
-            strokeColor: '#FFFFFF',
-            strokeWeight: 3.5,
-          },
+          title: viewRole === 'customer' ? 'Technician Live Location' : 'You (Technician)',
+          icon: technicianVehicleSvg,
           zIndex: 200,
         });
         techMarkerRef.current = techMarker;
@@ -389,9 +504,13 @@ export function JobTrackingMap({
         techMarker.addListener('click', () => {
           const accuracyText = liveTechCoords.accuracy ? `±${Math.round(liveTechCoords.accuracy)}m` : 'GPS Fix';
           const content = `
-            <div style="font-family: system-ui, sans-serif; padding: 4px;">
-              <div style="font-size: 11px; font-weight: 700; color: #2563EB;">🚗 Your Live GPS Location</div>
-              <div style="font-size: 10px; color: #64748B;">Accuracy: ${accuracyText}</div>
+            <div style="font-family: system-ui, -apple-system, sans-serif; padding: 4px;">
+              <div style="font-size: 11px; font-weight: 800; color: #2563EB; margin-bottom: 2px;">
+                🚗 ${viewRole === 'customer' ? 'Assigned Technician Location' : 'Your Live Location (Technician)'}
+              </div>
+              <div style="font-size: 10px; color: #64748B;">
+                GPS Accuracy: ${accuracyText} • Driving to Customer
+              </div>
             </div>
           `;
           infoWindowRef.current.setContent(content);
@@ -400,29 +519,32 @@ export function JobTrackingMap({
 
         // Calculate initial road route and ETA
         if (custLat != null && custLon != null) {
-          updateRoadRoute(liveTechCoords.latitude, liveTechCoords.longitude, custLat, custLon);
+          updateRoadRoute(liveTechCoords.latitude, liveTechCoords.longitude, custLat, custLon, true);
         }
       }
 
       // Auto-fit bounds
       if (custLat != null && liveTechCoords?.latitude != null) {
-        map.fitBounds(bounds, { top: 40, right: 40, bottom: 40, left: 40 });
+        map.fitBounds(bounds, { top: 60, right: 60, bottom: 60, left: 60 });
       }
     } catch (err) {
       console.warn('Map rendering error:', err);
     }
-  }, [apiLoaded, custLat, custLon, updateRoadRoute]);
+  }, [apiLoaded, custLat, custLon, updateRoadRoute, viewRole]);
 
   // Recenter map on customer
   const handleFocusCustomer = () => {
     if (mapRef.current && custLat != null && custLon != null) {
+      setIsFollowMe(false);
       mapRef.current.panTo({ lat: custLat, lng: custLon });
       mapRef.current.setZoom(17);
     }
   };
 
-  // Recenter map on technician
-  const handleFocusTechnician = () => {
+  // Follow Me toggle / Recenter on technician
+  const handleToggleFollowMe = () => {
+    const next = !isFollowMe;
+    setIsFollowMe(next);
     if (mapRef.current && liveTechCoords?.latitude != null && liveTechCoords?.longitude != null) {
       mapRef.current.panTo({ lat: liveTechCoords.latitude, lng: liveTechCoords.longitude });
       mapRef.current.setZoom(17);
@@ -431,15 +553,16 @@ export function JobTrackingMap({
 
   // Fit both markers into viewport (Fit Route)
   const handleFitRouteBounds = () => {
+    setIsFollowMe(false);
     if (mapRef.current && window.google?.maps && custLat != null && liveTechCoords?.latitude != null) {
       const bounds = new window.google.maps.LatLngBounds();
       bounds.extend({ lat: custLat, lng: custLon });
       bounds.extend({ lat: liveTechCoords.latitude, lng: liveTechCoords.longitude });
-      mapRef.current.fitBounds(bounds, { top: 40, right: 40, bottom: 40, left: 40 });
+      mapRef.current.fitBounds(bounds, { top: 60, right: 60, bottom: 60, left: 60 });
     }
   };
 
-  // One-time manual GPS refresh
+  // Manual GPS refresh / Fix
   const handleManualGpsRefresh = async () => {
     if (isRefreshingGps) return;
     setIsRefreshingGps(true);
@@ -447,12 +570,13 @@ export function JobTrackingMap({
       const pos = await getGPSPosition(true);
       const { latitude, longitude, accuracy } = pos.coords;
       await apiUpdateLocationFull(latitude, longitude, accuracy);
-      setLiveTechCoords({
+      const newCoords = {
         latitude,
         longitude,
         accuracy,
         updated_at: new Date().toISOString(),
-      });
+      };
+      setLiveTechCoords(newCoords);
       window.dispatchEvent(
         new CustomEvent('workforce:location-updated', {
           detail: {
@@ -460,12 +584,12 @@ export function JobTrackingMap({
             longitude,
             accuracy,
             timestamp: Date.now(),
-            source: 'map_refresh',
+            source: 'manual_fix',
           },
         })
       );
       if (custLat != null && custLon != null) {
-        updateRoadRoute(latitude, longitude, custLat, custLon);
+        updateRoadRoute(latitude, longitude, custLat, custLon, true);
       }
     } catch (_) {
     } finally {
@@ -481,28 +605,31 @@ export function JobTrackingMap({
     preServiceState?.geofence_passed
   );
 
-  // Status computation for Swiggy banner
+  // Status computation for operational banner
   const statusInfo = useMemo(() => {
     if (!liveTechCoords?.latitude || !liveTechCoords?.longitude) {
-      return { label: 'Location Unavailable', sub: 'Waiting for GPS telemetry fix...', tone: 'amber' };
+      return { code: 'NO_LOCATION', label: 'ACQUIRING LIVE GPS', sub: 'Fetching high-accuracy vehicle telemetry...', tone: 'amber' };
+    }
+    if (lastUpdateSecondsAgo > 300) {
+      return { code: 'LOCATION_STALE', label: 'LOCATION STALE', sub: `Last updated ${Math.round(lastUpdateSecondsAgo / 60)}m ago. Tap Refresh GPS.`, tone: 'amber' };
     }
     if (job?.status === 'completed') {
-      return { label: 'Job Completed', sub: 'Service completed successfully.', tone: 'emerald' };
+      return { code: 'COMPLETED', label: 'JOB COMPLETED', sub: 'Service completed successfully.', tone: 'emerald' };
     }
     if (job?.status === 'in_progress') {
-      return { label: 'Work In Progress', sub: 'Technician currently servicing appliance at customer site.', tone: 'blue' };
+      return { code: 'IN_PROGRESS', label: 'WORK IN PROGRESS', sub: 'Technician currently servicing appliance at customer site.', tone: 'blue' };
     }
     if (isBackendArrived) {
-      return { label: 'Arrived at Customer Location', sub: 'Inside 300m site perimeter. Work Start OTP required.', tone: 'emerald' };
+      return { code: 'ARRIVED', label: 'ARRIVAL VERIFIED', sub: 'Inside 300m site perimeter. Customer Work Start OTP required.', tone: 'emerald' };
     }
     if (distanceMeters != null && distanceMeters <= geofenceRadius) {
-      return { label: 'Approaching Customer Destination', sub: 'Entering 300m arrival perimeter...', tone: 'blue' };
+      return { code: 'ARRIVING_NOW', label: 'ARRIVING SOON', sub: 'Entering 300m arrival perimeter...', tone: 'blue' };
     }
     if (distanceMeters != null && distanceMeters <= 1000) {
-      return { label: 'Approaching Customer', sub: 'Technician is under 1 km away.', tone: 'blue' };
+      return { code: 'APPROACHING', label: 'APPROACHING CUSTOMER', sub: 'Technician is within 1 km of destination.', tone: 'blue' };
     }
-    return { label: 'En Route to Customer', sub: 'Driving along authorized road route.', tone: 'slate' };
-  }, [liveTechCoords, job?.status, isBackendArrived, distanceMeters, geofenceRadius]);
+    return { code: 'ON_THE_WAY', label: 'ON THE WAY', sub: 'Driving along authorized road route.', tone: 'slate' };
+  }, [liveTechCoords, lastUpdateSecondsAgo, job?.status, isBackendArrived, distanceMeters, geofenceRadius]);
 
   const displayDistance = roadDistanceText || (
     distanceMeters != null
@@ -515,17 +642,21 @@ export function JobTrackingMap({
   const displayEta = roadEtaText || (
     distanceMeters != null
       ? distanceMeters <= 300
-        ? 'Arriving Now'
-        : `${Math.max(1, Math.round((distanceMeters / 1000) * 3))} mins`
+        ? 'Arriving now'
+        : `${Math.max(1, Math.round((distanceMeters / 1000) * 3))} min`
       : '--'
   );
 
+  // GPS Accuracy & Quality Assessment
+  const accuracyMeters = liveTechCoords?.accuracy != null ? Math.round(liveTechCoords.accuracy) : null;
+  const isAccuracyLow = accuracyMeters != null && accuracyMeters > 50;
+
   return (
-    <div className="w-full bg-white border border-slate-200 rounded-xl overflow-hidden shadow-md">
-      {/* Swiggy / Uber Style Header Tracking Card */}
+    <div className="w-full bg-white border border-slate-200 rounded-xl overflow-hidden shadow-lg">
+      {/* ── Swiggy / Rapido Operational Header Tracking Panel ── */}
       <div className="p-3.5 bg-gradient-to-r from-slate-950 via-slate-900 to-blue-950 text-white">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          {/* Status & ETA Pill */}
+          {/* Status & Vehicle Indicator */}
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-blue-600/30 border border-blue-400/40 flex items-center justify-center text-blue-400 shrink-0 shadow-inner">
               {isBackendArrived ? (
@@ -537,8 +668,8 @@ export function JobTrackingMap({
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <h3 className="text-xs font-black text-white tracking-wider uppercase flex items-center gap-1.5">
-                  <span>{statusInfo.label}</span>
-                  {!isBackendArrived && (
+                  <span>🚗 {statusInfo.label}</span>
+                  {!isBackendArrived && liveTechCoords?.latitude && (
                     <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping inline-block" />
                   )}
                 </h3>
@@ -549,13 +680,25 @@ export function JobTrackingMap({
             </div>
           </div>
 
-          {/* Real-Time Live Road ETA & Distance Badge */}
-          <div className="flex items-center gap-3 ml-auto">
-            {!isBackendArrived && (
+          {/* Real-Time Live Road ETA, Distance Badge & Quick Navigation */}
+          <div className="flex items-center gap-2.5 ml-auto">
+            {!liveTechCoords?.latitude && (
+              <button
+                type="button"
+                onClick={handleManualGpsRefresh}
+                disabled={isRefreshingGps}
+                className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5 shadow transition-all active:scale-95 animate-pulse"
+              >
+                <LocateFixed className="w-3.5 h-3.5" />
+                <span>{isRefreshingGps ? 'Locating...' : 'Enable Live GPS'}</span>
+              </button>
+            )}
+
+            {liveTechCoords?.latitude && !isBackendArrived && (
               <div className="bg-slate-800/90 border border-slate-700/80 rounded-lg px-3 py-1 text-center backdrop-blur-sm">
                 <span className="text-[10px] text-slate-400 block font-semibold uppercase tracking-wider flex items-center justify-center gap-1">
                   <Clock className="w-3 h-3 text-blue-400" />
-                  Est. ETA
+                  ETA
                 </span>
                 <span className="text-sm font-black font-mono text-emerald-400 tracking-tight">
                   {displayEta}
@@ -563,17 +706,19 @@ export function JobTrackingMap({
               </div>
             )}
 
-            <div className="bg-slate-800/90 border border-slate-700/80 rounded-lg px-3 py-1 text-center backdrop-blur-sm">
-              <span className="text-[10px] text-slate-400 block font-semibold uppercase tracking-wider flex items-center justify-center gap-1">
-                <Navigation className="w-3 h-3 text-emerald-400" />
-                Distance
-              </span>
-              <span className="text-sm font-black font-mono text-white tracking-tight">
-                {displayDistance}
-              </span>
-            </div>
+            {liveTechCoords?.latitude && (
+              <div className="bg-slate-800/90 border border-slate-700/80 rounded-lg px-3 py-1 text-center backdrop-blur-sm">
+                <span className="text-[10px] text-slate-400 block font-semibold uppercase tracking-wider flex items-center justify-center gap-1">
+                  <Navigation className="w-3 h-3 text-emerald-400" />
+                  Remaining
+                </span>
+                <span className="text-sm font-black font-mono text-white tracking-tight">
+                  {displayDistance}
+                </span>
+              </div>
+            )}
 
-            {job?.latitude != null && job?.longitude != null && (
+            {viewRole === 'technician' && job?.latitude != null && job?.longitude != null && (
               <a
                 href={`https://www.google.com/maps/dir/?api=1&destination=${job.latitude},${job.longitude}`}
                 target="_blank"
@@ -588,42 +733,84 @@ export function JobTrackingMap({
           </div>
         </div>
 
-        {/* Customer Destination Address Ribbon */}
-        <div className="mt-2.5 pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-300 gap-2">
+        {/* Customer Destination Address Ribbon & Live GPS Quality Indicators */}
+        <div className="mt-2.5 pt-2 border-t border-slate-800/80 flex flex-wrap items-center justify-between text-xs text-slate-300 gap-2">
           <div className="flex items-center gap-1.5 min-w-0 truncate">
             <Home className="w-3.5 h-3.5 text-red-400 shrink-0" />
-            <span className="font-semibold text-slate-200 shrink-0">Customer:</span>
+            <span className="font-semibold text-slate-200 shrink-0">
+              {viewRole === 'customer' ? 'Your Location:' : 'Customer Site:'}
+            </span>
             <span className="truncate text-slate-300">{job?.address || 'Service Destination'}</span>
           </div>
-          {liveTechCoords?.accuracy != null && (
-            <span className="text-[10px] text-slate-400 font-mono shrink-0">
-              GPS ±{Math.round(liveTechCoords.accuracy)}m
-            </span>
-          )}
+
+          <div className="flex items-center gap-2.5 shrink-0 text-[10px] font-mono">
+            {accuracyMeters != null && (
+              <span className={`px-2 py-0.5 rounded ${isAccuracyLow ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30' : 'bg-slate-800 text-slate-300'}`}>
+                {isAccuracyLow ? `⚠️ Low GPS (±${accuracyMeters}m)` : `GPS ±${accuracyMeters}m`}
+              </span>
+            )}
+            {lastUpdateSecondsAgo > 0 && (
+              <span className={`px-2 py-0.5 rounded ${lastUpdateSecondsAgo > 120 ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30' : 'bg-slate-800 text-slate-400'}`}>
+                {lastUpdateSecondsAgo > 120
+                  ? `⚠️ Last updated ${Math.round(lastUpdateSecondsAgo / 60)}m ago`
+                  : `Updated ${lastUpdateSecondsAgo}s ago`}
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
-      {/* Interactive Google Map with Road Route Polyline */}
-      <div className="relative w-full h-[280px] sm:h-[340px] bg-slate-100">
+      {/* ── Interactive Google Map Container ── */}
+      <div className="relative w-full h-[320px] sm:h-[380px] bg-slate-100">
         <div ref={mapContainerRef} className="w-full h-full" />
 
-        {/* Swiggy-Style Map Action Control Buttons Overlay */}
+        {/* ── Floating Customer Destination Badge (Top-Left on Map) ── */}
+        <div className="absolute top-3 left-3 bg-white/95 backdrop-blur-md px-3.5 py-2.5 rounded-xl border border-slate-200/90 shadow-lg text-slate-800 max-w-[260px] sm:max-w-[300px] z-10">
+          <div className="flex items-center justify-between gap-2 mb-1">
+            <span className="inline-flex items-center gap-1 text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full bg-red-100 text-red-800">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-600 animate-pulse" />
+              Customer Destination
+            </span>
+            {job?.phone && (
+              <a
+                href={`tel:${job.phone}`}
+                className="text-[11px] text-blue-600 hover:text-blue-700 font-bold flex items-center gap-1"
+                title="Call Customer"
+              >
+                <Phone className="w-3 h-3" />
+                <span>Call</span>
+              </a>
+            )}
+          </div>
+          <p className="text-xs font-bold text-slate-900 truncate">
+            {job?.customer_name || 'Customer Site'}
+          </p>
+          <p className="text-[11px] text-slate-600 line-clamp-2 leading-tight mt-0.5">
+            {job?.address || 'Destination Address'}
+          </p>
+        </div>
+
+        {/* ── Map Viewport Controls Overlay (Top-Right) ── */}
         <div className="absolute top-3 right-3 flex flex-col gap-1.5 z-10">
           <button
             type="button"
             onClick={handleFitRouteBounds}
-            title="Fit Entire Route into View"
+            title="Fit Entire Road Route into View"
             className="p-2.5 bg-white/95 hover:bg-white text-slate-700 hover:text-blue-600 rounded-lg shadow-md border border-slate-200 text-xs font-bold transition-all flex items-center justify-center backdrop-blur-sm active:scale-95"
           >
             <Compass className="w-4 h-4 text-blue-600" />
           </button>
           <button
             type="button"
-            onClick={handleFocusTechnician}
-            title="Follow My Location"
-            className="p-2.5 bg-white/95 hover:bg-white text-slate-700 hover:text-blue-600 rounded-lg shadow-md border border-slate-200 text-xs font-bold transition-all flex items-center justify-center backdrop-blur-sm active:scale-95"
+            onClick={handleToggleFollowMe}
+            title={isFollowMe ? 'Follow Me Active (Click to Pause)' : 'Follow Me Paused (Click to Enable)'}
+            className={`p-2.5 rounded-lg shadow-md border text-xs font-bold transition-all flex items-center justify-center backdrop-blur-sm active:scale-95 ${
+              isFollowMe
+                ? 'bg-blue-600 text-white border-blue-600 shadow-blue-500/30'
+                : 'bg-white/95 text-slate-700 hover:text-blue-600 border-slate-200'
+            }`}
           >
-            <Crosshair className="w-4 h-4 text-blue-600" />
+            <Crosshair className={`w-4 h-4 ${isFollowMe ? 'text-white animate-pulse' : 'text-slate-600'}`} />
           </button>
           <button
             type="button"
@@ -633,37 +820,39 @@ export function JobTrackingMap({
           >
             <MapPin className="w-4 h-4 text-red-600" />
           </button>
-          <button
-            type="button"
-            onClick={handleManualGpsRefresh}
-            disabled={isRefreshingGps}
-            title="Refresh High-Accuracy GPS Fix"
-            className="p-2.5 bg-white/95 hover:bg-white text-slate-700 hover:text-emerald-600 rounded-lg shadow-md border border-slate-200 text-xs font-bold transition-all flex items-center justify-center backdrop-blur-sm disabled:opacity-50 active:scale-95"
-          >
-            <RotateCw className={`w-4 h-4 text-emerald-600 ${isRefreshingGps ? 'animate-spin' : ''}`} />
-          </button>
+          {viewRole === 'technician' && (
+            <button
+              type="button"
+              onClick={handleManualGpsRefresh}
+              disabled={isRefreshingGps}
+              title="Refresh High-Accuracy GPS Fix"
+              className="p-2.5 bg-white/95 hover:bg-white text-slate-700 hover:text-emerald-600 rounded-lg shadow-md border border-slate-200 text-xs font-bold transition-all flex items-center justify-center backdrop-blur-sm disabled:opacity-50 active:scale-95"
+            >
+              <RotateCw className={`w-4 h-4 text-emerald-600 ${isRefreshingGps ? 'animate-spin' : ''}`} />
+            </button>
+          )}
         </div>
 
-        {/* Map Legend Overlay */}
+        {/* ── Map Legend Overlay (Bottom-Left) ── */}
         <div className="absolute bottom-3 left-3 bg-white/95 backdrop-blur-sm px-3 py-2 rounded-lg border border-slate-200/90 shadow text-[10px] space-y-1.5 z-10">
-          <div className="flex items-center gap-2 font-medium text-slate-800">
-            <span className="w-3 h-3 rounded-full bg-blue-600 ring-2 ring-blue-200 flex items-center justify-center text-[7px] text-white font-black">
+          <div className="flex items-center gap-2 font-bold text-slate-800">
+            <span className="w-3.5 h-3.5 rounded-full bg-blue-600 ring-2 ring-blue-200 flex items-center justify-center text-[8px] text-white">
               🚗
             </span>
-            <span>Your Live Vehicle Pin</span>
+            <span>{viewRole === 'customer' ? 'Technician Live Vehicle' : 'Your Live Location (🚗 You)'}</span>
           </div>
-          <div className="flex items-center gap-2 font-medium text-slate-800">
-            <span className="w-3 h-3 rounded-full bg-red-600 ring-2 ring-red-200 flex items-center justify-center text-[7px] text-white font-black">
+          <div className="flex items-center gap-2 font-bold text-slate-800">
+            <span className="w-3.5 h-3.5 rounded-full bg-red-600 ring-2 ring-red-200 flex items-center justify-center text-[8px] text-white">
               🏠
             </span>
-            <span>Customer Destination</span>
+            <span>{viewRole === 'customer' ? 'Your Destination' : 'Customer Destination (🏠 Site)'}</span>
           </div>
-          <div className="flex items-center gap-2 font-medium text-blue-700">
+          <div className="flex items-center gap-2 font-bold text-blue-700">
             <span className="w-5 h-1.5 rounded-full bg-blue-600 shadow-sm" />
             <span>Turn-by-Turn Road Route</span>
           </div>
-          <div className="flex items-center gap-2 font-medium text-emerald-700">
-            <span className="w-3 h-3 rounded-full border border-emerald-500 bg-emerald-100" />
+          <div className="flex items-center gap-2 font-bold text-emerald-700">
+            <span className="w-3 h-3 rounded-full border-2 border-emerald-500 bg-emerald-100" />
             <span>300m Arrival Geofence</span>
           </div>
         </div>
@@ -689,14 +878,15 @@ export function JobTrackingMap({
         )}
       </div>
 
-      {/* Swiggy-Style Footer Live Progress & Geofence Status */}
+      {/* ── Footer Live Progress & Geofence Status ── */}
       <div className="p-3 bg-slate-50 border-t border-slate-200 flex items-center justify-between gap-3">
         <div className="text-xs text-slate-700 flex items-center gap-2 min-w-0">
           <ShieldCheck className="w-4 h-4 text-blue-600 shrink-0" />
           <span className="truncate">
             {isBackendArrived ? (
               <strong className="text-emerald-700 font-bold">
-                ✓ ARRIVAL VERIFIED — You have arrived within 300m of customer site. Ask customer for the 6-digit Work Start OTP.
+                ✓ ARRIVAL VERIFIED — Arrived within 300m of customer site.
+                {viewRole === 'technician' ? ' Ask customer for Work Start OTP.' : ' Share your 6-digit OTP with technician.'}
               </strong>
             ) : (
               <span>
@@ -707,8 +897,8 @@ export function JobTrackingMap({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
-          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-200 text-slate-700">
-            {isBackendArrived ? 'SITE REACHED' : 'LIVE TRACKING'}
+          <span className={`text-[10px] font-bold px-2.5 py-1 rounded-full ${isFollowMe ? 'bg-blue-100 text-blue-800 border border-blue-200' : 'bg-slate-200 text-slate-700'}`}>
+            {isFollowMe ? 'FOLLOW ME ON' : 'PAN MODE'}
           </span>
         </div>
       </div>

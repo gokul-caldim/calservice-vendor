@@ -86,12 +86,22 @@ export function EmployeeDashboardPage() {
   const isClockedIn = Boolean(timeTracking?.is_clocked_in);
   const isBreak = timeTracking?.shift_status === 'on_break';
 
+  const [currentLocation, setCurrentLocation] = useState(
+    user?.last_known_location || employee?.user?.last_known_location || null
+  );
+
   // ── Live GPS Tracking ────────────────────────────────────────────────────────
   // Start tracking when employee is ONLINE, stop when OFFLINE.
   // Pushes real browser GPS to /workforce/presence/location/ (User.last_known_location).
   // No mock coordinates. Errors are silent — GPS denial does not block the dashboard.
   const handleGPSPosition = useCallback(
     async ({ latitude, longitude, accuracy }) => {
+      setCurrentLocation({
+        latitude,
+        longitude,
+        accuracy,
+        updated_at: new Date().toISOString(),
+      });
       try {
         await apiUpdateLocationFull(latitude, longitude, accuracy);
       } catch (_) {
@@ -1380,7 +1390,7 @@ export function EmployeeDashboardPage() {
                               {/* Interactive Live Customer Location & Navigation Tracking Map */}
                               <JobTrackingMap
                                 job={selectedJob}
-                                technicianLocation={user?.last_known_location || employee?.user?.last_known_location}
+                                technicianLocation={currentLocation || user?.last_known_location || employee?.user?.last_known_location}
                                 preServiceState={preServiceState}
                                 geofenceRadius={300}
                               />

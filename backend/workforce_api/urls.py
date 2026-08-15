@@ -70,6 +70,7 @@ from .views import (
     WorkforceCustomerJobOTPView,
     WorkforceJobPreServicePhotoView,
     WorkforceJobPreServiceStatusView,
+    WorkforceJobLiveTrackingView,
     WorkforceReportsView,
     WorkforceLatencyAuditView,
     WorkforceVerificationSuiteView,
@@ -142,6 +143,8 @@ urlpatterns = [
     path("jobs/<int:pk>/customer-otp/", WorkforceCustomerJobOTPView.as_view(), name="workforce-job-customer-otp"),
     path("jobs/<int:pk>/pre-service-photo/", WorkforceJobPreServicePhotoView.as_view(), name="workforce-job-pre-service-photo"),
     path("jobs/<int:pk>/pre-service-status/", WorkforceJobPreServiceStatusView.as_view(), name="workforce-job-pre-service-status"),
+    path("jobs/<int:pk>/live-tracking/", WorkforceJobLiveTrackingView.as_view(), name="workforce-job-live-tracking"),
+    path("customer/jobs/<int:pk>/tracking/", WorkforceJobLiveTrackingView.as_view(), name="workforce-customer-job-tracking"),
 
     # Work Extensions & Scope Approvals
     path("jobs/<int:pk>/extension/", WorkforceJobExtensionView.as_view(), name="workforce-job-extension"),
