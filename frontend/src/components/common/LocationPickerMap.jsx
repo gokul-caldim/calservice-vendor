@@ -116,9 +116,7 @@ export function LocationPickerMap({
       mapTypeControl: false,
       streetViewControl: false,
       fullscreenControl: false,
-      zoomControlOptions: {
-        position: google.maps.ControlPosition.RIGHT_CENTER,
-      },
+      zoomControl: true,
     });
     mapRef.current = map;
 
@@ -167,7 +165,7 @@ export function LocationPickerMap({
     });
 
     // Places Autocomplete
-    if (showSearch && searchInputRef.current) {
+    if (showSearch && searchInputRef.current && google.maps.places) {
       const autocomplete = new google.maps.places.Autocomplete(searchInputRef.current, {
         fields: ['geometry', 'formatted_address'],
       });

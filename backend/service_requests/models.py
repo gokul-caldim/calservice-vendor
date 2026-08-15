@@ -190,8 +190,8 @@ class ServiceRequest(models.Model):
 
         if is_new and self.status in ["new_request", "confirmed", "draft"]:
             try:
-                from workforce_api.views import run_automatic_dispatch
-                run_automatic_dispatch(self)
+                from workforce_api.services.automatic_dispatch import dispatch_job
+                dispatch_job(self)
             except Exception:
                 pass
 

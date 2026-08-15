@@ -1,5 +1,18 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Clock, MapPin, Coffee, Play, CheckCircle2, ShieldCheck, AlertCircle, RefreshCw } from 'lucide-react';
+import {
+  Clock,
+  MapPin,
+  Coffee,
+  Play,
+  CheckCircle2,
+  ShieldCheck,
+  AlertCircle,
+  RefreshCw,
+  Crosshair,
+  Loader2,
+  AlertTriangle,
+  RotateCw,
+} from 'lucide-react';
 import {
   apiClockIn,
   apiClockOut,
@@ -8,6 +21,8 @@ import {
   apiGetTimeTracking,
   apiGeofenceCheck,
 } from '../../api/clockInApi.js';
+import { apiUpdateLocationFull } from '../../api/workforceService.js';
+import { getGPSPosition } from '../../hooks/useGPSPosition.js';
 
 export function ClockInCard({ onStatusChange }) {
   const [isClockedIn, setIsClockedIn] = useState(false);
@@ -15,6 +30,8 @@ export function ClockInCard({ onStatusChange }) {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [geoStatus, setGeoStatus] = useState({ allowed: null, distance_m: null, message: 'Geofence Check Pending' });
   const [loading, setLoading] = useState(false);
+  const [locScanning, setLocScanning] = useState(false);
+  const [liveLocation, setLiveLocation] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [clockInTime, setClockInTime] = useState(null);
@@ -81,81 +98,51 @@ export function ClockInCard({ onStatusChange }) {
   };
 
   // Perform browser GPS geofence check
-  const handleCheckGeofence = () => {
-    if (!navigator.geolocation) {
-      setErrorMsg('Geolocation is not supported by your browser.');
-      return;
-    }
-
+  const handleCheckGeofence = async () => {
     setLoading(true);
     setErrorMsg('');
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        try {
-          const res = await apiGeofenceCheck(pos.coords.latitude, pos.coords.longitude);
-          setGeoStatus({
-            allowed: res.allowed,
-            distance_m: res.distance_m,
-            message: res.allowed
-              ? `Authorized Location: ${res.matched_location || 'Site In-Bounds'} (${res.distance_m ?? 0}m)`
-              : `Outside Geofence Bounds: ${res.reason || 'Distance Exceeds Limit'}`,
-          });
-        } catch (err) {
-          setErrorMsg(err.message || 'Geofence check failed.');
-        } finally {
-          setLoading(false);
-        }
-      },
-      (err) => {
-        setLoading(false);
-        setErrorMsg(`GPS Error: ${err.message || 'Location access denied or unavailable.'}`);
-      },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-    );
+    try {
+      const pos = await getGPSPosition(true);
+      const res = await apiGeofenceCheck(pos.coords.latitude, pos.coords.longitude);
+      setGeoStatus({
+        allowed: res.allowed,
+        distance_m: res.distance_m,
+        message: res.allowed
+          ? `Authorized Location: ${res.matched_location || 'Site In-Bounds'} (${res.distance_m ?? 0}m)`
+          : `Outside Geofence Bounds: ${res.reason || 'Distance Exceeds Limit'}`,
+      });
+    } catch (err) {
+      setErrorMsg(err.message || 'Geofence check failed.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   // Perform Clock-In using real browser GPS
-  const handleClockIn = () => {
-    if (!navigator.geolocation) {
-      setErrorMsg('Geolocation is not supported by your browser.');
-      return;
-    }
-
+  const handleClockIn = async () => {
     setLoading(true);
     setErrorMsg('');
     setSuccessMsg('');
 
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        try {
-          const res = await apiClockIn({
-            lat: pos.coords.latitude,
-            lon: pos.coords.longitude,
-            address: 'GPS Verified Location',
-          });
+    try {
+      const pos = await getGPSPosition(true);
+      const res = await apiClockIn({
+        lat: pos.coords.latitude,
+        lon: pos.coords.longitude,
+        accuracy: pos.coords.accuracy,
+        timestamp: pos.timestamp || Date.now(),
+        address: 'GPS Verified Location',
+      });
 
-          setIsClockedIn(true);
-          setSuccessMsg(res.message || 'Clocked in successfully!');
-          await loadServerState();
-          if (onStatusChange) onStatusChange();
-        } catch (err) {
-          setErrorMsg(err.message || 'Clock-in rejected.');
-        } finally {
-          setLoading(false);
-        }
-      },
-      (err) => {
-        setLoading(false);
-        if (err.code === err.PERMISSION_DENIED) {
-          setErrorMsg('Clock-in blocked: GPS location permission was denied by browser. Please enable location access.');
-        } else if (err.code === err.POSITION_UNAVAILABLE) {
-          setErrorMsg('Clock-in blocked: GPS location is unavailable. Check device location services.');
-        } else {
-          setErrorMsg(`Clock-in blocked: GPS location request timed out (${err.message}).`);
-        }
-      },
-      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
-    );
+      setIsClockedIn(true);
+      setSuccessMsg(res.message || 'Clocked in successfully!');
+      await loadServerState();
+      if (onStatusChange) onStatusChange();
+    } catch (err) {
+      setErrorMsg(err.message || 'Clock-in rejected.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   // Perform Clock-Out
@@ -167,18 +154,12 @@ export function ClockInCard({ onStatusChange }) {
       let lat = null;
       let lon = null;
 
-      if (navigator.geolocation) {
-        await new Promise((resolve) => {
-          navigator.geolocation.getCurrentPosition(
-            (pos) => {
-              lat = pos.coords.latitude;
-              lon = pos.coords.longitude;
-              resolve();
-            },
-            () => resolve(),
-            { timeout: 5000 }
-          );
-        });
+      try {
+        const pos = await getGPSPosition(false);
+        lat = pos.coords.latitude;
+        lon = pos.coords.longitude;
+      } catch {
+        // Clock-out doesn't strictly block on GPS failure
       }
 
       const res = await apiClockOut({ lat, lon });
@@ -220,6 +201,72 @@ export function ClockInCard({ onStatusChange }) {
     }
   };
 
+  // Listen to external location updates (e.g. from TopHeader or background tracker)
+  useEffect(() => {
+    const handleLocEvent = (e) => {
+      if (e.detail?.latitude && e.detail?.longitude) {
+        setLiveLocation({
+          latitude: e.detail.latitude,
+          longitude: e.detail.longitude,
+          accuracy: e.detail.accuracy,
+          updated_at: e.detail.timestamp ? new Date(e.detail.timestamp) : new Date(),
+        });
+      }
+    };
+    window.addEventListener('workforce:location-updated', handleLocEvent);
+    return () => window.removeEventListener('workforce:location-updated', handleLocEvent);
+  }, []);
+
+  // Perform browser GPS location scan and refresh
+  const handleManualLocationRefresh = async () => {
+    if (locScanning) return;
+    setLocScanning(true);
+    setErrorMsg('');
+    try {
+      const pos = await getGPSPosition(true);
+      const { latitude, longitude, accuracy } = pos.coords;
+      await apiUpdateLocationFull(latitude, longitude, accuracy);
+      const newLoc = {
+        latitude,
+        longitude,
+        accuracy,
+        updated_at: new Date(),
+      };
+      setLiveLocation(newLoc);
+      try {
+        const res = await apiGeofenceCheck(latitude, longitude);
+        setGeoStatus({
+          allowed: res.allowed,
+          distance_m: res.distance_m,
+          message: res.allowed
+            ? `Authorized: ${res.matched_location || 'Site In-Bounds'} (${res.distance_m ?? 0}m)`
+            : `Outside Bounds: ${res.reason || 'Distance Exceeds Limit'}`,
+        });
+      } catch (_) {}
+      if (onStatusChange) onStatusChange();
+      window.dispatchEvent(
+        new CustomEvent('workforce:location-updated', {
+          detail: {
+            latitude,
+            longitude,
+            accuracy,
+            timestamp: pos.timestamp || Date.now(),
+            source: 'card_refresh',
+          },
+        })
+      );
+    } catch (err) {
+      setErrorMsg(err.message || 'Location permission required or GPS request timed out.');
+    } finally {
+      setLocScanning(false);
+    }
+  };
+
+  // Check if location is older than 5 minutes (300 seconds)
+  const isLocStale = liveLocation?.updated_at
+    ? (Date.now() - new Date(liveLocation.updated_at).getTime()) / 1000 > 300
+    : false;
+
   return (
     <div className="bg-white border border-slate-200 rounded overflow-hidden shadow-sm text-slate-800">
       {/* Top Header Strip */}
@@ -248,21 +295,75 @@ export function ClockInCard({ onStatusChange }) {
       </div>
 
       <div className="p-4 space-y-3">
-        {/* Location Status Bar */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between bg-slate-50 border border-slate-200 rounded px-3.5 py-2 text-xs gap-2">
-          <div className="flex items-center gap-2">
-            <MapPin className="w-4 h-4 text-blue-600 shrink-0" />
-            <span className="text-slate-700 font-semibold">Location:</span>
-            <span className="text-slate-600">{geoStatus.message}</span>
+        {/* Real-Time Location Status Bar */}
+        <div className="bg-slate-50 border border-slate-200 rounded p-3 text-xs space-y-2">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                <MapPin className="w-4 h-4 text-blue-600 shrink-0" />
+                Location Telemetry
+              </span>
+              {liveLocation ? (
+                isLocStale ? (
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-300 flex items-center gap-1">
+                    <AlertTriangle className="w-3 h-3 text-amber-600" />
+                    <span>Location needs refresh</span>
+                  </span>
+                ) : (
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-300 flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    <span>Current location available</span>
+                  </span>
+                )
+              ) : (
+                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-200 text-slate-700 flex items-center gap-1">
+                  <AlertCircle className="w-3 h-3 text-slate-500" />
+                  <span>Location unavailable</span>
+                </span>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={handleManualLocationRefresh}
+              disabled={locScanning}
+              className="px-2.5 py-1 bg-white hover:bg-slate-100 border border-slate-300 rounded text-[11px] font-bold text-slate-700 transition-colors inline-flex items-center gap-1.5 shadow-xs self-start sm:self-auto disabled:opacity-50"
+            >
+              {locScanning ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
+                  <span>Scanning GPS...</span>
+                </>
+              ) : (
+                <>
+                  <RotateCw className="w-3.5 h-3.5 text-blue-600" />
+                  <span>{liveLocation ? 'Refresh Location' : 'Enable Location'}</span>
+                </>
+              )}
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={handleCheckGeofence}
-            disabled={loading}
-            className="text-[11px] font-bold text-blue-600 hover:text-blue-800 underline self-start sm:self-auto"
-          >
-            Check Location
-          </button>
+
+          {liveLocation ? (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-600 font-mono pt-1 border-t border-slate-200/60">
+              <span>
+                Coordinates: <strong className="text-slate-900">{Number(liveLocation.latitude).toFixed(5)}, {Number(liveLocation.longitude).toFixed(5)}</strong>
+              </span>
+              {liveLocation.accuracy != null && (
+                <span>
+                  Accuracy: <strong className="text-slate-900">± {Math.round(liveLocation.accuracy)} m</strong>
+                </span>
+              )}
+              {liveLocation.updated_at && (
+                <span>
+                  Updated: <strong className="text-slate-900">{new Date(liveLocation.updated_at).toLocaleTimeString()}</strong>
+                </span>
+              )}
+            </div>
+          ) : (
+            <p className="text-[11px] text-slate-500 pt-1 border-t border-slate-200/60">
+              Click &quot;Enable Location&quot; to scan your current GPS position and refresh your proximity eligibility for job dispatch.
+            </p>
+          )}
         </div>
 
         {/* Notifications */}

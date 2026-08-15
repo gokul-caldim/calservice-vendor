@@ -44,28 +44,55 @@ function haversineMetres(lat1, lng1, lat2, lng2) {
  * Returns a Promise that resolves with the current GeolocationPosition, or
  * rejects with a structured error object:
  *   { code: 'PERMISSION_DENIED' | 'POSITION_UNAVAILABLE' | 'TIMEOUT' | 'UNSUPPORTED', message }
+ *
+ * Implements robust multi-tier fallback:
+ * 1. Tries high accuracy (GPS hardware) for 6s.
+ * 2. If it times out or returns POSITION_UNAVAILABLE (common on laptops/desktops without GPS chips),
+ *    automatically falls back to standard accuracy (Wi-Fi/IP network geolocation).
  */
-export function getGPSPosition(highAccuracy = true) {
+export function getGPSPosition(preferHighAccuracy = true) {
   return new Promise((resolve, reject) => {
-    if (!navigator.geolocation) {
+    if (typeof window === 'undefined' || !navigator.geolocation) {
       reject({ code: 'UNSUPPORTED', message: 'Geolocation is not supported by this browser.' });
       return;
     }
-    navigator.geolocation.getCurrentPosition(
-      (pos) => resolve(pos),
-      (err) => {
-        const codes = { 1: 'PERMISSION_DENIED', 2: 'POSITION_UNAVAILABLE', 3: 'TIMEOUT' };
-        reject({
-          code: codes[err.code] || 'POSITION_UNAVAILABLE',
-          message: err.message || 'Could not retrieve GPS position.',
-        });
-      },
-      {
-        enableHighAccuracy: highAccuracy,
-        timeout: 15_000,
-        maximumAge: MAX_POSITION_AGE_MS,
-      },
-    );
+
+    const tryPosition = (enableHighAccuracy, timeoutMs, maxAgeMs, isFallback = false) => {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve(pos),
+        (err) => {
+          // If high-accuracy timed out (code 3) or failed as unavailable (code 2), retry with standard accuracy
+          if (!isFallback && (err.code === 3 || err.code === 2 || err.code === err.TIMEOUT || err.code === err.POSITION_UNAVAILABLE)) {
+            console.warn(`[GPS] High accuracy request failed (${err.message}). Retrying with standard accuracy...`);
+            tryPosition(false, 10000, 300000, true);
+            return;
+          }
+
+          const codes = { 1: 'PERMISSION_DENIED', 2: 'POSITION_UNAVAILABLE', 3: 'TIMEOUT' };
+          let msg = err.message || 'Could not retrieve GPS position.';
+          if (err.code === 1 || err.code === err.PERMISSION_DENIED) {
+            msg = 'Location permission is denied. Please allow location access in your browser address bar settings.';
+          } else if (err.code === 2 || err.code === err.POSITION_UNAVAILABLE) {
+            msg = 'Location is unavailable. Please check your device location services and internet connection.';
+          } else if (err.code === 3 || err.code === err.TIMEOUT) {
+            msg = 'Location request timed out. Please check your connection and try again.';
+          }
+
+          reject({
+            code: codes[err.code] || 'POSITION_UNAVAILABLE',
+            message: msg,
+            originalError: err,
+          });
+        },
+        {
+          enableHighAccuracy,
+          timeout: timeoutMs,
+          maximumAge: maxAgeMs,
+        }
+      );
+    };
+
+    tryPosition(preferHighAccuracy, 6000, MAX_POSITION_AGE_MS, !preferHighAccuracy);
   });
 }
 

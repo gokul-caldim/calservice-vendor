@@ -15,10 +15,19 @@ import {
   ExternalLink,
   Shield,
   Settings,
+  Crosshair,
+  Loader2,
+  Check,
+  AlertTriangle,
 } from 'lucide-react';
 
 import { Modal } from '../enterprise/Modal.jsx';
-import { apiGetNotifications, apiMarkNotificationRead } from '../../api/workforceService.js';
+import {
+  apiGetNotifications,
+  apiMarkNotificationRead,
+  apiUpdateLocationFull,
+} from '../../api/workforceService.js';
+import { getGPSPosition } from '../../hooks/useGPSPosition.js';
 
 export function TopHeader({ onToggleSidebar = () => {} }) {
   const { user, logout, togglePresence, isAdmin, isEmployee, registrationStatus } = useAuth();
@@ -30,6 +39,48 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
   const [notifications, setNotifications] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [globalSearch, setGlobalSearch] = useState('');
+
+  // Location Scan State
+  const [locState, setLocState] = useState('idle'); // 'idle' | 'locating' | 'success' | 'error'
+  const [locCoords, setLocCoords] = useState(() => {
+    const loc = user?.last_known_location;
+    if (loc?.latitude && loc?.longitude) {
+      return { latitude: Number(loc.latitude), longitude: Number(loc.longitude), accuracy: loc.accuracy || null };
+    }
+    return null;
+  });
+
+  const handleScanCurrentLocation = async () => {
+    if (locState === 'locating') return;
+    setLocState('locating');
+    try {
+      const pos = await getGPSPosition(true);
+      const { latitude, longitude, accuracy } = pos.coords;
+      await apiUpdateLocationFull(latitude, longitude, accuracy);
+      setLocCoords({
+        latitude,
+        longitude,
+        accuracy,
+        timestamp: pos.timestamp || Date.now(),
+      });
+      setLocState('success');
+      window.dispatchEvent(
+        new CustomEvent('workforce:location-updated', {
+          detail: {
+            latitude,
+            longitude,
+            accuracy,
+            timestamp: pos.timestamp || Date.now(),
+            source: 'header_scan',
+          },
+        })
+      );
+      setTimeout(() => setLocState('idle'), 2500);
+    } catch (_) {
+      setLocState('error');
+      setTimeout(() => setLocState('idle'), 3000);
+    }
+  };
 
   // 10s silent background notification polling
   useEffect(() => {
@@ -148,25 +199,74 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
           <div className="flex items-center gap-2 sm:gap-3 shrink-0">
             {user ? (
               <>
-                {/* Technician Online / Offline Toggle */}
+                {/* Technician Online / Offline Toggle & Current Location Scan */}
                 {isEmployee && registrationStatus === 'approved' && (
-                  <button
-                    type="button"
-                    onClick={handlePresenceToggle}
-                    disabled={isToggling}
-                    className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-semibold border transition-all ${
-                      isOnline
-                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/30'
-                        : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'
-                    }`}
-                    title={isOnline ? 'You are ONLINE. Click to go OFFLINE' : 'You are OFFLINE. Click to go ONLINE'}
-                  >
-                    <span
-                      className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}
-                    />
-                    <span className="text-[11px] uppercase font-bold">{isOnline ? 'ONLINE' : 'OFFLINE'}</span>
-                    <Power className="w-3 h-3 ml-0.5 opacity-70" />
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={handlePresenceToggle}
+                      disabled={isToggling}
+                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-semibold border transition-all ${
+                        isOnline
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/30'
+                          : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'
+                      }`}
+                      title={isOnline ? 'You are ONLINE. Click to go OFFLINE' : 'You are OFFLINE. Click to go ONLINE'}
+                    >
+                      <span
+                        className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}
+                      />
+                      <span className="text-[11px] uppercase font-bold">{isOnline ? 'ONLINE' : 'OFFLINE'}</span>
+                      <Power className="w-3 h-3 ml-0.5 opacity-70" />
+                    </button>
+
+                    {/* Compact Real-Time Current Location Scan Button */}
+                    <button
+                      type="button"
+                      onClick={handleScanCurrentLocation}
+                      disabled={locState === 'locating'}
+                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-semibold border transition-all ${
+                        locState === 'locating'
+                          ? 'bg-blue-500/20 text-blue-300 border-blue-500/40 cursor-wait'
+                          : locState === 'success'
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                          : locState === 'error'
+                          ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                          : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700 hover:text-white'
+                      }`}
+                      title={
+                        locCoords
+                          ? `Location: ${locCoords.latitude.toFixed(4)}, ${locCoords.longitude.toFixed(4)} (±${Math.round(locCoords.accuracy || 0)}m). Click to refresh.`
+                          : 'Click to scan and update your current GPS location'
+                      }
+                    >
+                      {locState === 'locating' ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
+                          <span className="text-[11px] font-bold">Locating...</span>
+                        </>
+                      ) : locState === 'success' ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          <span className="text-[11px] font-bold">Location Updated</span>
+                        </>
+                      ) : locState === 'error' ? (
+                        <>
+                          <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+                          <span className="text-[11px] font-bold">Location Unavailable</span>
+                        </>
+                      ) : (
+                        <>
+                          <Crosshair className="w-3.5 h-3.5 text-slate-400" />
+                          <span className="text-[11px] font-bold">
+                            {locCoords
+                              ? `${locCoords.latitude.toFixed(3)}, ${locCoords.longitude.toFixed(3)}`
+                              : 'Current Location'}
+                          </span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 )}
 
                 {/* Help button */}

@@ -333,6 +333,7 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     active_offer = serializers.SerializerMethodField()
     extensions = serializers.SerializerMethodField()
     active_extension = serializers.SerializerMethodField()
+    distance_km = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceRequest
@@ -352,6 +353,7 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "address",
             "latitude",
             "longitude",
+            "distance_km",
             "preferred_date",
             "preferred_time",
             "total_amount",
@@ -364,6 +366,22 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_distance_km(self, obj):
+        request = self.context.get("request")
+        if not request or not getattr(request, "user", None):
+            return None
+        last_loc = getattr(request.user, "last_known_location", None) or {}
+        emp_lat = last_loc.get("latitude") if last_loc.get("latitude") is not None else last_loc.get("lat")
+        emp_lon = last_loc.get("longitude") if last_loc.get("longitude") is not None else (last_loc.get("lng") or last_loc.get("lon"))
+        if emp_lat is None or emp_lon is None or obj.latitude is None or obj.longitude is None:
+            return None
+        try:
+            from time_tracking.geo import haversine_distance
+            dist_m = haversine_distance(float(emp_lat), float(emp_lon), float(obj.latitude), float(obj.longitude))
+            return round(dist_m / 1000.0, 2)
+        except Exception:
+            return None
 
     def get_customer_display_name(self, obj):
         if obj.customer_name:

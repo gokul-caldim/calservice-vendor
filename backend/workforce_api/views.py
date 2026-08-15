@@ -1023,111 +1023,13 @@ class WorkforceJobCashCollectView(APIView):
 
 # ─── 10. Dynamic Job Dispatch & Eligibility Matching (Phase 14) ───────────────
 
-def check_technician_eligibility(emp, service_name=None):
-    """
-    Enforces all 7 dispatch eligibility criteria server-side:
-    1. Account active (user & emp)
-    2. Registration approved
-    3. Required dossier documents approved
-    4. Requested service approved on technician record
-    5. Availability = AVAILABLE (is_online == True)
-    6. Shift attendance = Clocked In (decoupled from is_online)
-    7. Not on leave & not currently busy on active job
-    """
 def check_technician_eligibility(emp, service_name=None, prefetched_data=None):
     """
-    Evaluates 7-step readiness rules for dynamic dispatch eligibility.
-    Supports ORM prefetched attributes to eliminate query roundtrips.
+    Standardized 9-Gate Employee Eligibility Check.
+    Delegates to the authoritative check_candidate_eligibility engine in automatic_dispatch.py.
     """
-    if not emp or not emp.is_active or not getattr(emp.user, "is_active", True):
-        return False, "Technician account is inactive."
-
-    bank_details = emp.bank_details or {}
-    onboarding = bank_details.get("onboarding", {})
-    reg_status = onboarding.get("status", "not_started")
-    if reg_status != "approved":
-        return False, "Technician registration onboarding is not approved."
-
-    # Check all dossier documents approved
-    documents = onboarding.get("documents", {})
-    if any(doc.get("status") != "approved" for doc in documents.values()):
-        return False, "Technician has unapproved dossier documents."
-
-    # Check mandatory compliance records
-    if hasattr(emp, "prefetched_invalid_compliance"):
-        if emp.prefetched_invalid_compliance:
-            return False, "Technician has expired or rejected mandatory compliance document."
-    elif prefetched_data and "expired_comp_ids" in prefetched_data:
-        if emp.id in prefetched_data["expired_comp_ids"]:
-            return False, "Technician has expired or rejected mandatory compliance document."
-    else:
-        mandatory_comp = WorkforceEmployeeCompliance.objects.filter(
-            employee=emp,
-            requirement__is_mandatory=True,
-            status__in=["EXPIRED", "REJECTED"]
-        ).first()
-        if mandatory_comp:
-            return False, f"Technician has expired or rejected mandatory compliance document: '{mandatory_comp.requirement.title}'."
-
-    # Check work schedule
-    today_dow = timezone.now().weekday()
-    if hasattr(emp, "prefetched_today_schedules"):
-        sched = emp.prefetched_today_schedules[0] if emp.prefetched_today_schedules else None
-    elif prefetched_data and "schedules" in prefetched_data:
-        sched = prefetched_data["schedules"].get(emp.id)
-    else:
-        sched = WorkforceEmployeeSchedule.objects.filter(employee=emp, day_of_week=today_dow).first()
-
-    if sched:
-        if not sched.is_working_day:
-            return False, "Technician is scheduled off today."
-        now_time = timezone.now().time()
-        if not (sched.start_time <= now_time <= sched.end_time):
-            return False, f"Technician is outside scheduled working hours ({sched.start_time.strftime('%H:%M')}-{sched.end_time.strftime('%H:%M')})."
-
-    # Check service qualification & verified skills
-    approved_svcs = [s.get("name", "") for s in onboarding.get("services", []) if s.get("status") == "approved"]
-    if hasattr(emp, "prefetched_verified_skills"):
-        verified_skills = [es.skill.name for es in emp.prefetched_verified_skills]
-    elif prefetched_data and "skills" in prefetched_data:
-        verified_skills = prefetched_data["skills"].get(emp.id, [])
-    else:
-        verified_skills = list(WorkforceEmployeeSkill.objects.filter(employee=emp, is_verified=True).values_list("skill__name", flat=True))
-
-    if service_name:
-        matches_catalog = any(service_name.lower() in s.lower() or s.lower() in service_name.lower() for s in approved_svcs) if approved_svcs else False
-        matches_skill = any(service_name.lower() in s.lower() or s.lower() in service_name.lower() for s in verified_skills) if verified_skills else False
-        if not matches_catalog and not matches_skill:
-            return False, f"Technician is not authorized or verified for requested service '{service_name}'."
-
-    # Check live presence availability
-    if not emp.is_online or emp.current_availability != "available":
-        return False, "Technician is currently OFFLINE or unavailable."
-
-    # Check leave status (active approved leave spanning current date)
-    today_str = timezone.now().date().isoformat()
-    leaves = bank_details.get("leaves", [])
-    for l in leaves:
-        if l.get("status") == "approved":
-            start_date = l.get("start_date", "")
-            end_date = l.get("end_date", "")
-            if start_date <= today_str <= end_date:
-                return False, f"Technician is on approved leave from {start_date} to {end_date}."
-
-    # Check active job assignment
-    if hasattr(emp, "is_busy_job"):
-        if emp.is_busy_job:
-            return False, "Technician is busy on active job assignment."
-    elif prefetched_data and "busy_ids" in prefetched_data:
-        if emp.id in prefetched_data["busy_ids"]:
-            return False, "Technician is busy on active job assignment."
-    else:
-        active_job = ServiceRequest.objects.filter(
-            assigned_employee=emp,
-            status__in=["accepted", "on_the_way", "in_progress"]
-        ).first()
-        if active_job:
-            return False, f"Technician is busy on active Job #{active_job.id} ({active_job.request_id})."
+    from .services.automatic_dispatch import check_candidate_eligibility
+    return check_candidate_eligibility(emp, service_name)
 
     return True, "Eligible"
 
@@ -1205,244 +1107,23 @@ class WorkforceDispatchAssignView(APIView):
     permission_classes = [IsWorkforceAdmin]
 
     def post(self, request):
-        job_id = request.data.get("job_id")
-        employee_id = request.data.get("employee_id")
-
-        if not job_id or not employee_id:
-            return Response({"error": "job_id and employee_id required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        with transaction.atomic():
-            job = ServiceRequest.objects.select_for_update().filter(pk=job_id).first()
-            if not job:
-                return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            if job.status in ["completed", "cancelled"]:
-                return Response({"error": f"Job #{job.id} is already {job.status}."}, status=status.HTTP_400_BAD_REQUEST)
-
-            emp = Employee.objects.select_for_update().select_related("user").filter(pk=employee_id).first()
-            if not emp:
-                return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Perform strict server-side eligibility check
-            service_name = job.issue_title or job.service_category
-            is_eligible, ineligibility_reason = check_technician_eligibility(emp, service_name)
-            if not is_eligible:
-                return Response({"error": f"Cannot assign technician: {ineligibility_reason}"}, status=status.HTTP_400_BAD_REQUEST)
-
-            job.assigned_employee = emp
-            job.status = "assigned"
-            job.save()
-
-            return Response({
-                "message": f"Job #{job.id} assigned to {emp.user.get_full_name()} ({emp.employee_id}).",
-                "job_id": job.id,
-                "assigned_employee": emp.employee_id,
-                "status": job.status,
-            }, status=status.HTTP_200_OK)
+        return Response({
+            "code": "MANUAL_DISPATCH_DISABLED",
+            "message": "Customer jobs are automatically assigned using live employee availability, GPS proximity and eligibility.",
+            "error": "Manual primary job assignment has been decommissioned. Automatic geo-based dispatch engine is active."
+        }, status=status.HTTP_410_GONE)
 
 
 # ─── Automatic Dispatch Engine ────────────────────────────────────────────────
 
 def run_automatic_dispatch(job):
     """
-    Executes Automatic Dispatch Engine for a ServiceRequest:
-    1. Locks ServiceRequest row with select_for_update inside transaction.atomic()
-    2. Validates customer latitude & longitude coordinates exist on ServiceRequest.
-    3. Filters candidate employees strictly scoped to the same Company tenant.
-    4. Evaluates candidate eligibility using check_technician_eligibility()
-    5. Retrieves real live GPS coordinates from candidate's User.last_known_location.
-    6. Calculates Haversine proximity distance in kilometers between customer and candidate.
-    7. Computes combined rank score:
-       - Proximity score (higher for closer, max 100.0)
-       - Verified skill proficiency (+30 EXPERT, +20 INTERMEDIATE, +10 BEGINNER)
-       - Workload penalty (-15 points per active assigned job)
-       - Live shift clock-in (+10 points)
-    8. Ranks candidates primarily by nearest distance (ascending), with highest score as tiebreaker.
-    9. Filters out candidates who have already rejected or been offered this job.
-    10. If no candidates remain:
-       - Set job.status = "unassigned"
-       - Create notification for Admin & log event.
-    11. If eligible candidate found:
-       - Create WorkforceJobOffer(job=job, employee=candidate, status="OFFERED", expires_at=now+5min, rank_score=score)
-       - Keep job.status = "assigned" (or dispatchable)
-       - Trigger create_notification() for candidate user & broadcast event.
+    Delegates to authoritative automatic dispatch service:
+    workforce_api.services.automatic_dispatch.dispatch_job
     """
-    with transaction.atomic():
-        job_obj = ServiceRequest.objects.select_for_update().filter(pk=job.pk).first()
-        if not job_obj or job_obj.status in ["completed", "cancelled"]:
-            return False, "Job is not in a dispatchable state."
+    from workforce_api.services.automatic_dispatch import dispatch_job
+    return dispatch_job(job)
 
-        # Validate customer booking coordinates
-        if job_obj.latitude is None or job_obj.longitude is None:
-            job_obj.status = "unassigned"
-            job_obj.save()
-            return False, "Customer booking is missing valid GPS coordinates (latitude/longitude) for geographic dispatch."
-
-        service_name = job_obj.issue_title or job_obj.service_category
-        candidates = Employee.objects.filter(is_active=True).select_related("user", "company")
-        if job_obj.company_id:
-            candidates = candidates.filter(company_id=job_obj.company_id)
-
-        # Exclude candidates who rejected or currently have an active offer for this job
-        previous_offers = list(WorkforceJobOffer.objects.filter(job=job_obj).values_list("employee_id", flat=True))
-
-        from time_tracking.geo import haversine_distance
-
-        ranked_candidates = []
-
-        for emp in candidates:
-            if emp.id in previous_offers:
-                continue
-
-            # Check eligibility against service_category, then issue_title
-            is_eligible, reason = check_technician_eligibility(emp, job_obj.service_category)
-            if not is_eligible and job_obj.issue_title:
-                is_eligible, reason = check_technician_eligibility(emp, job_obj.issue_title)
-
-            if not is_eligible:
-                continue
-
-            # Real live GPS from User.last_known_location
-            last_loc = getattr(emp.user, "last_known_location", None) or {}
-            emp_lat = last_loc.get("latitude") if last_loc.get("latitude") is not None else last_loc.get("lat")
-            emp_lon = last_loc.get("longitude") if last_loc.get("longitude") is not None else (last_loc.get("lng") or last_loc.get("lon"))
-
-            if emp_lat is None or emp_lon is None:
-                # No live GPS telemetry available
-                continue
-
-            try:
-                emp_lat_f = float(emp_lat)
-                emp_lon_f = float(emp_lon)
-            except (ValueError, TypeError):
-                continue
-
-            # Location Freshness Gate: Candidate must have transmitted GPS within the last 30 minutes
-            updated_at_str = last_loc.get("updated_at")
-            if not updated_at_str:
-                # Missing timestamp -> Stale GPS
-                continue
-
-            try:
-                from django.utils.dateparse import parse_datetime
-                loc_dt = parse_datetime(str(updated_at_str))
-                if not loc_dt:
-                    continue
-                if timezone.is_naive(loc_dt):
-                    loc_dt = timezone.make_aware(loc_dt)
-                gps_age_seconds = (timezone.now() - loc_dt).total_seconds()
-                MAX_GPS_AGE_SECONDS = 1800  # 30 minutes maximum age for live dispatch
-                if gps_age_seconds > MAX_GPS_AGE_SECONDS or gps_age_seconds < -60:
-                    # GPS is stale (> 30 minutes old) -> Skip candidate
-                    continue
-            except Exception:
-                continue
-
-            # Real distance calculation in km
-            dist_m = haversine_distance(float(job_obj.latitude), float(job_obj.longitude), emp_lat_f, emp_lon_f)
-            dist_km = dist_m / 1000.0
-
-
-            # Proximity score (closer = higher score, max 100)
-            proximity_score = max(0.0, 100.0 - (dist_km * 2.0))
-
-            # 1. Skill proficiency score
-            skills = WorkforceEmployeeSkill.objects.filter(employee=emp, is_verified=True).select_related("skill")
-            max_prof = 0
-            for sk in skills:
-                sk_name = sk.skill.name.lower()
-                matches = False
-                for term in [job_obj.service_category, job_obj.issue_title]:
-                    if term and (term.lower() in sk_name or sk_name in term.lower()):
-                        matches = True
-                        break
-                if matches:
-                    if sk.proficiency_level == "EXPERT":
-                        max_prof = max(max_prof, 30)
-                    elif sk.proficiency_level == "INTERMEDIATE":
-                        max_prof = max(max_prof, 20)
-                    else:
-                        max_prof = max(max_prof, 10)
-
-
-            # 2. Active workload penalty
-            active_jobs_count = ServiceRequest.objects.filter(
-                assigned_employee=emp,
-                status__in=["assigned", "accepted", "on_the_way", "in_progress"]
-            ).count()
-            workload_penalty = active_jobs_count * 15.0
-
-            # 3. Territory match
-            city = (emp.bank_details or {}).get("onboarding", {}).get("draft", {}).get("personal", {}).get("city", "")
-            territory_bonus = 15.0 if (job_obj.address and city and city.lower() in job_obj.address.lower()) else 0.0
-
-            # 4. Shift clock-in active
-            bank_details = emp.bank_details or {}
-            is_clocked_in = bank_details.get("attendance", {}).get("is_clocked_in", False)
-            clock_in_bonus = 10.0 if is_clocked_in else 0.0
-
-            total_score = proximity_score + max_prof + territory_bonus - workload_penalty + clock_in_bonus
-
-            ranked_candidates.append({
-                "score": total_score,
-                "distance_km": dist_km,
-                "employee": emp,
-            })
-
-        if not ranked_candidates:
-            job_obj.status = "unassigned"
-            job_obj.save()
-            admin_user = get_user_model().objects.filter(role="admin").first()
-            if admin_user:
-                create_notification(
-                    recipient=admin_user,
-                    title="Automatic Dispatch: Awaiting Technician",
-                    message=f"No eligible nearby technician available for Job #{job_obj.id} ({service_name}). Job remains unassigned.",
-                    notification_type="DISPATCH_UNASSIGNED",
-                    company=job_obj.company,
-                    related_object_id=job_obj.id,
-                )
-            return False, "No eligible technicians available for automatic dispatch."
-
-        # Rank primarily by nearest distance (ascending), then by highest score (descending)
-        ranked_candidates.sort(key=lambda x: (x["distance_km"], -x["score"]))
-        top_candidate = ranked_candidates[0]
-        top_score = top_candidate["score"]
-        top_dist_km = top_candidate["distance_km"]
-        top_emp = top_candidate["employee"]
-
-        # Expire any previous pending offers for this job
-        WorkforceJobOffer.objects.filter(job=job_obj, status="OFFERED").update(status="EXPIRED")
-
-        # Create new offer valid for 5 minutes
-        expires_at = timezone.now() + timezone.timedelta(minutes=5)
-        offer = WorkforceJobOffer.objects.create(
-            job=job_obj,
-            employee=top_emp,
-            status="OFFERED",
-            rank_score=top_score,
-            expires_at=expires_at,
-        )
-
-        if job_obj.status in ["draft", "new_request", "confirmed", "unassigned"]:
-            job_obj.status = "assigned"
-            job_obj.save()
-
-        loc_str = f" at {job_obj.address}" if job_obj.address else ""
-        req_id_str = f" ({job_obj.request_id})" if job_obj.request_id else f" #{job_obj.id}"
-        service_label = job_obj.issue_title or job_obj.service_category or "Service Request"
-        expiry_str = expires_at.strftime("%H:%M:%S UTC")
-
-        create_notification(
-            recipient=top_emp.user,
-            title="New Job Offer Available!",
-            message=f"You have a new exclusive job offer for '{service_label}'{req_id_str}{loc_str} ({top_dist_km:.1f} km away). Expiry: {expiry_str}. Open your dashboard to Accept or Decline.",
-            notification_type="JOB_OFFER",
-            company=job_obj.company,
-            related_object_id=str(job_obj.id),
-        )
-
-        return True, f"Job #{job_obj.id} offered to {top_emp.user.get_full_name() or top_emp.user.username} ({top_dist_km:.1f}km away, Score: {top_score:.1f})."
 
 
 
@@ -1517,12 +1198,13 @@ class WorkforceJobAcceptOfferView(APIView):
             if conflicting:
                 return Response({"error": f"Cannot accept job: Technician already has an active assigned Job #{conflicting.id}."}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Verify technician eligibility
-            is_eligible, reason = check_technician_eligibility(emp, job_obj.service_category)
-            if not is_eligible and job_obj.issue_title:
-                is_eligible, reason = check_technician_eligibility(emp, job_obj.issue_title)
-            if not is_eligible:
-                return Response({"error": f"Cannot accept offer: {reason}"}, status=status.HTTP_400_BAD_REQUEST)
+            # Verify technician eligibility if accepting without an existing vetted offer
+            if not offer:
+                is_eligible, reason = check_technician_eligibility(emp, job_obj.service_category)
+                if not is_eligible and job_obj.issue_title:
+                    is_eligible, reason = check_technician_eligibility(emp, job_obj.issue_title)
+                if not is_eligible:
+                    return Response({"error": f"Cannot accept offer: {reason}"}, status=status.HTTP_400_BAD_REQUEST)
 
 
             job_obj.assigned_employee = emp
@@ -3045,6 +2727,13 @@ class WorkforceLocationUpdateView(APIView):
                     })
             except Exception:
                 pass
+
+        # Reconsider pending dispatchable customer jobs upon fresh GPS update
+        try:
+            from workforce_api.services.automatic_dispatch import reconsider_jobs_for_employee
+            reconsider_jobs_for_employee(emp)
+        except Exception:
+            pass
 
         return Response({
             "message": "Live GPS coordinates updated.",

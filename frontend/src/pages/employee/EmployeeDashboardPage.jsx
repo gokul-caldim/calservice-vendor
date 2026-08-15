@@ -29,15 +29,14 @@ import {
   apiRequestService,
   apiRemoveService,
 } from '../../api/workforceService.js';
-import { apiClockIn } from '../../api/clockInApi.js';
 import { ClockInCard } from '../../components/employee/ClockInCard.jsx';
+import { JobTrackingMap } from '../../components/employee/JobTrackingMap.jsx';
 
 import { AppShell } from '../../components/common/AppShell.jsx';
 import { StatusBadge } from '../../components/enterprise/StatusBadge.jsx';
 import { Modal } from '../../components/enterprise/Modal.jsx';
 import { ErrorState } from '../../components/enterprise/ErrorState.jsx';
-import { LoadingState } from '../../components/enterprise/LoadingState.jsx';
-import { useLocationTracker } from '../../hooks/useGPSPosition.js';
+import { useLocationTracker, getGPSPosition } from '../../hooks/useGPSPosition.js';
 import { apiUpdateLocationFull } from '../../api/workforceService.js';
 import {
   Wrench,
@@ -57,7 +56,6 @@ import {
   Upload,
   PlusCircle,
   ShoppingBag,
-  Coffee,
   Sun,
   Moon,
   Send,
@@ -65,6 +63,8 @@ import {
   Award,
   FileText,
   Settings as SettingsIcon,
+  Sparkles,
+  Compass,
 } from 'lucide-react';
 
 export function EmployeeDashboardPage() {
@@ -134,32 +134,20 @@ export function EmployeeDashboardPage() {
 
   const handleArriveAtLocation = async () => {
     if (!selectedJob) return;
-    if (!navigator.geolocation) {
-      setError('Browser Geolocation is not supported by your browser.');
-      return;
-    }
-
     setActionLoading(selectedJob.id);
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        try {
-          const res = await apiVerifyArrival(selectedJob.id, pos.coords.latitude, pos.coords.longitude);
-          setSuccessMsg(res.message || 'Arrival verified!');
-          setPreServiceState((prev) => ({ ...prev, geofence_passed: true }));
-          await loadDashboard();
-          setTimeout(() => setSuccessMsg(''), 4000);
-        } catch (err) {
-          setError(err.message || 'Arrival geofence verification failed.');
-        } finally {
-          setActionLoading(null);
-        }
-      },
-      (err) => {
-        setError(`GPS error: ${err.message}`);
-        setActionLoading(null);
-      },
-      { enableHighAccuracy: true, timeout: 10000 }
-    );
+    setError('');
+    try {
+      const pos = await getGPSPosition(true);
+      const res = await apiVerifyArrival(selectedJob.id, pos.coords.latitude, pos.coords.longitude);
+      setSuccessMsg(res.message || 'Arrival verified!');
+      setPreServiceState((prev) => ({ ...prev, geofence_passed: true }));
+      await loadDashboard();
+      setTimeout(() => setSuccessMsg(''), 4000);
+    } catch (err) {
+      setError(err.message || 'Arrival geofence verification failed.');
+    } finally {
+      setActionLoading(null);
+    }
   };
 
   const handleVerifyOtpSubmit = async () => {
@@ -196,39 +184,28 @@ export function EmployeeDashboardPage() {
     }
   };
 
-  const handleDirectJobClockIn = () => {
+  const handleDirectJobClockIn = async () => {
     if (!selectedJob) return;
-    if (!navigator.geolocation) {
-      setError('Browser Geolocation is not supported by your browser.');
-      return;
-    }
     setActionLoading(selectedJob.id);
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        try {
-          const res = await apiClockIn({
-            lat: pos.coords.latitude,
-            lon: pos.coords.longitude,
-            accuracy: pos.coords.accuracy,
-            timestamp: pos.timestamp || Date.now(),
-            address: selectedJob.address || 'GPS Verified Customer Location',
-          });
-          setSuccessMsg(res.message || 'Clocked in successfully! Job is now IN PROGRESS.');
-          await loadDashboard();
-          setSelectedJob((prev) => (prev ? { ...prev, status: 'in_progress' } : null));
-          setTimeout(() => setSuccessMsg(''), 4000);
-        } catch (err) {
-          setError(err.message || 'Clock-in failed');
-        } finally {
-          setActionLoading(null);
-        }
-      },
-      (err) => {
-        setActionLoading(null);
-        setError(`Location Error: ${err.message || 'GPS location denied or unavailable'}`);
-      },
-      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
-    );
+    setError('');
+    try {
+      const pos = await getGPSPosition(true);
+      const res = await apiClockIn({
+        lat: pos.coords.latitude,
+        lon: pos.coords.longitude,
+        accuracy: pos.coords.accuracy,
+        timestamp: pos.timestamp || Date.now(),
+        address: selectedJob.address || 'GPS Verified Customer Location',
+      });
+      setSuccessMsg(res.message || 'Clocked in successfully! Job is now IN PROGRESS.');
+      await loadDashboard();
+      setSelectedJob((prev) => (prev ? { ...prev, status: 'in_progress' } : null));
+      setTimeout(() => setSuccessMsg(''), 4000);
+    } catch (err) {
+      setError(err.message || 'Clock-in failed');
+    } finally {
+      setActionLoading(null);
+    }
   };
 
   // Modals
@@ -298,6 +275,15 @@ export function EmployeeDashboardPage() {
       Notification.requestPermission().catch(() => {});
     }
   }, [isOnline]);
+
+  // Listen for real-time location update events (from TopHeader or ClockInCard) to refresh job queue
+  useEffect(() => {
+    const handleLocationUpdate = () => {
+      loadDashboard();
+    };
+    window.addEventListener('workforce:location-updated', handleLocationUpdate);
+    return () => window.removeEventListener('workforce:location-updated', handleLocationUpdate);
+  }, []);
 
   // Silent background job queue polling when technician is ONLINE
   useEffect(() => {
@@ -1188,25 +1174,38 @@ export function EmployeeDashboardPage() {
                             <h3 className="text-xs font-bold text-slate-900 truncate">
                               {job.service_title || job.service_category}
                             </h3>
-                            <p className="text-[11px] text-slate-500 truncate mt-0.5 flex items-center gap-1">
-                              <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
-                              <span>{job.address}</span>
-                            </p>
+                            <div className="flex items-center justify-between text-[11px] text-slate-500 mt-0.5 gap-2">
+                              <span className="truncate flex items-center gap-1">
+                                <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
+                                <span className="truncate">{job.address || 'Address provided on acceptance'}</span>
+                              </span>
+                              {job.distance_km != null && (
+                                <span className="shrink-0 font-mono text-[10px] font-bold text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200">
+                                  {job.distance_km.toFixed(1)} km away
+                                </span>
+                              )}
+                            </div>
                             <div className="flex items-center justify-between mt-2 pt-1 border-t border-slate-100 text-[10px] text-slate-500">
                               <span>Date: <strong className="text-slate-800">{job.preferred_date || '—'}</strong></span>
                               <span>{job.preferred_time || ''}</span>
                             </div>
 
                             {(job.active_offer?.status === 'OFFERED' || job.status === 'job_offered') && (
-                              <div className="mt-2.5 p-2.5 rounded bg-amber-50 border border-amber-200 text-amber-900 space-y-1.5">
+                              <div className="mt-2.5 p-2.5 rounded bg-amber-50 border border-amber-200 text-amber-900 space-y-2">
                                 <div className="flex items-center justify-between">
                                   <span className="font-bold text-[10px] text-amber-800 uppercase tracking-wider flex items-center gap-1">
                                     <Sparkles className="w-3 h-3 text-amber-600" />
-                                    <span>JOB OFFER</span>
+                                    <span>EXCLUSIVE JOB OFFER</span>
                                   </span>
-                                  <span className="text-[10px] font-mono text-amber-700">
-                                    {job.preferred_time || '5m Expiry'}
-                                  </span>
+                                  {job.distance_km != null ? (
+                                    <span className="text-[10px] font-mono font-bold text-amber-900 bg-amber-100 px-1.5 py-0.5 rounded border border-amber-300">
+                                      {job.distance_km.toFixed(1)} km away
+                                    </span>
+                                  ) : (
+                                    <span className="text-[10px] font-mono text-amber-700">
+                                      {job.preferred_time || '5m Expiry'}
+                                    </span>
+                                  )}
                                 </div>
                                 <div className="flex items-center gap-1.5 pt-1">
                                   <button
@@ -1378,6 +1377,14 @@ export function EmployeeDashboardPage() {
 
                           {(selectedJob.status === 'accepted' || selectedJob.status === 'on_the_way' || selectedJob.status === 'arrived') && (
                             <div className="w-full space-y-3.5 border border-slate-200 rounded-lg p-3.5 bg-slate-50/50 mt-1">
+                              {/* Interactive Live Customer Location & Navigation Tracking Map */}
+                              <JobTrackingMap
+                                job={selectedJob}
+                                technicianLocation={user?.last_known_location || employee?.user?.last_known_location}
+                                preServiceState={preServiceState}
+                                geofenceRadius={300}
+                              />
+
                               <div className="flex items-center justify-between border-b border-slate-200 pb-2">
                                 <span className="text-[11px] font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
                                   <ShieldCheck className="w-4 h-4 text-blue-600" />
@@ -1388,33 +1395,29 @@ export function EmployeeDashboardPage() {
                                 </span>
                               </div>
 
-                              {/* Step 1: Location Verification */}
+                              {/* Step 1: Automatic Location Geofence Verification (Zero-Manual-Arrival) */}
                               <div className="p-3 bg-white border border-slate-200 rounded flex items-center justify-between">
                                 <div>
                                   <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
                                     <MapPin className="w-3.5 h-3.5 text-blue-600" />
-                                    1. Location Verification
+                                    1. Location Verification (Automatic Geofence)
                                   </h4>
                                   <p className="text-[10px] text-slate-500 mt-0.5">
                                     {preServiceState.geofence_passed
-                                      ? 'Location verified! You are at the authorized service location.'
-                                      : 'Verify your location at the job address.'}
+                                      ? 'Arrival verified! You are inside the authorized 300m customer site geofence.'
+                                      : 'Travel toward customer destination. Arrival is automatically verified by backend GPS when within 300 meters.'}
                                   </p>
                                 </div>
                                 {preServiceState.geofence_passed ? (
-                                  <span className="px-2.5 py-1 bg-emerald-50 text-emerald-700 font-bold rounded text-xs border border-emerald-200 flex items-center gap-1">
+                                  <span className="px-2.5 py-1 bg-emerald-50 text-emerald-700 font-bold rounded text-xs border border-emerald-200 flex items-center gap-1 shrink-0">
                                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                                    LOCATION VERIFIED
+                                    ARRIVAL VERIFIED
                                   </span>
                                 ) : (
-                                  <button
-                                    type="button"
-                                    onClick={handleArriveAtLocation}
-                                    disabled={actionLoading === selectedJob.id}
-                                    className="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs shadow-sm transition-colors"
-                                  >
-                                    {actionLoading === selectedJob.id ? 'Verifying Location...' : 'ARRIVE AT LOCATION'}
-                                  </button>
+                                  <span className="px-2.5 py-1 bg-blue-50 text-blue-700 font-bold rounded text-xs border border-blue-200 flex items-center gap-1 shrink-0">
+                                    <Compass className="w-3.5 h-3.5 text-blue-600 animate-spin" />
+                                    GPS PENDING (&le;300m)
+                                  </span>
                                 )}
                               </div>
 
