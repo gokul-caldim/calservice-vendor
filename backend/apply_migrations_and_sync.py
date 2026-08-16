@@ -124,6 +124,9 @@ with connection.cursor() as cursor:
             );
         """)
         print("WorkforceJobReschedule table verified in PostgreSQL.")
+    except Exception as e:
+        print("WorkforceJobReschedule create table notice:", e)
+
     try:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS workforce_employee_change_request (
@@ -212,5 +215,59 @@ with connection.cursor() as cursor:
     except Exception as e:
         print("WorkforceJobFeedback create table notice:", e)
 
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS workforce_job_payment (
+                id BIGSERIAL PRIMARY KEY,
+                job_id BIGINT UNIQUE NOT NULL,
+                employee_id BIGINT,
+                company_id BIGINT,
+                payment_method VARCHAR(30) NOT NULL DEFAULT 'CASH_ON_SERVICE',
+                payment_status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+                amount_due NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
+                amount_paid NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
+                amount_received NUMERIC(10, 2),
+                change_returned NUMERIC(10, 2),
+                currency VARCHAR(10) NOT NULL DEFAULT 'INR',
+                gateway_transaction_id VARCHAR(200),
+                cash_collected_at TIMESTAMP WITH TIME ZONE,
+                cash_collected_by_id BIGINT,
+                customer_confirmed_at TIMESTAMP WITH TIME ZONE,
+                customer_confirmation_method VARCHAR(50) NOT NULL DEFAULT '',
+                payment_confirmation_otp_hash VARCHAR(256),
+                otp_expires_at TIMESTAMP WITH TIME ZONE,
+                otp_attempts INTEGER NOT NULL DEFAULT 0,
+                otp_used_at TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_wfp_job_status ON workforce_job_payment(job_id, payment_status);
+            CREATE INDEX IF NOT EXISTS idx_wfp_emp_status ON workforce_job_payment(employee_id, payment_status);
+            CREATE INDEX IF NOT EXISTS idx_wfp_comp_status ON workforce_job_payment(company_id, payment_status);
+        """)
+        print("WorkforceJobPayment table verified in PostgreSQL.")
+    except Exception as e:
+        print("WorkforceJobPayment create table notice:", e)
+
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS workforce_payment_collection_event (
+                id BIGSERIAL PRIMARY KEY,
+                job_payment_id BIGINT NOT NULL,
+                employee_id BIGINT,
+                actor_user_id BIGINT,
+                event_type VARCHAR(50) NOT NULL,
+                amount NUMERIC(10, 2),
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_wfpe_pay_created ON workforce_payment_collection_event(job_payment_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_wfpe_type_created ON workforce_payment_collection_event(event_type, created_at);
+        """)
+        print("WorkforcePaymentCollectionEvent table verified in PostgreSQL.")
+    except Exception as e:
+        print("WorkforcePaymentCollectionEvent create table notice:", e)
+
 print("DB Schema Sync Complete!")
+
 

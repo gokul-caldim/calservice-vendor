@@ -21,35 +21,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { MapPin, Navigation, Search, Loader } from 'lucide-react';
 import { getGPSPosition } from '../../hooks/useGPSPosition.js';
 
-// Dynamically load the Maps JS API script once
-let mapsApiPromise = null;
-
-function loadMapsApi(apiKey) {
-  if (!mapsApiPromise) {
-    mapsApiPromise = new Promise((resolve, reject) => {
-      if (window.google?.maps) {
-        resolve(window.google.maps);
-        return;
-      }
-      const existingScript = document.getElementById('gmap-script');
-      if (existingScript) {
-        existingScript.addEventListener('load', () => resolve(window.google.maps));
-        existingScript.addEventListener('error', reject);
-        return;
-      }
-      const script = document.createElement('script');
-      script.id = 'gmap-script';
-      script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=places&loading=async`;
-      script.async = true;
-      script.defer = true;
-      script.onload = () => resolve(window.google.maps);
-
-      script.onerror = (e) => reject(e);
-      document.head.appendChild(script);
-    });
-  }
-  return mapsApiPromise;
-}
+import { loadMapsApi } from '../../utils/loadGoogleMaps.js';
 
 /**
  * @param {Object} props

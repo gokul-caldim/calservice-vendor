@@ -131,18 +131,87 @@ export function useGPSPosition() {
 }
 
 /**
+ * Location Adapter Abstraction (Mobile & Web Architecture)
+ */
+/**
+ * Location Adapter Abstraction (Mobile & Web Architecture)
+ */
+export class WebGeolocationAdapter {
+  watch(onSuccess, onError, options) {
+    if (typeof window === 'undefined' || !navigator.geolocation) {
+      if (onError) onError({ code: 'UNSUPPORTED', message: 'Geolocation not supported.' });
+      return null;
+    }
+    return navigator.geolocation.watchPosition(
+      onSuccess,
+      (err) => {
+        // If high accuracy failed/timed out, try watching with standard accuracy
+        if (options?.enableHighAccuracy && (err.code === 2 || err.code === 3)) {
+          console.warn('[GPS] watchPosition high accuracy failed, falling back to standard accuracy.');
+          try {
+            navigator.geolocation.clearWatch(this._watchId);
+          } catch (_) {}
+          this._watchId = navigator.geolocation.watchPosition(onSuccess, onError, {
+            enableHighAccuracy: false,
+            timeout: 20000,
+            maximumAge: 60000,
+          });
+          return;
+        }
+        if (onError) onError(err);
+      },
+      options
+    );
+  }
+
+  clearWatch(id) {
+    if (typeof window !== 'undefined' && navigator.geolocation && id != null) {
+      try {
+        navigator.geolocation.clearWatch(id);
+      } catch (_) {}
+    }
+  }
+
+  getCurrentPosition(onSuccess, onError, options) {
+    if (typeof window === 'undefined' || !navigator.geolocation) {
+      if (onError) onError({ code: 'UNSUPPORTED', message: 'Geolocation not supported.' });
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      onSuccess,
+      (err) => {
+        if (options?.enableHighAccuracy && (err.code === 2 || err.code === 3)) {
+          console.warn('[GPS] getCurrentPosition high accuracy failed, retrying with standard accuracy.');
+          navigator.geolocation.getCurrentPosition(onSuccess, onError, {
+            enableHighAccuracy: false,
+            timeout: 15000,
+            maximumAge: 60000,
+          });
+          return;
+        }
+        if (onError) onError(err);
+      },
+      options
+    );
+  }
+}
+
+const defaultLocationAdapter = new WebGeolocationAdapter();
+
+/**
  * useLocationTracker hook.
  *
- * Starts live GPS tracking when `active` is true, stops when false.
- * Calls `onPositionChange({ latitude, longitude, accuracy })` when a new
- * significant position is available (distance > MOVEMENT_THRESHOLD_METRES or
- * first fix after interval).
+ * Single centralized continuous GPS watcher for employee session.
+ * Starts live GPS tracking automatically when `active` is true (e.g. employee is ONLINE).
+ * Calls `onPositionChange({ latitude, longitude, accuracy, speed, heading, captured_at })`
+ * on every valid fix (movement > MOVEMENT_THRESHOLD_METRES or periodic interval).
  *
  * @param {boolean} active  - Start tracking when true, stop when false.
  * @param {Function} onPositionChange - Callback with position data.
- * @param {Function} [onError]  - Optional callback for errors.
+ * @param {Function} [onError]  - Optional callback for structured errors.
+ * @param {Object} [adapter]  - Optional location adapter (defaults to WebGeolocationAdapter).
  */
-export function useLocationTracker(active, onPositionChange, onError) {
+export function useLocationTracker(active, onPositionChange, onError, adapter = defaultLocationAdapter) {
   const lastPositionRef = useRef(null);
   const lastReportedTimeRef = useRef(0);
   const watchIdRef = useRef(null);
@@ -150,7 +219,7 @@ export function useLocationTracker(active, onPositionChange, onError) {
 
   const handlePosition = useCallback(
     (pos) => {
-      const { latitude, longitude, accuracy } = pos.coords;
+      const { latitude, longitude, accuracy, speed, heading } = pos.coords;
       const now = Date.now();
       const last = lastPositionRef.current;
       const timeSinceLastReport = now - lastReportedTimeRef.current;
@@ -163,7 +232,14 @@ export function useLocationTracker(active, onPositionChange, onError) {
 
       lastPositionRef.current = { latitude, longitude };
       lastReportedTimeRef.current = now;
-      onPositionChange({ latitude, longitude, accuracy: accuracy ?? null });
+      onPositionChange({
+        latitude,
+        longitude,
+        accuracy: accuracy ?? null,
+        speed: speed ?? null,
+        heading: heading ?? null,
+        captured_at: new Date(pos.timestamp || now).toISOString(),
+      });
     },
     [onPositionChange],
   );
@@ -171,28 +247,35 @@ export function useLocationTracker(active, onPositionChange, onError) {
   const handleError = useCallback(
     (err) => {
       const codes = { 1: 'PERMISSION_DENIED', 2: 'POSITION_UNAVAILABLE', 3: 'TIMEOUT' };
+      let msg = err.message || 'Could not retrieve GPS position.';
+      if (err.code === 1 || err.code === 'PERMISSION_DENIED') {
+        msg = 'Location permission is required to receive nearby jobs.';
+      } else if (err.code === 2 || err.code === 'POSITION_UNAVAILABLE') {
+        msg = 'Location services are unavailable. Please check device location settings.';
+      } else if (err.code === 3 || err.code === 'TIMEOUT') {
+        msg = 'Location request timed out. Retrying in background...';
+      }
       if (onError) {
-        onError({ code: codes[err.code] || 'POSITION_UNAVAILABLE', message: err.message });
+        onError({ code: codes[err.code] || err.code || 'POSITION_UNAVAILABLE', message: msg });
       }
     },
     [onError],
   );
 
-  // Force-poll on the interval in case the watch misses positions
+  // Force-poll on interval in case watcher is idle
   const forcePoll = useCallback(() => {
-    if (!navigator.geolocation) return;
-    navigator.geolocation.getCurrentPosition(handlePosition, handleError, {
+    adapter.getCurrentPosition(handlePosition, handleError, {
       enableHighAccuracy: true,
-      timeout: 15_000,
+      timeout: 10_000,
       maximumAge: MAX_POSITION_AGE_MS,
     });
-  }, [handlePosition, handleError]);
+  }, [handlePosition, handleError, adapter]);
 
   useEffect(() => {
     if (!active) {
-      // Stop tracking
+      // Stop tracking when offline/inactive
       if (watchIdRef.current !== null) {
-        navigator.geolocation?.clearWatch(watchIdRef.current);
+        adapter.clearWatch(watchIdRef.current);
         watchIdRef.current = null;
       }
       if (intervalRef.current !== null) {
@@ -204,27 +287,22 @@ export function useLocationTracker(active, onPositionChange, onError) {
       return;
     }
 
-    if (!navigator.geolocation) {
-      if (onError) onError({ code: 'UNSUPPORTED', message: 'Geolocation not supported.' });
-      return;
-    }
-
-    // Start watch
-    watchIdRef.current = navigator.geolocation.watchPosition(handlePosition, handleError, {
+    // Start single continuous watch when active (ONLINE)
+    watchIdRef.current = adapter.watch(handlePosition, handleError, {
       enableHighAccuracy: true,
-      timeout: 15_000,
+      timeout: 10_000,
       maximumAge: MAX_POSITION_AGE_MS,
     });
 
     // Periodic force-poll as backup
     intervalRef.current = setInterval(forcePoll, POLL_INTERVAL_MS);
 
-    // Initial fix immediately
+    // Initial fix immediately upon becoming active
     forcePoll();
 
     return () => {
       if (watchIdRef.current !== null) {
-        navigator.geolocation?.clearWatch(watchIdRef.current);
+        adapter.clearWatch(watchIdRef.current);
         watchIdRef.current = null;
       }
       if (intervalRef.current !== null) {
@@ -232,5 +310,6 @@ export function useLocationTracker(active, onPositionChange, onError) {
         intervalRef.current = null;
       }
     };
-  }, [active, handlePosition, handleError, forcePoll]);
+  }, [active, handlePosition, handleError, forcePoll, adapter]);
 }
+

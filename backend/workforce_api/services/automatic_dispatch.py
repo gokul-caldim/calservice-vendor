@@ -10,6 +10,7 @@ from datetime import timedelta
 from typing import List, Dict, Any, Tuple, Optional
 
 from django.db import transaction
+from django.db.models import Exists, OuterRef, Prefetch, Q
 from django.utils import timezone
 from django.contrib.auth import get_user_model
 from django.utils.dateparse import parse_datetime
@@ -27,8 +28,11 @@ from time_tracking.geo import haversine_distance
 
 logger = logging.getLogger("workforce.dispatch")
 
-# Strict GPS telemetry freshness requirement (5 minutes maximum age for live dispatch)
-MAX_GPS_AGE_SECONDS = 300
+# Strict GPS telemetry freshness requirement (2 minutes maximum age for live dispatch)
+MAX_GPS_AGE_SECONDS = 120
+
+# Maximum geographic dispatch radius (50 km)
+MAX_DISPATCH_RADIUS_KM = 50.0
 
 # Default job offer duration before auto-expiry and fallback
 DEFAULT_OFFER_DURATION_MINUTES = 5
@@ -36,27 +40,96 @@ DEFAULT_OFFER_DURATION_MINUTES = 5
 # Dispatchable database statuses
 DISPATCHABLE_STATUSES = ["draft", "new_request", "confirmed", "unassigned", "assigned"]
 
+# Canonical service synonyms and explicit alias dictionary
+EXPLICIT_SERVICE_ALIASES = {
+    "hvac": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
+    "ac": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
+    "air conditioning": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
+    "ac repair & diagnostics": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
+    "ac service & cleaning": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
+    "ac gas & refrigerant": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
+    "ac installation & uninstallation": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
+    "plumbing": {"plumbing", "plumber", "pipe repair", "water leakage", "drainage", "tap repair", "sanitary"},
+    "electrical": {"electrical", "electrician", "wiring", "switchboard", "fan repair", "fuse repair", "light fitting"},
+    "electrician": {"electrical", "electrician", "wiring", "switchboard", "fan repair", "fuse repair", "light fitting"},
+    "refrigerator": {"refrigerator", "fridge", "freezer", "single door fridge", "double door fridge"},
+    "washing machine": {"washing machine", "washer", "dryer", "top load", "front load"},
+    "tv & display": {"tv & display", "tv", "television", "led tv", "smart tv", "display"},
+    "microwave oven repair": {"microwave", "microwave oven", "microwave oven repair", "oven"},
+    "carpentry services": {"carpentry", "carpenter", "wood work", "furniture repair", "door repair", "carpentry services"},
+    "pest control": {"pest control", "cockroach control", "ants & bed bugs control", "termite control", "bed bugs", "cockroach", "termite"},
+    "cockroach control": {"cockroach control", "cockroach", "pest control"},
+    "ants & bed bugs control": {"ants & bed bugs control", "ants", "bed bugs", "pest control"},
+    "termite control": {"termite control", "termite", "pest control"},
+    "cleaning": {"cleaning", "kitchen cleaning", "bathroom cleaning", "full house cleaning", "sofa cleaning", "deep cleaning", "house cleaning"},
+    "kitchen cleaning": {"kitchen cleaning", "cleaning", "deep cleaning"},
+    "bathroom cleaning": {"bathroom cleaning", "cleaning", "deep cleaning"},
+    "full house cleaning": {"full house cleaning", "cleaning", "deep cleaning", "house cleaning"},
+    "sofa cleaning": {"sofa cleaning", "cleaning", "couch cleaning"},
+    "two wheeler": {"two wheeler", "bike", "scooter", "motorcycle", "bike repair", "two wheeler repair"},
+    "truck": {"truck", "packer & mover", "packers & movers", "logistics", "shifting"},
+    "packer & mover": {"packer & mover", "packers & movers", "truck", "shifting", "relocation"},
+}
 
-def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = None) -> Tuple[bool, str]:
+
+def canonical_service_match(requested_service: str, approved_services: List[str], verified_skills: List[str]) -> Tuple[bool, str, str]:
+    """
+    Evaluates whether a requested service matches an employee's authorized services or verified skills.
+    Returns (is_match, match_method, matched_term).
+    """
+    if not requested_service:
+        return True, "EMPTY_SERVICE_BYPASS", ""
+
+    req_clean = requested_service.lower().replace("—", " ").replace("-", " ").strip()
+    req_words = set(w for w in req_clean.split() if len(w) >= 2)
+
+    # 1. Check exact or direct match against approved employee services
+    for it in approved_services:
+        if not it:
+            continue
+        it_clean = it.lower().replace("—", " ").replace("-", " ").strip()
+        if req_clean == it_clean or req_clean in it_clean or it_clean in req_clean:
+            return True, "EXACT_OR_SUBSTRING_SERVICE", it
+
+    # 2. Check verified skills
+    for sk in verified_skills:
+        if not sk:
+            continue
+        sk_clean = sk.lower().replace("—", " ").replace("-", " ").strip()
+        if req_clean == sk_clean or req_clean in sk_clean or sk_clean in req_clean:
+            return True, "VERIFIED_SKILL_MATCH", sk
+
+    # 3. Check explicit canonical alias table
+    for alias_key, alias_group in EXPLICIT_SERVICE_ALIASES.items():
+        # If requested service matches this alias key/group
+        if req_clean == alias_key or req_clean in alias_group or any(req_word in alias_group for req_word in req_words):
+            # Check if employee has any matching service in that alias group
+            for it in approved_services:
+                it_clean = it.lower().replace("—", " ").replace("-", " ").strip()
+                if it_clean in alias_group or any(w in alias_group for w in it_clean.split() if len(w) >= 2):
+                    return True, "EXPLICIT_ALIAS_SERVICE", it
+            for sk in verified_skills:
+                sk_clean = sk.lower().replace("—", " ").replace("-", " ").strip()
+                if sk_clean in alias_group or any(w in alias_group for w in sk_clean.split() if len(w) >= 2):
+                    return True, "EXPLICIT_ALIAS_SKILL", sk
+
+    return False, "NO_MATCH", ""
+
+
+def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = None) -> Tuple[bool, str, Dict[str, bool]]:
     """
     9-Gate Employee Eligibility Engine:
     Authoritative server-side evaluation of 9 mandatory operational gates.
     Every gate fails closed.
-
-    Gate 1 — Account Active: Employee and User accounts must both be active.
-    Gate 2 — Registration Approved: Employee onboarding dossier must be approved.
-    Gate 3 — Required Documents Approved: Mandatory dossier documents must all be approved.
-    Gate 4 — Mandatory Compliance Valid: Compliance certificates must not be expired/rejected.
-    Gate 5 — Working Schedule: Current time must fall within today's working schedule.
-    Gate 6 — Service / Skill Authorization: Must be authorized for service or have verified skill.
-    Gate 7 — Live Presence: Must be ONLINE and AVAILABLE.
-    Gate 8 — Leave Check: Must not be on approved leave today.
-    Gate 9 — Workload Concurrency: Must not be busy on an active conflicting job assignment.
+    Returns (is_eligible, reason_message, gate_results_dict).
     """
+    gate_results = {f"G{i}": True for i in range(1, 10)}
+
     # ── Gate 1: Account Active ────────────────────────────────────────────────
     if not emp or not emp.is_active or not getattr(emp.user, "is_active", True):
+        gate_results["G1"] = False
         logger.debug(f"[9GATE_REJECT_GATE1_ACCOUNT_INACTIVE] Employee #{getattr(emp, 'id', None)} account is inactive.")
-        return False, "Gate 1: Technician account is inactive."
+        return False, "Gate 1: Technician account is inactive.", gate_results
 
     bank_details = emp.bank_details or {}
     onboarding = bank_details.get("onboarding", {})
@@ -64,20 +137,23 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
     # ── Gate 2: Registration Approved ─────────────────────────────────────────
     reg_status = onboarding.get("status", "not_started")
     if reg_status != "approved":
+        gate_results["G2"] = False
         logger.debug(f"[9GATE_REJECT_GATE2_ONBOARDING_UNAPPROVED] Employee #{emp.id} onboarding status is '{reg_status}'.")
-        return False, "Gate 2: Technician registration onboarding is not approved."
+        return False, "Gate 2: Technician registration onboarding is not approved.", gate_results
 
     # ── Gate 3: Required Documents Approved ───────────────────────────────────
     documents = onboarding.get("documents", {})
     if any(doc.get("status") != "approved" for doc in documents.values()):
+        gate_results["G3"] = False
         logger.debug(f"[9GATE_REJECT_GATE3_DOCUMENTS_UNAPPROVED] Employee #{emp.id} has unapproved documents.")
-        return False, "Gate 3: Technician has unapproved dossier documents."
+        return False, "Gate 3: Technician has unapproved dossier documents.", gate_results
 
     # ── Gate 4: Mandatory Compliance Valid ────────────────────────────────────
     if hasattr(emp, "prefetched_invalid_compliance"):
         if emp.prefetched_invalid_compliance:
+            gate_results["G4"] = False
             logger.debug(f"[9GATE_REJECT_GATE4_COMPLIANCE_INVALID] Employee #{emp.id} has invalid compliance.")
-            return False, "Gate 4: Technician has expired or rejected mandatory compliance document."
+            return False, "Gate 4: Technician has expired or rejected mandatory compliance document.", gate_results
     else:
         mandatory_comp = WorkforceEmployeeCompliance.objects.filter(
             employee=emp,
@@ -85,8 +161,9 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
             status__in=["EXPIRED", "REJECTED"],
         ).first()
         if mandatory_comp:
+            gate_results["G4"] = False
             logger.debug(f"[9GATE_REJECT_GATE4_COMPLIANCE_INVALID] Employee #{emp.id} compliance '{mandatory_comp.requirement.title}' is {mandatory_comp.status}.")
-            return False, f"Gate 4: Technician has expired or rejected mandatory compliance document: '{mandatory_comp.requirement.title}'."
+            return False, f"Gate 4: Technician has expired or rejected mandatory compliance document: '{mandatory_comp.requirement.title}'.", gate_results
 
     # ── Gate 5: Working Schedule ──────────────────────────────────────────────
     if hasattr(emp, "prefetched_today_schedules"):
@@ -97,12 +174,14 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
 
     if sched:
         if not sched.is_working_day:
+            gate_results["G5"] = False
             logger.debug(f"[9GATE_REJECT_GATE5_SCHEDULE_OFF] Employee #{emp.id} is scheduled off today.")
-            return False, "Gate 5: Technician is scheduled off today."
+            return False, "Gate 5: Technician is scheduled off today.", gate_results
         now_time = timezone.now().time()
         if not (sched.start_time <= now_time <= sched.end_time):
+            gate_results["G5"] = False
             logger.debug(f"[9GATE_REJECT_GATE5_SCHEDULE_OUTSIDE] Employee #{emp.id} outside hours ({sched.start_time}-{sched.end_time}).")
-            return False, f"Gate 5: Technician is outside scheduled working hours ({sched.start_time.strftime('%H:%M')}-{sched.end_time.strftime('%H:%M')})."
+            return False, f"Gate 5: Technician is outside scheduled working hours ({sched.start_time.strftime('%H:%M')}-{sched.end_time.strftime('%H:%M')}).", gate_results
 
     # ── Gate 6: Service / Skill Authorization ─────────────────────────────────
     approved_svcs = []
@@ -121,30 +200,18 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
         )
 
     if service_name:
-        svc_lower = service_name.lower().replace("—", " ").replace("-", " ")
-        svc_words = set(w for w in svc_lower.split() if len(w) >= 2)
-
-        def matches_any(items):
-            for it in items:
-                it_lower = it.lower().replace("—", " ").replace("-", " ")
-                if svc_lower in it_lower or it_lower in svc_lower:
-                    return True
-                it_words = set(w for w in it_lower.split() if len(w) >= 2)
-                # If significant common keywords exist (e.g. ac, hvac, plumbing, electrical, clean, repair)
-                if svc_words & it_words:
-                    return True
-            return False
-
-        matches_catalog = matches_any(approved_svcs) if approved_svcs else False
-        matches_skill = matches_any(verified_skills) if verified_skills else False
-        if not matches_catalog and not matches_skill:
-            logger.debug(f"[9GATE_REJECT_GATE6_SKILL_MISMATCH] Employee #{emp.id} not verified for '{service_name}'.")
-            return False, f"Gate 6: Technician is not authorized or verified for requested service '{service_name}'."
+        is_match, method, matched = canonical_service_match(service_name, approved_svcs, verified_skills)
+        logger.info(f"[DISPATCH_SERVICE_MATCH] job_service=\"{service_name}\" employee_services={approved_svcs} verified_skills={verified_skills} match_method={method} result={'PASS' if is_match else 'FAIL'}")
+        if not is_match:
+            gate_results["G6"] = False
+            logger.debug(f"[9GATE_REJECT_GATE6_SKILL_MISMATCH] Employee #{emp.id} not authorized/verified for '{service_name}'.")
+            return False, f"Gate 6: Technician is not authorized or verified for requested service '{service_name}'.", gate_results
 
     # ── Gate 7: Live Presence (Online & Available) ────────────────────────────
     if not emp.is_online or emp.current_availability != "available":
+        gate_results["G7"] = False
         logger.debug(f"[9GATE_REJECT_GATE7_PRESENCE_OFFLINE] Employee #{emp.id} presence is is_online={emp.is_online}, avail={emp.current_availability}.")
-        return False, "Gate 7: Technician is currently OFFLINE or unavailable."
+        return False, "Gate 7: Technician is currently OFFLINE or unavailable.", gate_results
 
     # ── Gate 8: Leave Check ───────────────────────────────────────────────────
     today_str = timezone.now().date().isoformat()
@@ -154,32 +221,41 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
             start_date = l.get("start_date", "")
             end_date = l.get("end_date", "")
             if start_date <= today_str <= end_date:
+                gate_results["G8"] = False
                 logger.debug(f"[9GATE_REJECT_GATE8_LEAVE_ACTIVE] Employee #{emp.id} on approved leave ({start_date} to {end_date}).")
-                return False, f"Gate 8: Technician is on approved leave from {start_date} to {end_date}."
+                return False, f"Gate 8: Technician is on approved leave from {start_date} to {end_date}.", gate_results
 
     # ── Gate 9: Workload Concurrency ──────────────────────────────────────────
     if hasattr(emp, "is_busy_job"):
         if emp.is_busy_job:
+            gate_results["G9"] = False
             logger.debug(f"[9GATE_REJECT_GATE9_WORKLOAD_BUSY] Employee #{emp.id} has active busy job.")
-            return False, "Gate 9: Technician is busy on active job assignment."
+            return False, "Gate 9: Technician is busy on active job assignment.", gate_results
     else:
         active_job = ServiceRequest.objects.filter(
             assigned_employee=emp,
             status__in=["accepted", "on_the_way", "arrived", "in_progress"],
         ).first()
         if active_job:
+            gate_results["G9"] = False
             logger.debug(f"[9GATE_REJECT_GATE9_WORKLOAD_BUSY] Employee #{emp.id} is busy on active Job #{active_job.id}.")
-            return False, f"Gate 9: Technician is busy on active Job #{active_job.id} ({active_job.request_id})."
+            return False, f"Gate 9: Technician is busy on active Job #{active_job.id} ({active_job.request_id}).", gate_results
 
-    return True, "All 9 Eligibility Gates Passed"
+    return True, "All 9 Eligibility Gates Passed", gate_results
 
 
-def get_eligible_candidates(job_obj: ServiceRequest, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) -> List[Dict[str, Any]]:
+def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) -> List[Dict[str, Any]]:
     """
     Finds and ranks all eligible candidate employees for a given ServiceRequest.
     Uses database-level filtering and prefetching for optimal WAN performance.
     """
-    from django.db.models import Exists, OuterRef, Prefetch
+    if hasattr(job_id_or_obj, "latitude"):
+        job_obj = job_id_or_obj
+    else:
+        job_obj = ServiceRequest.objects.filter(pk=job_id_or_obj).first()
+        if not job_obj:
+            logger.warning(f"[DISPATCH_JOB_NOT_FOUND] Job #{job_id_or_obj} not found.")
+            return []
 
     if job_obj.latitude is None or job_obj.longitude is None:
         logger.warning(f"[DISPATCH_GPS_MISSING] Job #{job_obj.id} lacks customer GPS coordinates.")
@@ -244,53 +320,64 @@ def get_eligible_candidates(job_obj: ServiceRequest, max_gps_age_seconds: int = 
             logger.debug(f"[DISPATCH_CANDIDATE_REJECTED] Employee #{emp.id} already has offer history for Job #{job_obj.id}.")
             continue
 
-        # Check eligibility against service_category, then issue_title
-        is_eligible, reason = check_candidate_eligibility(emp, job_obj.service_category)
-        if not is_eligible and job_obj.issue_title:
-            is_eligible, reason = check_candidate_eligibility(emp, job_obj.issue_title)
-
-        if not is_eligible:
-            logger.debug(f"[DISPATCH_CANDIDATE_REJECTED] Employee #{emp.id} ineligible: {reason}")
-            continue
-
         # Extract live GPS from User.last_known_location
         last_loc = getattr(emp.user, "last_known_location", None) or {}
         emp_lat = last_loc.get("latitude") if last_loc.get("latitude") is not None else last_loc.get("lat")
         emp_lon = last_loc.get("longitude") if last_loc.get("longitude") is not None else (last_loc.get("lng") or last_loc.get("lon"))
 
-        if emp_lat is None or emp_lon is None:
-            logger.debug(f"[DISPATCH_GPS_MISSING] Employee #{emp.id} has no live GPS coordinates.")
-            continue
-
-        try:
-            emp_lat_f = float(emp_lat)
-            emp_lon_f = float(emp_lon)
-        except (ValueError, TypeError):
-            logger.debug(f"[DISPATCH_GPS_MISSING] Employee #{emp.id} has invalid GPS format.")
-            continue
-
-        # Location Freshness Gate: must be within max_gps_age_seconds (default 300s / 5min)
+        gps_age_s = None
         updated_at_str = last_loc.get("updated_at")
-        if not updated_at_str:
-            logger.debug(f"[DISPATCH_GPS_STALE] Employee #{emp.id} has missing GPS updated_at timestamp.")
+        if updated_at_str:
+            try:
+                loc_dt = parse_datetime(str(updated_at_str))
+                if loc_dt:
+                    if timezone.is_naive(loc_dt):
+                        loc_dt = timezone.make_aware(loc_dt)
+                    gps_age_s = (now - loc_dt).total_seconds()
+            except Exception:
+                pass
+
+        dist_km = None
+        emp_lat_f = None
+        emp_lon_f = None
+        if emp_lat is not None and emp_lon is not None:
+            try:
+                emp_lat_f = float(emp_lat)
+                emp_lon_f = float(emp_lon)
+                dist_m = haversine_distance(cust_lat, cust_lon, emp_lat_f, emp_lon_f)
+                dist_km = dist_m / 1000.0
+            except (ValueError, TypeError):
+                pass
+
+        logger.info(
+            f"[9GATE_EVALUATION] employee={emp.id} online={emp.is_online} availability={emp.current_availability} "
+            f"gps_age={f'{gps_age_s:.1f}s' if gps_age_s is not None else 'MISSING'} "
+            f"distance_km={f'{dist_km:.2f}km' if dist_km is not None else 'UNKNOWN'}"
+        )
+
+        # Check eligibility against service_category, then issue_title
+        is_eligible, reason, gate_results = check_candidate_eligibility(emp, job_obj.service_category)
+        if not is_eligible and job_obj.issue_title:
+            is_eligible, reason, gate_results = check_candidate_eligibility(emp, job_obj.issue_title)
+
+        g_str = " ".join(f"{k}={'PASS' if v else 'FAIL'}" for k, v in gate_results.items())
+        logger.info(f"[9GATE_RESULT] employee={emp.id} {g_str}")
+
+        if not is_eligible:
+            logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason={reason}")
             continue
 
-        try:
-            loc_dt = parse_datetime(str(updated_at_str))
-            if not loc_dt:
-                continue
-            if timezone.is_naive(loc_dt):
-                loc_dt = timezone.make_aware(loc_dt)
-            gps_age = (now - loc_dt).total_seconds()
-            if gps_age > max_gps_age_seconds or gps_age < -60:
-                logger.debug(f"[DISPATCH_GPS_STALE] Employee #{emp.id} GPS is stale ({gps_age:.1f}s > {max_gps_age_seconds}s).")
-                continue
-        except Exception:
+        if emp_lat_f is None or emp_lon_f is None:
+            logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=GPS_MISSING")
             continue
 
-        # Calculate Haversine proximity distance in km
-        dist_m = haversine_distance(cust_lat, cust_lon, emp_lat_f, emp_lon_f)
-        dist_km = dist_m / 1000.0
+        if gps_age_s is None or gps_age_s > max_gps_age_seconds or gps_age_s < -60:
+            logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=GPS_STALE gps_age={gps_age_s}s")
+            continue
+
+        if dist_km is None or dist_km > MAX_DISPATCH_RADIUS_KM:
+            logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=RADIUS_EXCEEDED distance_km={dist_km}")
+            continue
 
         # Proximity score (closer = higher score, max 100)
         proximity_score = max(0.0, 100.0 - (dist_km * 2.0))
@@ -344,9 +431,10 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
     2. Validates dispatchable state and coordinates
     3. Checks if an active exclusive offer already exists (idempotent guard)
     4. Evaluates and ranks eligible candidates
-    5. Creates WorkforceJobOffer and sends JOB_OFFER notification
+    5. Creates WorkforceJobOffer, sends JOB_OFFER notification, and logs audit events
     """
     job_id = job_id_or_obj.pk if hasattr(job_id_or_obj, "pk") else job_id_or_obj
+    from workforce_api.models import WorkforceEventLog
 
     with transaction.atomic():
         job_obj = ServiceRequest.objects.select_for_update().filter(pk=job_id).first()
@@ -360,6 +448,12 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
             return False, f"Job #{job_id} is already accepted and in progress with Employee #{job_obj.assigned_employee_id}."
 
         now = timezone.now()
+
+        logger.info(
+            f"[DISPATCH_EVALUATION] job_id={job_obj.id} "
+            f"service=\"{job_obj.service_category or job_obj.issue_title}\" "
+            f"customer_lat={job_obj.latitude} customer_lng={job_obj.longitude}"
+        )
 
         # Idempotency: Check if an active, non-expired offer already exists
         active_offer = WorkforceJobOffer.objects.select_for_update().filter(
@@ -380,8 +474,18 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
             logger.warning(f"[DISPATCH_GPS_MISSING] Job #{job_id} is missing coordinates.")
             return False, "Customer booking is missing valid GPS coordinates."
 
+        WorkforceEventLog.objects.create(
+            event_type="DISPATCH_STARTED",
+            payload={"job_id": job_obj.id, "service": job_obj.service_category}
+        )
+
         # Find eligible candidate technicians
         candidates = get_eligible_candidates(job_obj, max_gps_age_seconds=max_gps_age_seconds)
+
+        WorkforceEventLog.objects.create(
+            event_type="CANDIDATES_EVALUATED",
+            payload={"job_id": job_obj.id, "eligible_count": len(candidates)}
+        )
 
         if not candidates:
             if job_obj.status != "unassigned":
@@ -425,6 +529,12 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
             job_obj.status = "assigned"
             job_obj.save(update_fields=["status"])
 
+        WorkforceEventLog.objects.create(
+            user=top_emp.user,
+            event_type="OFFER_CREATED",
+            payload={"job_id": job_obj.id, "offer_id": offer.id, "employee_id": top_emp.id, "distance_km": round(top_dist_km, 2)}
+        )
+
         loc_str = f" at {job_obj.address}" if job_obj.address else ""
         req_id_str = f" ({job_obj.request_id})" if job_obj.request_id else f" #{job_obj.id}"
         service_label = job_obj.issue_title or job_obj.service_category or "Service Request"
@@ -439,7 +549,10 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
             related_object_id=str(job_obj.id),
         )
 
-        logger.info(f"[DISPATCH_OFFER_CREATED] Offer #{offer.id} created: Job #{job_obj.id} -> Employee #{top_emp.id} ({top_dist_km:.2f}km away, Score: {top_score:.1f}).")
+        logger.info(
+            f"[DISPATCH_DECISION] job={job_obj.id} employee={top_emp.id} "
+            f"distance_km={top_dist_km:.2f} score={top_score:.1f} status=OFFER_CREATED"
+        )
         return True, f"Job #{job_obj.id} offered to {top_emp.user.get_full_name() or top_emp.user.username} ({top_dist_km:.1f}km away, Score: {top_score:.1f})."
 
 

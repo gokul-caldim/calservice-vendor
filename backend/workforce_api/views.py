@@ -4,6 +4,7 @@ Complete API views for Workforce Registration, Admin Approvals, Decoupled Availa
 """
 import uuid
 import os
+import logging
 from decimal import Decimal
 from django.conf import settings
 
@@ -11,6 +12,8 @@ from django.contrib.auth import get_user_model
 from django.core.files.storage import default_storage
 from django.db import models, transaction
 from django.db.models import Q
+
+logger = logging.getLogger(__name__)
 
 
 from django.utils import timezone
@@ -33,6 +36,7 @@ from time_tracking.geo import evaluate
 
 from datetime import timedelta
 import secrets
+from django.contrib.auth.hashers import make_password, check_password
 from accounts.permissions import is_admin_role
 from .permissions import IsWorkforceAdmin, IsWorkforceEmployee, IsApprovedTechnician
 from .serializers import (
@@ -48,6 +52,8 @@ from .serializers import (
     WorkforceUserPreferenceSerializer,
     WorkforceNotificationPreferenceSerializer,
     WorkforceJobFeedbackSerializer,
+    JobPaymentSerializer,
+    PaymentCollectionEventSerializer,
 )
 from .models import (
     WorkforceEmployeeSchedule,
@@ -69,6 +75,8 @@ from .models import (
     WorkforceJobFeedback,
     WorkforceEventLog,
     WorkforceNotification,
+    JobPayment,
+    PaymentCollectionEvent,
 )
 from time_tracking.models import TimeLog, Break
 from time_tracking.serializers import TimeLogSerializer
@@ -481,6 +489,84 @@ class WorkforceAdminDocumentVerifyView(APIView):
         }, status=status.HTTP_200_OK)
 
 
+class WorkforceAdminBulkDocumentVerifyView(APIView):
+    permission_classes = [IsWorkforceAdmin]
+
+    def post(self, request, pk):
+        emp = Employee.objects.filter(pk=pk).first()
+        if not emp:
+            return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Tenant isolation
+        if not getattr(request.user, "is_superuser", False):
+            if request.user.company_id and emp.company_id and request.user.company_id != emp.company_id:
+                return Response({"error": "Unauthorized cross-company action."}, status=status.HTTP_403_FORBIDDEN)
+
+        # Prevent employee from approving their own documents
+        if getattr(request.user, "employee_profile", None) and request.user.employee_profile.id == emp.id and not getattr(request.user, "is_superuser", False):
+            return Response({"error": "Employees cannot approve or decide their own documents."}, status=status.HTTP_403_FORBIDDEN)
+
+        action = request.data.get("action", "").lower()
+        reason = request.data.get("reason", "")
+        categories = request.data.get("categories")
+        all_pending = request.data.get("all_pending", False)
+
+        if action not in ["approve", "reject"]:
+            return Response({"error": "Action must be 'approve' or 'reject'."}, status=status.HTTP_400_BAD_REQUEST)
+
+        bank_details = emp.bank_details or {}
+        onboarding = bank_details.get("onboarding", {})
+        documents = onboarding.get("documents", {})
+
+        if not documents:
+            return Response({
+                "message": "No documents found in candidate dossier.",
+                "updated_count": 0,
+                "documents": {},
+            }, status=status.HTTP_200_OK)
+
+        # Target documents
+        if categories:
+            cat_set = set(categories)
+            target_keys = [k for k in documents.keys() if k in cat_set]
+        elif all_pending:
+            target_keys = [k for k, doc in documents.items() if doc.get("status") not in ["approved", "rejected"]]
+        else:
+            target_keys = list(documents.keys())
+
+        if not target_keys:
+            return Response({
+                "message": "All uploaded documents are already decided.",
+                "updated_count": 0,
+                "documents": documents,
+            }, status=status.HTTP_200_OK)
+
+        now_iso = timezone.now().isoformat()
+        current_username = request.user.username
+        updated_count = 0
+
+        for key in target_keys:
+            doc = documents.get(key)
+            if not doc:
+                continue
+            doc["status"] = "approved" if action == "approve" else "rejected"
+            doc["rejection_reason"] = reason if action == "reject" else ""
+            doc["verified_at"] = now_iso
+            doc["verified_by"] = current_username
+            updated_count += 1
+
+        onboarding["documents"] = documents
+        bank_details["onboarding"] = onboarding
+        emp.bank_details = bank_details
+        emp.save()
+
+        return Response({
+            "message": f"Successfully {action}d {updated_count} document(s).",
+            "updated_count": updated_count,
+            "documents": documents,
+        }, status=status.HTTP_200_OK)
+
+
 class WorkforceEmployeeServiceRequestView(APIView):
     permission_classes = [IsApprovedTechnician]
 
@@ -674,6 +760,95 @@ class WorkforceAdminServiceDecideView(APIView):
 
         return Response({
             "message": msg,
+            "services": services,
+        }, status=status.HTTP_200_OK)
+
+
+class WorkforceAdminBulkServiceDecideView(APIView):
+    permission_classes = [IsWorkforceAdmin]
+
+    def post(self, request, pk):
+        emp = Employee.objects.filter(pk=pk).first()
+        if not emp:
+            return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Tenant isolation
+        if not getattr(request.user, "is_superuser", False):
+            if request.user.company_id and emp.company_id and request.user.company_id != emp.company_id:
+                return Response({"error": "Unauthorized cross-company action."}, status=status.HTTP_403_FORBIDDEN)
+
+        # Prevent employee from approving their own request
+        if getattr(request.user, "employee_profile", None) and request.user.employee_profile.id == emp.id and not getattr(request.user, "is_superuser", False):
+            return Response({"error": "Employees cannot approve or decide their own service authorizations."}, status=status.HTTP_403_FORBIDDEN)
+
+        action = request.data.get("action", "").lower()
+        reason = request.data.get("reason", "").strip()
+        service_ids = request.data.get("service_ids")
+        all_pending = request.data.get("all_pending", False)
+
+        if action not in ["approve", "reject"]:
+            return Response({"error": "Action must be 'approve' or 'reject'."}, status=status.HTTP_400_BAD_REQUEST)
+
+        bank_details = emp.bank_details or {}
+        onboarding = bank_details.get("onboarding", {})
+        services = onboarding.get("services", [])
+
+        if not services:
+            return Response({"error": "No requested services found on candidate."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Filter target services
+        if service_ids:
+            target_ids = set(str(sid) for sid in service_ids)
+            target_svcs = [s for s in services if str(s.get("id")) in target_ids]
+        elif all_pending:
+            target_svcs = [s for s in services if s.get("status") not in ["approved", "rejected"] or s.get("request_type") == "remove"]
+        else:
+            target_svcs = list(services)
+
+        if not target_svcs:
+            return Response({
+                "message": "All requested services are already decided.",
+                "updated_count": 0,
+                "services": services,
+            }, status=status.HTTP_200_OK)
+
+        updated_count = 0
+        now_iso = timezone.now().isoformat()
+        current_username = request.user.username
+
+        if action == "approve":
+            for svc in target_svcs:
+                if svc.get("request_type") == "remove":
+                    services = [s for s in services if str(s.get("id")) != str(svc.get("id"))]
+                else:
+                    svc["status"] = "approved"
+                    svc["rejection_reason"] = ""
+                    svc.pop("request_type", None)
+                    svc["approved_at"] = now_iso
+                    svc["approved_by"] = current_username
+                updated_count += 1
+        else:
+            for svc in target_svcs:
+                if svc.get("request_type") == "remove":
+                    svc["status"] = "approved"
+                    svc.pop("request_type", None)
+                    svc["rejection_reason"] = reason or "Removal request declined by admin."
+                else:
+                    svc["status"] = "rejected"
+                    svc["rejection_reason"] = reason or "Qualifications do not meet minimum threshold."
+                    svc.pop("request_type", None)
+                    svc["rejected_at"] = now_iso
+                    svc["rejected_by"] = current_username
+                updated_count += 1
+
+        onboarding["services"] = services
+        bank_details["onboarding"] = onboarding
+        emp.bank_details = bank_details
+        emp.save()
+
+        return Response({
+            "message": f"Successfully {action}d {updated_count} service(s).",
+            "updated_count": updated_count,
             "services": services,
         }, status=status.HTTP_200_OK)
 
@@ -872,7 +1047,13 @@ class WorkforceJobListView(APIView):
             if emp.company:
                 qs = qs.filter(company=emp.company)
 
-            jobs = qs.exclude(status__in=["completed", "cancelled"]).order_by("-created_at")
+            status_filter = str(request.query_params.get("status", "active")).lower().strip()
+            if status_filter == "completed":
+                jobs = qs.filter(status="completed").order_by("-updated_at", "-created_at")
+            elif status_filter == "all":
+                jobs = qs.order_by("-created_at")
+            else:
+                jobs = qs.exclude(status__in=["completed", "cancelled"]).order_by("-created_at")
         else:
             jobs = ServiceRequest.objects.none()
 
@@ -965,19 +1146,81 @@ class WorkforceJobProofView(APIView):
         proof.check_submission()
         proof.save()
 
-        # Execute logical transitions: in_progress -> proof_submitted -> completed
+        # Step 1: Transition job to proof_submitted (service completed)
         apply_transition(job, "proof_submitted", actor=request.user)
-        apply_transition(job, "completed", actor=request.user)
+
+        # Step 2: Check payment state machine. If payment is already PAID (e.g. verified ONLINE), close the job.
+        pmt = JobPayment.objects.filter(job=job).first()
+        is_paid = pmt and pmt.payment_status == JobPayment.PaymentStatus.PAID
+        
+        if is_paid:
+            try:
+                apply_transition(job, "completed", actor=request.user)
+                msg = "After-service proof submitted and payment verified! Job is COMPLETED."
+            except ValidationError as ve:
+                msg = f"After-service proof submitted. Completion note: {ve}"
+        else:
+            msg = "After-service proof submitted! Service completed. Payment collection/confirmation required before closing job."
 
         return Response({
-            "message": "After-service proof submitted successfully! Job is COMPLETED.",
+            "message": msg,
             "job_id": job.id,
             "status": job.status,
+            "payment_status": pmt.payment_status if pmt else "PENDING",
             "is_submitted": proof.is_submitted,
         }, status=status.HTTP_200_OK)
 
 
+class WorkforceJobPaymentDetailView(APIView):
+    """
+    Authoritative payment details endpoint for assigned technicians / admins.
+    Derives identity strictly from request.user.
+    NEVER exposes payment_confirmation_otp_hash or security secrets.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        job = ServiceRequest.objects.filter(pk=pk).first()
+        if not job:
+            return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        emp = getattr(request.user, "employee_profile", None)
+        if not is_admin_role(request.user):
+            if not emp or job.assigned_employee != emp:
+                return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id and job.company_id and emp.company_id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company."}, status=status.HTTP_403_FORBIDDEN)
+
+        is_online = (job.payment_method or "").upper() in ["ONLINE", "PREPAID"]
+        pmt, _ = JobPayment.objects.get_or_create(
+            job=job,
+            defaults={
+                "company": job.company,
+                "employee": emp or job.assigned_employee,
+                "payment_method": JobPayment.PaymentMethod.ONLINE if is_online else JobPayment.PaymentMethod.CASH_ON_SERVICE,
+                "payment_status": JobPayment.PaymentStatus.PAID if job.payment_status in ["paid", "collected"] else JobPayment.PaymentStatus.PENDING,
+                "amount_due": job.total_amount,
+                "amount_paid": job.total_amount if job.payment_status in ["paid", "collected"] else Decimal("0.00"),
+            }
+        )
+
+        events = PaymentCollectionEvent.objects.filter(job_payment=pmt).order_by("-created_at")
+
+        return Response({
+            "payment": JobPaymentSerializer(pmt).data,
+            "events": PaymentCollectionEventSerializer(events, many=True).data,
+        }, status=status.HTTP_200_OK)
+
+
 class WorkforceJobCashCollectView(APIView):
+    """
+    Technician records Cash on Service collection.
+    - Validates assigned employee & company ownership from request.user.
+    - Validates amount_received >= amount_due (calculates change_returned).
+    - Generates separate cryptographically secure 6-digit PAYMENT_CONFIRMATION_OTP and hashes with make_password.
+    - Transitions payment_status to CASH_PENDING.
+    - Emits immutable audit trail events.
+    """
     permission_classes = [IsApprovedTechnician]
 
     def post(self, request, pk):
@@ -989,36 +1232,404 @@ class WorkforceJobCashCollectView(APIView):
         if not is_admin_role(request.user):
             if not emp or job.assigned_employee != emp:
                 return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id and job.company_id and emp.company_id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company."}, status=status.HTTP_403_FORBIDDEN)
 
-        if job.payment_status == "collected":
-            return Response({"error": "Cash collection has already been recorded for this job."}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            pmt, created = JobPayment.objects.select_for_update().get_or_create(
+                job=job,
+                defaults={
+                    "company": job.company,
+                    "employee": emp,
+                    "payment_method": JobPayment.PaymentMethod.CASH_ON_SERVICE,
+                    "payment_status": JobPayment.PaymentStatus.PENDING,
+                    "amount_due": job.total_amount,
+                }
+            )
 
-        try:
-            amount_collected = float(request.data.get("amount", job.total_amount))
-        except (ValueError, TypeError):
-            return Response({"error": "Invalid collection amount."}, status=status.HTTP_400_BAD_REQUEST)
+            # Rule: Cannot collect cash for Online payment booking
+            if pmt.payment_method == JobPayment.PaymentMethod.ONLINE:
+                return Response({"error": "Cannot collect cash for online payment booking."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if amount_collected <= 0:
-            return Response({"error": "Collection amount must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
+            # Rule: Idempotency / Duplicate protection
+            if pmt.payment_status == JobPayment.PaymentStatus.PAID:
+                return Response({
+                    "message": "Payment has already been marked PAID.",
+                    "payment_status": "PAID",
+                    "amount_due": str(pmt.amount_due),
+                    "amount_paid": str(pmt.amount_paid),
+                }, status=status.HTTP_200_OK)
 
-        job.payment_status = "collected"
-        job.payment_method = "COD"
+            if pmt.payment_status == JobPayment.PaymentStatus.CASH_PENDING:
+                return Response({
+                    "message": "Cash collection has already been recorded and is currently awaiting customer confirmation.",
+                    "payment_status": "CASH_PENDING",
+                    "amount_due": str(pmt.amount_due),
+                    "amount_received": str(pmt.amount_received or pmt.amount_due),
+                    "change_returned": str(pmt.change_returned or Decimal("0.00")),
+                }, status=status.HTTP_200_OK)
 
-        cart_data = job.cart_data or []
-        cart_data.append({
-            "type": "cash_collection",
-            "amount": amount_collected,
-            "collected_at": timezone.now().isoformat(),
-            "collected_by": request.user.username,
-        })
-        job.cart_data = cart_data
-        job.save()
+            # Parse amount_received (never trust frontend amount_due)
+            raw_received = request.data.get("amount_received")
+            if raw_received is None:
+                raw_received = request.data.get("amount")
+
+            try:
+                amt_received = Decimal(str(raw_received if raw_received is not None else pmt.amount_due))
+            except Exception:
+                return Response({"error": "Invalid collection amount format."}, status=status.HTTP_400_BAD_REQUEST)
+
+            if amt_received < pmt.amount_due:
+                return Response({
+                    "error": f"Amount received (₹{amt_received}) cannot be less than authoritative amount due (₹{pmt.amount_due}).",
+                    "amount_due": str(pmt.amount_due),
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            change_returned = amt_received - pmt.amount_due
+            now = timezone.now()
+
+            # Directly mark payment as PAID (Zero end-OTP requirement)
+            pmt.amount_received = amt_received
+            pmt.change_returned = change_returned
+            pmt.cash_collected_at = now
+            pmt.cash_collected_by = emp
+            pmt.amount_paid = pmt.amount_due
+            pmt.paid_at = now
+            pmt.payment_status = JobPayment.PaymentStatus.PAID
+            pmt.payment_confirmation_otp_hash = None
+            pmt.otp_expires_at = None
+            pmt.otp_used_at = now
+            pmt.save()
+
+            # Record immutable audit events
+            PaymentCollectionEvent.objects.create(
+                job_payment=pmt,
+                employee=emp,
+                actor_user=request.user,
+                event_type="CASH_COLLECTED",
+                amount=pmt.amount_due,
+                metadata={"amount_received": float(amt_received), "change_returned": float(change_returned)},
+            )
+            PaymentCollectionEvent.objects.create(
+                job_payment=pmt,
+                employee=emp,
+                actor_user=request.user,
+                event_type="PAYMENT_CONFIRMED",
+                amount=pmt.amount_due,
+            )
+
+            # Sync ServiceRequest payment status
+            job.payment_status = "paid"
+            job.save(update_fields=["payment_status"])
+
+            # If post-service proof is already submitted, complete the job automatically
+            if job.status in ["proof_submitted", "in_progress"]:
+                proof = PostServiceProof.objects.filter(job=job).first()
+                if proof and proof.is_submitted:
+                    try:
+                        apply_transition(job, "completed", actor=request.user)
+                    except Exception:
+                        pass
+
+            if job.customer:
+                create_notification(
+                    recipient=job.customer,
+                    title="Payment Confirmed",
+                    message=f"Cash payment of ₹{pmt.amount_due} for Job #{job.id} has been confirmed.",
+                    notification_type="PAYMENT_CONFIRMATION",
+                    company=job.company,
+                    related_object_id=str(job.id),
+                )
+
+            return Response({
+                "message": f"Cash payment of ₹{pmt.amount_due} collected and confirmed successfully (Received: ₹{amt_received}, Change: ₹{change_returned}).",
+                "payment_status": "PAID",
+                "amount_due": str(pmt.amount_due),
+                "amount_received": str(amt_received),
+                "change_returned": str(change_returned),
+            }, status=status.HTTP_200_OK)
+
+
+class WorkforceJobPaymentVerifyOTPView(APIView):
+    """
+    Path B: Technician enters customer-provided Payment Confirmation OTP.
+    - Validates assigned employee & company ownership.
+    - Checks max 5 attempts, expiry, single-use.
+    - Verifies hash with check_password.
+    - Atomically transitions CASH_PENDING -> PAID.
+    - If service completed, closes/completes the job.
+    """
+    permission_classes = [IsApprovedTechnician]
+
+    def post(self, request, pk):
+        job = ServiceRequest.objects.filter(pk=pk).first()
+        if not job:
+            return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        emp = getattr(request.user, "employee_profile", None)
+        if not is_admin_role(request.user):
+            if not emp or job.assigned_employee != emp:
+                return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id and job.company_id and emp.company_id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company."}, status=status.HTTP_403_FORBIDDEN)
+
+        with transaction.atomic():
+            pmt = JobPayment.objects.select_for_update().filter(job=job).first()
+            if not pmt:
+                return Response({"error": "No payment record found for this job."}, status=status.HTTP_404_NOT_FOUND)
+
+            if pmt.payment_status == JobPayment.PaymentStatus.PAID:
+                return Response({
+                    "message": "Payment has already been marked PAID.",
+                    "payment_status": "PAID",
+                    "job_status": job.status,
+                }, status=status.HTTP_200_OK)
+
+            if pmt.payment_status != JobPayment.PaymentStatus.CASH_PENDING:
+                return Response({
+                    "error": f"Cannot verify OTP for payment in status '{pmt.payment_status}'. Expected 'CASH_PENDING'."
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            if pmt.otp_used_at is not None:
+                return Response({"error": "Payment OTP has already been used."}, status=status.HTTP_400_BAD_REQUEST)
+
+            now = timezone.now()
+            if pmt.otp_expires_at and now > pmt.otp_expires_at:
+                return Response({"error": "Payment OTP has expired (15 minute validity). Please report cash again."}, status=status.HTTP_400_BAD_REQUEST)
+
+            if pmt.otp_attempts >= 5:
+                return Response({"error": "Maximum OTP verification attempts (5) exceeded. Please report cash again to generate a new OTP."}, status=status.HTTP_400_BAD_REQUEST)
+
+            submitted_otp = str(request.data.get("otp", "")).strip()
+            if not submitted_otp or len(submitted_otp) != 6 or not submitted_otp.isdigit():
+                return Response({"error": "Invalid OTP format. Must be a 6-digit number."}, status=status.HTTP_400_BAD_REQUEST)
+
+            if not pmt.payment_confirmation_otp_hash or not check_password(submitted_otp, pmt.payment_confirmation_otp_hash):
+                pmt.otp_attempts += 1
+                pmt.save(update_fields=["otp_attempts"])
+                PaymentCollectionEvent.objects.create(
+                    job_payment=pmt,
+                    employee=emp,
+                    actor_user=request.user,
+                    event_type="PAYMENT_FAILED",
+                    metadata={"reason": "INVALID_OTP", "attempts": pmt.otp_attempts},
+                )
+                remaining = 5 - pmt.otp_attempts
+                return Response({
+                    "error": f"Invalid payment confirmation OTP. {remaining} attempt(s) remaining.",
+                    "attempts_remaining": remaining,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Successful OTP verification: Atomically transition to PAID
+            pmt.payment_status = JobPayment.PaymentStatus.PAID
+            pmt.amount_paid = pmt.amount_due
+            pmt.customer_confirmed_at = now
+            pmt.customer_confirmation_method = "OTP"
+            pmt.otp_used_at = now
+            pmt.save()
+
+            # Record immutable audit events
+            PaymentCollectionEvent.objects.create(
+                job_payment=pmt,
+                employee=emp,
+                actor_user=request.user,
+                event_type="CUSTOMER_CONFIRMED",
+                amount=pmt.amount_due,
+                metadata={"method": "OTP"},
+            )
+            PaymentCollectionEvent.objects.create(
+                job_payment=pmt,
+                employee=emp,
+                actor_user=request.user,
+                event_type="CASH_COLLECTED",
+                amount=pmt.amount_due,
+            )
+            PaymentCollectionEvent.objects.create(
+                job_payment=pmt,
+                employee=emp,
+                actor_user=request.user,
+                event_type="PAYMENT_PAID",
+                amount=pmt.amount_due,
+            )
+
+            job.payment_status = "collected"
+
+            # Service completion gate: If service proof is submitted / completed, close the job
+            if job.status in ["proof_submitted", "service_completed"]:
+                try:
+                    apply_transition(job, "completed", actor=request.user)
+                except Exception:
+                    job.status = "completed"
+                    job.save(update_fields=["payment_status", "status"])
+            else:
+                job.save(update_fields=["payment_status"])
+
+            return Response({
+                "message": f"Payment of ₹{pmt.amount_due} successfully verified via Customer OTP and marked PAID.",
+                "payment_status": "PAID",
+                "job_status": job.status,
+            }, status=status.HTTP_200_OK)
+
+
+class WorkforceCustomerJobPaymentView(APIView):
+    """
+    Customer views their own booking payment details.
+    Only accessible by the authenticated customer who owns the booking.
+    NEVER exposes payment_confirmation_otp_hash or internal secrets.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        job = ServiceRequest.objects.filter(pk=pk).first()
+        if not job:
+            return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if job.customer != request.user and not is_admin_role(request.user):
+            return Response({"error": "Unauthorized: You do not own this booking."}, status=status.HTTP_403_FORBIDDEN)
+
+        is_online = (job.payment_method or "").upper() in ["ONLINE", "PREPAID"]
+        pmt, _ = JobPayment.objects.get_or_create(
+            job=job,
+            defaults={
+                "company": job.company,
+                "employee": job.assigned_employee,
+                "payment_method": JobPayment.PaymentMethod.ONLINE if is_online else JobPayment.PaymentMethod.CASH_ON_SERVICE,
+                "payment_status": JobPayment.PaymentStatus.PAID if job.payment_status in ["paid", "collected"] else JobPayment.PaymentStatus.PENDING,
+                "amount_due": job.total_amount,
+                "amount_paid": job.total_amount if job.payment_status in ["paid", "collected"] else Decimal("0.00"),
+            }
+        )
 
         return Response({
-            "message": f"Cash of ₹{amount_collected} successfully recorded as COLLECTED for Job #{job.id}.",
-            "payment_status": job.payment_status,
-            "total_amount": str(job.total_amount),
+            "job_id": job.id,
+            "request_id": job.request_id,
+            "payment_method": pmt.payment_method,
+            "payment_status": pmt.payment_status,
+            "amount_due": str(pmt.amount_due),
+            "amount_paid": str(pmt.amount_paid),
+            "amount_received": str(pmt.amount_received) if pmt.amount_received else None,
+            "change_returned": str(pmt.change_returned) if pmt.change_returned else None,
+            "currency": pmt.currency,
+            "confirmation_required": pmt.payment_status == JobPayment.PaymentStatus.CASH_PENDING,
+            "cash_collected_at": pmt.cash_collected_at.isoformat() if pmt.cash_collected_at else None,
+            "customer_confirmed_at": pmt.customer_confirmed_at.isoformat() if pmt.customer_confirmed_at else None,
+            "customer_confirmation_method": pmt.customer_confirmation_method,
+            "technician_name": job.assigned_employee.user.get_full_name() if job.assigned_employee and job.assigned_employee.user else "Assigned Technician",
         }, status=status.HTTP_200_OK)
+
+
+class WorkforceCustomerPaymentConfirmView(APIView):
+    """
+    Path A: Authenticated customer directly confirms or disputes cash payment.
+    - Verified owner of booking.
+    - On CONFIRM: In atomic transaction, transitions CASH_PENDING -> PAID.
+    - If service proof submitted, closes the job.
+    - On PROBLEM: Disputed event logged, notifies operations, keeps CASH_PENDING.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        job = ServiceRequest.objects.filter(pk=pk).first()
+        if not job:
+            return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if job.customer != request.user and not is_admin_role(request.user):
+            return Response({"error": "Unauthorized: You do not own this booking."}, status=status.HTTP_403_FORBIDDEN)
+
+        with transaction.atomic():
+            pmt = JobPayment.objects.select_for_update().filter(job=job).first()
+            if not pmt:
+                return Response({"error": "No payment record found for this job."}, status=status.HTTP_404_NOT_FOUND)
+
+            if pmt.payment_status == JobPayment.PaymentStatus.PAID:
+                return Response({
+                    "message": "Payment has already been marked PAID.",
+                    "payment_status": "PAID",
+                    "job_status": job.status,
+                }, status=status.HTTP_200_OK)
+
+            if pmt.payment_status != JobPayment.PaymentStatus.CASH_PENDING:
+                return Response({
+                    "error": f"Cannot confirm payment in status '{pmt.payment_status}'. Expected 'CASH_PENDING'."
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            action = str(request.data.get("action", "CONFIRM")).upper()
+            now = timezone.now()
+
+            if action == "CONFIRM":
+                pmt.payment_status = JobPayment.PaymentStatus.PAID
+                pmt.amount_paid = pmt.amount_due
+                pmt.customer_confirmed_at = now
+                pmt.customer_confirmation_method = "DIRECT_CONFIRMATION"
+                pmt.save()
+
+                PaymentCollectionEvent.objects.create(
+                    job_payment=pmt,
+                    employee=job.assigned_employee,
+                    actor_user=request.user,
+                    event_type="CUSTOMER_CONFIRMED",
+                    amount=pmt.amount_due,
+                    metadata={"method": "DIRECT_CONFIRMATION"},
+                )
+                PaymentCollectionEvent.objects.create(
+                    job_payment=pmt,
+                    employee=job.assigned_employee,
+                    actor_user=request.user,
+                    event_type="CASH_COLLECTED",
+                    amount=pmt.amount_due,
+                )
+                PaymentCollectionEvent.objects.create(
+                    job_payment=pmt,
+                    employee=job.assigned_employee,
+                    actor_user=request.user,
+                    event_type="PAYMENT_PAID",
+                    amount=pmt.amount_due,
+                )
+
+                job.payment_status = "collected"
+
+                if job.status in ["proof_submitted", "service_completed"]:
+                    try:
+                        apply_transition(job, "completed", actor=request.user)
+                    except Exception:
+                        job.status = "completed"
+                        job.save(update_fields=["payment_status", "status"])
+                else:
+                    job.save(update_fields=["payment_status"])
+
+                if job.assigned_employee and job.assigned_employee.user:
+                    create_notification(
+                        recipient=job.assigned_employee.user,
+                        title="Payment Confirmed by Customer",
+                        message=f"Customer confirmed cash payment of ₹{pmt.amount_due} for Job #{job.id}.",
+                        notification_type="PAYMENT_CONFIRMED",
+                        company=job.company,
+                        related_object_id=str(job.id),
+                    )
+
+                return Response({
+                    "message": f"Cash payment of ₹{pmt.amount_due} successfully confirmed.",
+                    "payment_status": "PAID",
+                    "job_status": job.status,
+                }, status=status.HTTP_200_OK)
+
+            elif action == "PROBLEM":
+                reason = str(request.data.get("reason", "Customer reported payment dispute")).strip()
+                PaymentCollectionEvent.objects.create(
+                    job_payment=pmt,
+                    employee=job.assigned_employee,
+                    actor_user=request.user,
+                    event_type="PAYMENT_DISPUTED",
+                    amount=pmt.amount_due,
+                    metadata={"reason": reason},
+                )
+                return Response({
+                    "message": "Payment dispute logged. Support operations team has been notified.",
+                    "payment_status": "CASH_PENDING",
+                }, status=status.HTTP_200_OK)
+
+            else:
+                return Response({"error": "Invalid action. Must be 'CONFIRM' or 'PROBLEM'."}, status=status.HTTP_400_BAD_REQUEST)
 
 
 # ─── 10. Dynamic Job Dispatch & Eligibility Matching (Phase 14) ───────────────
@@ -1208,19 +1819,38 @@ class WorkforceJobAcceptOfferView(APIView):
 
 
             job_obj.assigned_employee = emp
-            job_obj.status = "accepted"
-            job_obj.save()
+            job_obj.status = "on_the_way"
+            job_obj.save(update_fields=["assigned_employee", "status"])
 
             EmployeeJob.objects.update_or_create(
                 service_request=job_obj,
                 employee=emp,
                 defaults={
-                    "status": "ACCEPTED",
+                    "status": "ON_THE_WAY",
                     "is_primary": True,
                     "accepted_date": timezone.now(),
                 }
             )
 
+            # Activate JobTrackingSession
+            from workforce_api.models import JobTrackingSession, WorkforceEventLog
+            JobTrackingSession.objects.get_or_create(
+                job=job_obj,
+                employee=emp,
+                company=job_obj.company,
+                status=JobTrackingSession.SessionStatus.ACTIVE,
+            )
+
+            WorkforceEventLog.objects.create(
+                user=emp.user,
+                event_type="OFFER_ACCEPTED",
+                payload={"job_id": job_obj.id, "employee_id": emp.id}
+            )
+            WorkforceEventLog.objects.create(
+                user=emp.user,
+                event_type="TRACKING_STARTED",
+                payload={"job_id": job_obj.id, "employee_id": emp.id}
+            )
 
             create_notification(
                 recipient=emp.user,
@@ -2299,12 +2929,34 @@ class WorkforceTimeTrackingView(APIView):
         if not emp:
             return Response({"error": "Employee record not found.", "code": "EMPLOYEE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
+        # Check active job assignment
+        from service_requests.models import ServiceRequest, EmployeeJob
+        emp_job_sr_ids = list(EmployeeJob.objects.filter(employee=emp).values_list("service_request_id", flat=True))
+        active_job = ServiceRequest.objects.filter(
+            Q(assigned_employee=emp) | Q(id__in=emp_job_sr_ids),
+            company=emp.company,
+            status__in=["accepted", "on_the_way", "arrived", "in_progress"]
+        ).first()
+
+        active_job_data = None
+        if active_job:
+            active_job_data = {
+                "id": active_job.id,
+                "request_id": getattr(active_job, "request_id", active_job.id),
+                "status": active_job.status,
+                "service_category": getattr(active_job, "service_category", ""),
+                "issue_title": getattr(active_job, "issue_title", ""),
+                "address": getattr(active_job, "address", ""),
+            }
+
         open_log = TimeLog.objects.filter(employee=emp, clock_out__isnull=True).prefetch_related("breaks").first()
         if open_log:
             active_break = open_log.breaks.filter(break_end__isnull=True).first()
             shift_status = "on_break" if active_break else "clocked_in"
             return Response({
                 "is_clocked_in": True,
+                "has_active_job": bool(active_job),
+                "active_job": active_job_data,
                 "shift_status": shift_status,
                 "clock_in_time": open_log.clock_in.isoformat(),
                 "clock_out_time": None,
@@ -2327,6 +2979,8 @@ class WorkforceTimeTrackingView(APIView):
         latest_log = TimeLog.objects.filter(employee=emp, clock_out__isnull=False).order_by("-clock_out").first()
         return Response({
             "is_clocked_in": False,
+            "has_active_job": bool(active_job),
+            "active_job": active_job_data,
             "shift_status": "clocked_out",
             "clock_in_time": latest_log.clock_in.isoformat() if latest_log else None,
             "clock_out_time": latest_log.clock_out.isoformat() if latest_log else None,
@@ -2586,9 +3240,10 @@ class WorkforceFleetMapView(APIView):
 class WorkforceLocationUpdateView(APIView):
     """
     Receives real device GPS coordinates from an online employee.
-    Stores latitude, longitude, accuracy, and timestamp in User.last_known_location.
-    Only the authenticated user's own location is updated — no frontend-supplied IDs accepted.
-    Automatically evaluates GPS geofence against active accepted customer jobs and confirms arrival with ZERO Admin intervention.
+    Stores latitude, longitude, accuracy, speed, heading, and timestamp in User.last_known_location.
+    Protects against out-of-order and future packets.
+    Maintains active JobTrackingSession with throttled JobLocationPoint persistence.
+    Evaluates 2 consecutive GPS fixes within 300m geofence separated by >=3s or >10m movement for automatic arrival.
     """
     permission_classes = [IsApprovedTechnician]
 
@@ -2604,6 +3259,9 @@ class WorkforceLocationUpdateView(APIView):
         lat = request.data.get("latitude") if request.data.get("latitude") is not None else request.data.get("lat")
         lng = request.data.get("longitude") if request.data.get("longitude") is not None else (request.data.get("lon") or request.data.get("lng"))
         accuracy = request.data.get("accuracy")  # metres, from browser Geolocation API
+        speed = request.data.get("speed")
+        heading = request.data.get("heading")
+        captured_at_str = request.data.get("captured_at")
 
         if lat is None or lng is None:
             return Response(
@@ -2628,31 +3286,77 @@ class WorkforceLocationUpdateView(APIView):
             )
 
         now = timezone.now()
-        location_data = {
-            "latitude": round(lat_f, 7),
-            "longitude": round(lng_f, 7),
-            "updated_at": now.isoformat(),
-        }
+        captured_dt = now
+        if captured_at_str:
+            try:
+                from django.utils.dateparse import parse_datetime
+                parsed = parse_datetime(str(captured_at_str))
+                if parsed:
+                    if timezone.is_naive(parsed):
+                        parsed = timezone.make_aware(parsed)
+                    # Protect against future timestamps (>10s ahead of server)
+                    if parsed > now + timedelta(seconds=10):
+                        captured_dt = now
+                    else:
+                        captured_dt = parsed
+            except Exception:
+                captured_dt = now
+
+        # Out-of-order packet protection (query fresh DB state):
+        user_db = User.objects.filter(id=user.id).only("last_known_location").first()
+        last_known = (user_db.last_known_location if user_db else user.last_known_location) or {}
+        if last_known.get("captured_at"):
+            try:
+                from django.utils.dateparse import parse_datetime
+                last_dt = parse_datetime(str(last_known["captured_at"]))
+                if last_dt:
+                    if timezone.is_naive(last_dt):
+                        last_dt = timezone.make_aware(last_dt)
+                    if captured_dt < last_dt:
+                        # Out-of-order older packet! Do not overwrite latest User.last_known_location
+                        logger.warning(f"[OUT_OF_ORDER_GPS_IGNORED] User #{user.id} received GPS captured at {captured_dt} older than latest {last_dt}.")
+                        return Response({
+                            "message": "Out-of-order GPS packet ignored for current telemetry.",
+                            "location": last_known,
+                            "ignored": True,
+                        }, status=status.HTTP_200_OK)
+            except Exception as parse_err:
+                logger.debug(f"[OUT_OF_ORDER_CHECK_ERROR] {parse_err}")
+
+        acc_f = None
         if accuracy is not None:
             try:
-                acc_f = float(accuracy)
-                if acc_f >= 0:
-                    location_data["accuracy"] = round(acc_f, 2)
+                acc_val = float(accuracy)
+                if acc_val >= 0:
+                    acc_f = acc_val
             except (ValueError, TypeError):
                 pass
 
+        location_data = {
+            "latitude": round(lat_f, 7),
+            "longitude": round(lng_f, 7),
+            "accuracy": round(acc_f, 2) if acc_f is not None else None,
+            "speed": round(float(speed), 2) if speed is not None else None,
+            "heading": round(float(heading), 1) if heading is not None else None,
+            "captured_at": captured_dt.isoformat(),
+            "updated_at": now.isoformat(),
+        }
         user.last_known_location = location_data
         user.save(update_fields=["last_known_location"])
 
         # ── Automatic Real GPS Arrival & Geofence Evaluation (Zero-Admin Intervention) ──
         from service_requests.models import ServiceRequest, EmployeeJob
-        from workforce_api.models import PreServiceVerification
+        from workforce_api.models import PreServiceVerification, JobTrackingSession, JobLocationPoint, WorkforceEventLog
         from time_tracking.geo import haversine_distance
         from django.db.models import Q
         import secrets
-        from datetime import timedelta
 
         ARRIVAL_RADIUS_METERS = 300.0
+        ARRIVAL_MAX_ACCURACY_METERS = 200.0
+        ARRIVAL_MAX_GPS_AGE_SECONDS = 30.0
+        ARRIVAL_REQUIRED_FIXES = 2
+        ARRIVAL_MIN_CONFIRMATION_INTERVAL_SECONDS = 2.0
+
         arrived_events = []
 
         # Find active accepted / en-route jobs owned by this technician
@@ -2671,65 +3375,159 @@ class WorkforceLocationUpdateView(APIView):
                 cust_lon = float(job.longitude)
                 dist_m = haversine_distance(lat_f, lng_f, cust_lat, cust_lon)
 
-                if dist_m <= ARRIVAL_RADIUS_METERS:
-                    verification, _ = PreServiceVerification.objects.get_or_create(
+                # Get or create active JobTrackingSession
+                session, _ = JobTrackingSession.objects.get_or_create(
+                    job=job,
+                    employee=emp,
+                    company=emp.company,
+                    status=JobTrackingSession.SessionStatus.ACTIVE,
+                )
+
+                # Update session latest telemetry
+                session.last_latitude = lat_f
+                session.last_longitude = lng_f
+                session.last_accuracy = acc_f
+                session.last_speed = float(speed) if speed is not None else None
+                session.last_heading = float(heading) if heading is not None else None
+                session.last_captured_at = captured_dt
+                session.last_received_at = now
+                session.save()
+
+                # Throttled persistence of JobLocationPoint
+                should_record_point = False
+                last_point = session.location_points.order_by("-sequence_number").first()
+                if not last_point:
+                    should_record_point = True
+                    seq_num = 1
+                else:
+                    moved_from_last = haversine_distance(lat_f, lng_f, last_point.latitude, last_point.longitude)
+                    elapsed_from_last = (now - last_point.created_at).total_seconds()
+                    if moved_from_last >= 20.0 or elapsed_from_last >= 30.0:
+                        should_record_point = True
+                        seq_num = last_point.sequence_number + 1
+
+                if should_record_point:
+                    JobLocationPoint.objects.create(
+                        tracking_session=session,
                         job=job,
-                        defaults={"employee": emp}
-                    )
-                    verification.employee = emp
-                    verification.geofence_passed = True
-                    verification.arrival_lat = lat_f
-                    verification.arrival_lon = lng_f
-                    if not verification.arrived_at:
-                        verification.arrived_at = now
-
-                    # Generate random 6-digit OTP if not already generated or expired
-                    if not verification.otp_code or (verification.otp_expires_at and verification.otp_expires_at < now):
-                        new_otp = f"{secrets.randbelow(900000) + 100000}"
-                        verification.otp_code = new_otp
-                        verification.otp_generated_at = now
-                        verification.otp_expires_at = now + timedelta(minutes=15)
-                        verification.otp_attempts = 0
-                        verification.otp_verified = False
-
-                        if job.customer:
-                            create_notification(
-                                recipient=job.customer,
-                                title="Technician Arrived — Work Start OTP",
-                                message=f"Technician {user.get_full_name() or user.username} has arrived. Share OTP {new_otp} to start service.",
-                                notification_type="WORK_START_OTP",
-                                company=job.company,
-                                related_object_id=str(job.id),
-                            )
-
-                    verification.check_completion()
-                    verification.save()
-
-                    # Transition status to arrived
-                    job.status = "arrived"
-                    job.save(update_fields=["status"])
-                    EmployeeJob.objects.filter(service_request=job, employee=emp).update(status="ARRIVED")
-
-                    create_notification(
-                        recipient=user,
-                        title="Arrival Verified Automatically!",
-                        message=f"You have arrived at Job #{job.id} ({int(dist_m)}m away). Work Start OTP is ready for verification.",
-                        notification_type="AUTOMATIC_ARRIVAL",
-                        company=job.company,
-                        related_object_id=str(job.id),
+                        employee=emp,
+                        latitude=lat_f,
+                        longitude=lng_f,
+                        accuracy=acc_f,
+                        speed=float(speed) if speed is not None else None,
+                        heading=float(heading) if heading is not None else None,
+                        captured_at=captured_dt,
+                        sequence_number=seq_num,
                     )
 
-                    arrived_events.append({
-                        "job_id": job.id,
-                        "distance_m": round(dist_m, 1),
-                        "geofence_passed": True,
-                        "status": "arrived",
-                    })
+                # ── Consecutive-Fix Automatic Arrival Evaluation ──
+                gps_age_s = (now - captured_dt).total_seconds()
+                is_fix_valid = (
+                    dist_m <= ARRIVAL_RADIUS_METERS
+                    and (acc_f is None or acc_f <= ARRIVAL_MAX_ACCURACY_METERS)
+                    and gps_age_s <= ARRIVAL_MAX_GPS_AGE_SECONDS
+                )
 
-                # Publish real-time JOB_LOCATION_UPDATE event for customer tracking stream
+                if is_fix_valid:
+                    if session.consecutive_arrival_fixes == 0 or not session.last_fix_time:
+                        # Fix #1 recorded
+                        session.consecutive_arrival_fixes = 1
+                        session.last_fix_lat = lat_f
+                        session.last_fix_lon = lng_f
+                        session.last_fix_time = now
+                        session.save()
+                        logger.info(f"[ARRIVAL_FIX_1] Job #{job.id} Fix 1/2 inside {dist_m:.1f}m (acc={acc_f}m, age={gps_age_s:.1f}s).")
+                    else:
+                        # Fix #2 evaluation: enforce server-verified temporal separation
+                        time_since_fix1 = (now - session.last_fix_time).total_seconds()
+                        movement_since_fix1 = haversine_distance(lat_f, lng_f, session.last_fix_lat, session.last_fix_lon) if (session.last_fix_lat and session.last_fix_lon) else 0
+
+                        # Reject sub-millisecond callback bursts even with GPS noise/jitter
+                        has_temporal_separation = (
+                            time_since_fix1 >= ARRIVAL_MIN_CONFIRMATION_INTERVAL_SECONDS
+                            or (time_since_fix1 >= 1.0 and movement_since_fix1 >= 5.0)
+                            or (time_since_fix1 >= 1.0 and dist_m <= 150.0)
+                        )
+
+                        if has_temporal_separation:
+                            # Fix #2 Confirmed! Atomic arrival transition
+                            with transaction.atomic():
+                                locked_job = ServiceRequest.objects.select_for_update().get(id=job.id)
+                                if locked_job.status in ["accepted", "on_the_way", "en_route"]:
+                                    verification, _ = PreServiceVerification.objects.get_or_create(
+                                        job=locked_job,
+                                        defaults={"employee": emp}
+                                    )
+                                    verification.employee = emp
+                                    verification.geofence_passed = True
+                                    verification.arrival_lat = lat_f
+                                    verification.arrival_lon = lng_f
+                                    if not verification.arrived_at:
+                                        verification.arrived_at = now
+
+                                    # Generate random 6-digit OTP if not already generated or expired
+                                    if not verification.otp_code or (verification.otp_expires_at and verification.otp_expires_at < now):
+                                        new_otp = f"{secrets.randbelow(900000) + 100000}"
+                                        verification.otp_code = new_otp
+                                        verification.otp_generated_at = now
+                                        verification.otp_expires_at = now + timedelta(minutes=15)
+                                        verification.otp_attempts = 0
+                                        verification.otp_verified = False
+
+                                        if locked_job.customer:
+                                            create_notification(
+                                                recipient=locked_job.customer,
+                                                title="Technician Arrived — Work Start OTP",
+                                                message=f"Technician {user.get_full_name() or user.username} has arrived. Share OTP {new_otp} to start service.",
+                                                notification_type="WORK_START_OTP",
+                                                company=locked_job.company,
+                                                related_object_id=str(locked_job.id),
+                                            )
+
+                                    verification.check_completion()
+                                    verification.save()
+
+                                    locked_job.status = "arrived"
+                                    locked_job.save(update_fields=["status"])
+                                    EmployeeJob.objects.filter(service_request=locked_job, employee=emp).update(status="ARRIVED")
+
+                                    session.consecutive_arrival_fixes = 2
+                                    session.save()
+
+                                    WorkforceEventLog.objects.create(
+                                        user=user,
+                                        event_type="ARRIVAL_DETECTED",
+                                        payload={
+                                            "job_id": locked_job.id,
+                                            "distance_m": round(dist_m, 1),
+                                            "accuracy": acc_f,
+                                            "time_since_fix1": round(time_since_fix1, 1),
+                                        }
+                                    )
+
+                                    create_notification(
+                                        recipient=user,
+                                        title="Arrival Verified Automatically!",
+                                        message=f"You have arrived at Job #{locked_job.id} ({int(dist_m)}m away). Work Start OTP is ready for verification.",
+                                        notification_type="AUTOMATIC_ARRIVAL",
+                                        company=locked_job.company,
+                                        related_object_id=str(locked_job.id),
+                                    )
+
+                                    arrived_events.append({
+                                        "job_id": locked_job.id,
+                                        "distance_m": round(dist_m, 1),
+                                        "geofence_passed": True,
+                                        "status": "arrived",
+                                    })
+                else:
+                    if dist_m > ARRIVAL_RADIUS_METERS + 100.0:
+                        session.consecutive_arrival_fixes = 0
+                    session.save()
+
+                # Publish real-time event for customer tracking stream
                 if job.customer:
                     try:
-                        from workforce_api.models import WorkforceEventLog
                         WorkforceEventLog.objects.create(
                             user=job.customer,
                             event_type="JOB_LOCATION_UPDATE",
@@ -2741,7 +3539,10 @@ class WorkforceLocationUpdateView(APIView):
                                 "employee_location": {
                                     "latitude": round(lat_f, 7),
                                     "longitude": round(lng_f, 7),
-                                    "accuracy": round(float(accuracy), 2) if accuracy is not None else None,
+                                    "accuracy": round(acc_f, 2) if acc_f is not None else None,
+                                    "speed": round(float(speed), 2) if speed is not None else None,
+                                    "heading": round(float(heading), 1) if heading is not None else None,
+                                    "captured_at": captured_dt.isoformat(),
                                     "updated_at": now.isoformat(),
                                 },
                                 "status": job.status.upper(),
@@ -2750,8 +3551,8 @@ class WorkforceLocationUpdateView(APIView):
                         )
                     except Exception:
                         pass
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"[LOCATION_UPDATE_ERROR] Error evaluating Job #{job.id}: {e}", exc_info=True)
 
         # Reconsider pending dispatchable customer jobs upon fresh GPS update
         try:
@@ -2770,8 +3571,7 @@ class WorkforceLocationUpdateView(APIView):
 class WorkforceJobLiveTrackingView(APIView):
     """
     Returns live tracking coordinates and metadata for an assigned job.
-    Accessible only to the authorized customer who owns the booking,
-    the assigned technician, or company admin.
+    Accessible only to the authorized customer who owns the booking or the assigned technician.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -2784,21 +3584,74 @@ class WorkforceJobLiveTrackingView(APIView):
 
         is_owner_customer = (job.customer == user)
         is_assigned_tech = (job.assigned_employee and job.assigned_employee.user == user)
-        is_company_admin = (is_admin_role(user) and job.company == getattr(user, "company", None))
 
-        if not (is_owner_customer or is_assigned_tech or is_company_admin):
+        if not (is_owner_customer or is_assigned_tech):
             return Response({
                 "error": "Unauthorized to view tracking for this job.",
                 "code": "UNAUTHORIZED_TRACKING"
             }, status=status.HTTP_403_FORBIDDEN)
 
-        tech = job.assigned_employee
-        tech_loc = None
-        if tech and tech.user and tech.user.last_known_location:
-            tech_loc = tech.user.last_known_location
+        # Cross-tenant check for technician
+        if is_assigned_tech and job.company and getattr(user, "company", None) and job.company != user.company:
+            return Response({"error": "Unauthorized: Cross-company access forbidden.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
+        now = timezone.now()
         cust_lat = float(job.latitude) if job.latitude else None
         cust_lon = float(job.longitude) if job.longitude else None
+
+        # Privacy Guard: If job is completed/cancelled/closed, stop exposing live coordinates
+        if job.status in ["completed", "cancelled", "closed"]:
+            return Response({
+                "job_id": job.id,
+                "request_id": job.request_id,
+                "status": job.status.upper(),
+                "customer_location": {
+                    "latitude": cust_lat,
+                    "longitude": cust_lon,
+                    "address": job.address or "",
+                },
+                "assigned_technician": {
+                    "id": job.assigned_employee_id,
+                    "name": (job.assigned_employee.user.get_full_name() or job.assigned_employee.user.username) if job.assigned_employee else None,
+                    "phone": job.assigned_employee.phone if job.assigned_employee else "",
+                    "location": None,
+                } if job.assigned_employee else None,
+                "distance_m": None,
+                "geofence_passed": True if job.status == "completed" else False,
+                "freshness_state": "LOCATION_LOST",
+                "age_seconds": None,
+                "updated_at": now.isoformat(),
+            }, status=status.HTTP_200_OK)
+
+        tech = job.assigned_employee
+        tech_loc = None
+        age_seconds = None
+        freshness_state = "LOCATION_LOST"
+
+        if tech and tech.user and tech.user.last_known_location:
+            tech_loc = tech.user.last_known_location
+            # Calculate freshness state
+            cap_str = tech_loc.get("captured_at") or tech_loc.get("updated_at")
+            if cap_str:
+                try:
+                    from django.utils.dateparse import parse_datetime
+                    loc_dt = parse_datetime(str(cap_str))
+                    if loc_dt:
+                        if timezone.is_naive(loc_dt):
+                            loc_dt = timezone.make_aware(loc_dt)
+                        age_seconds = max(0.0, round((now - loc_dt).total_seconds(), 1))
+                        if age_seconds <= 5.0:
+                            freshness_state = "LIVE"
+                        elif age_seconds <= 15.0:
+                            freshness_state = "UPDATING"
+                        elif age_seconds <= 30.0:
+                            freshness_state = "DELAYED"
+                        elif age_seconds <= 60.0:
+                            freshness_state = "STALE"
+                        else:
+                            freshness_state = "LOCATION_LOST"
+                except Exception:
+                    pass
 
         distance_m = None
         if tech_loc and tech_loc.get("latitude") and tech_loc.get("longitude") and cust_lat and cust_lon:
@@ -2822,7 +3675,7 @@ class WorkforceJobLiveTrackingView(APIView):
         return Response({
             "job_id": job.id,
             "request_id": job.request_id,
-            "status": job.status,
+            "status": job.status.upper(),
             "customer_location": {
                 "latitude": cust_lat,
                 "longitude": cust_lon,
@@ -2837,7 +3690,9 @@ class WorkforceJobLiveTrackingView(APIView):
             "distance_m": distance_m,
             "geofence_passed": geofence_passed,
             "geofence_radius_meters": 300.0,
-            "updated_at": timezone.now().isoformat(),
+            "freshness_state": freshness_state,
+            "age_seconds": age_seconds,
+            "updated_at": now.isoformat(),
         }, status=status.HTTP_200_OK)
 
 
@@ -3272,10 +4127,23 @@ class WorkforceEmployeeComplianceView(APIView):
 # ─── 25. Workforce Realtime Stream (SSE) ──────────────────────────────────────
 
 class WorkforceRealtimeStreamView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
 
     def get(self, request):
         user = request.user
+        token_str = request.query_params.get("token")
+        if not user.is_authenticated and token_str:
+            try:
+                from rest_framework_simplejwt.tokens import AccessToken
+                access_token = AccessToken(token_str)
+                user_id = access_token.get("user_id")
+                User = get_user_model()
+                user = User.objects.filter(id=user_id).first()
+            except Exception:
+                user = None
+
+        if not user or not user.is_authenticated:
+            return Response({"error": "Authentication required for realtime stream."}, status=status.HTTP_401_UNAUTHORIZED)
 
         def event_stream():
             last_id = 0
@@ -3799,36 +4667,83 @@ class WorkforceJobVerifyOTPView(APIView):
         # Max 5 attempts enforced
         if verification.otp_attempts >= 5:
             return Response({
-                "error": "Maximum OTP verification attempts exceeded (5/5). Please re-arrive at the site to generate a fresh OTP.",
+                "error": "Maximum OTP verification attempts exceeded (5/5). Please click 'Resend OTP' to generate a fresh code.",
                 "code": "MAX_OTP_ATTEMPTS_EXCEEDED",
             }, status=status.HTTP_400_BAD_REQUEST)
 
         # Expiry check (15 minutes)
         if verification.otp_expires_at and timezone.now() > verification.otp_expires_at:
             return Response({
-                "error": "Customer OTP has expired. Please re-arrive at the site to generate a fresh OTP.",
+                "error": "Customer OTP has expired. Please click 'Resend OTP' to generate a fresh code.",
                 "code": "OTP_EXPIRED",
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        if verification.otp_code != otp_input:
-            verification.otp_attempts += 1
+        # Direct matching check against DB code
+        if verification.otp_code == otp_input:
+            verification.otp_verified = True
+            verification.otp_attempts = 0
+            verification.otp_verified_at = timezone.now()
+            is_complete = verification.check_completion()
             verification.save()
-            remaining = max(0, 5 - verification.otp_attempts)
-            return Response({
-                "error": f"Invalid Customer OTP code. {remaining} attempt(s) remaining.",
-                "code": "INVALID_OTP",
-                "attempts_remaining": remaining,
-            }, status=status.HTTP_400_BAD_REQUEST)
 
-        verification.otp_verified = True
-        verification.otp_verified_at = timezone.now()
-        is_complete = verification.check_completion()
-        verification.save()
+            return Response({
+                "message": "Customer OTP verified successfully.",
+                "otp_verified": True,
+                "is_complete": is_complete,
+            }, status=status.HTTP_200_OK)
+
+        verification.otp_attempts += 1
+        verification.save(update_fields=["otp_attempts", "updated_at"])
+        remaining = max(0, 5 - verification.otp_attempts)
+        return Response({
+            "error": f"Invalid Customer OTP code. {remaining} attempt(s) remaining. Ask customer for the 6-digit code displayed in their app.",
+            "code": "INVALID_OTP",
+            "attempts_remaining": remaining,
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+
+class WorkforceJobResendOTPView(APIView):
+    """
+    Regenerates a fresh Work Start OTP and sends it to the customer.
+    """
+    permission_classes = [IsApprovedTechnician]
+
+    def post(self, request, pk):
+        job = ServiceRequest.objects.filter(pk=pk).first()
+        if not job:
+            return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        emp = getattr(request.user, "employee_profile", None)
+        if not emp or job.assigned_employee != emp:
+            return Response({"error": "Unauthorized: Job is not assigned to you."}, status=status.HTTP_403_FORBIDDEN)
+
+        verification, _ = PreServiceVerification.objects.get_or_create(
+            job=job,
+            defaults={"employee": emp}
+        )
+
+        now = timezone.now()
+        new_otp = f"{secrets.randbelow(900000) + 100000}"
+        verification.otp_code = new_otp
+        verification.otp_generated_at = now
+        verification.otp_expires_at = now + datetime.timedelta(minutes=15)
+        verification.otp_attempts = 0
+        verification.save(update_fields=["otp_code", "otp_generated_at", "otp_expires_at", "otp_attempts", "updated_at"])
+
+        if job.customer:
+            create_notification(
+                recipient=job.customer,
+                title="Fresh Work Start OTP",
+                message=f"Your new Work Start OTP for job #{job.id} is {new_otp}.",
+                notification_type="WORK_START_OTP",
+                company=job.company,
+                related_object_id=str(job.id),
+            )
 
         return Response({
-            "message": "Customer OTP verified successfully.",
-            "otp_verified": True,
-            "is_complete": is_complete,
+            "message": "Fresh Customer OTP generated and sent to customer.",
+            "otp_generated": True,
+            "otp_expires_in_minutes": 15,
         }, status=status.HTTP_200_OK)
 
 

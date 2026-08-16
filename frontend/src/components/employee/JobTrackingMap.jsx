@@ -40,61 +40,7 @@ import {
 import { getGPSPosition } from '../../hooks/useGPSPosition.js';
 import { apiUpdateLocationFull } from '../../api/workforceService.js';
 
-let mapsApiPromise = null;
-
-function loadMapsApi(apiKey) {
-  if (typeof window === 'undefined') return Promise.reject(new Error('No window'));
-  if (window.google?.maps?.Map && typeof window.google.maps.Map === 'function') {
-    return Promise.resolve(window.google.maps);
-  }
-  if (!mapsApiPromise) {
-    mapsApiPromise = new Promise((resolve, reject) => {
-      const checkReady = () => {
-        if (window.google?.maps?.Map && typeof window.google.maps.Map === 'function') {
-          resolve(window.google.maps);
-          return true;
-        }
-        return false;
-      };
-
-      if (checkReady()) return;
-
-      const existingScript = document.getElementById('gmap-script');
-      if (existingScript) {
-        const interval = setInterval(() => {
-          if (checkReady()) clearInterval(interval);
-        }, 100);
-        setTimeout(() => {
-          clearInterval(interval);
-          if (checkReady()) resolve(window.google.maps);
-          else reject(new Error('Google Maps initialization timeout.'));
-        }, 10000);
-        return;
-      }
-
-      window.__initGoogleMapsWorkforce = () => {
-        if (checkReady()) resolve(window.google.maps);
-      };
-
-      const script = document.createElement('script');
-      script.id = 'gmap-script';
-      script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=places,geometry&callback=__initGoogleMapsWorkforce`;
-      script.async = true;
-      script.defer = true;
-      script.onerror = (e) => reject(e);
-      document.head.appendChild(script);
-
-      const interval = setInterval(() => {
-        if (checkReady()) clearInterval(interval);
-      }, 100);
-      setTimeout(() => {
-        clearInterval(interval);
-        if (checkReady()) resolve(window.google.maps);
-      }, 10000);
-    });
-  }
-  return mapsApiPromise;
-}
+import { loadMapsApi } from '../../utils/loadGoogleMaps.js';
 
 // Calculate Haversine direct distance in meters
 function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
@@ -146,37 +92,6 @@ export function JobTrackingMap({
   const custLat = job?.latitude != null ? parseFloat(job.latitude) : null;
   const custLon = job?.longitude != null ? parseFloat(job.longitude) : null;
 
-  // 1. Auto-Acquire GPS immediately on mount if not provided via prop
-  useEffect(() => {
-    if (!liveTechCoords?.latitude) {
-      getGPSPosition(false)
-        .then((pos) => {
-          if (pos?.coords) {
-            const newCoords = {
-              latitude: pos.coords.latitude,
-              longitude: pos.coords.longitude,
-              accuracy: pos.coords.accuracy,
-              updated_at: new Date().toISOString(),
-            };
-            setLiveTechCoords(newCoords);
-            window.dispatchEvent(
-              new CustomEvent('workforce:location-updated', {
-                detail: {
-                  latitude: newCoords.latitude,
-                  longitude: newCoords.longitude,
-                  accuracy: newCoords.accuracy,
-                  timestamp: Date.now(),
-                  source: 'mount_auto_detect',
-                },
-              })
-            );
-            apiUpdateLocationFull(newCoords.latitude, newCoords.longitude, newCoords.accuracy).catch(() => {});
-          }
-        })
-        .catch(() => {});
-    }
-  }, [liveTechCoords?.latitude]);
-
   // Load Google Maps API script
   useEffect(() => {
     if (!apiKey) {
@@ -191,13 +106,15 @@ export function JobTrackingMap({
       });
   }, [apiKey]);
 
-  // Sync initial technician location from prop
+  // Sync initial technician location from centralized prop
   useEffect(() => {
     if (technicianLocation?.latitude != null && technicianLocation?.longitude != null) {
       setLiveTechCoords({
         latitude: parseFloat(technicianLocation.latitude),
         longitude: parseFloat(technicianLocation.longitude),
         accuracy: technicianLocation.accuracy,
+        speed: technicianLocation.speed,
+        heading: technicianLocation.heading,
         updated_at: technicianLocation.updated_at || new Date().toISOString(),
       });
     }
@@ -227,15 +144,61 @@ export function JobTrackingMap({
     return () => clearInterval(timer);
   }, [liveTechCoords]);
 
+  const animFrameRef = useRef(null);
+  const currentPosRef = useRef({ lat: null, lng: null });
+  const [directionsFailed, setDirectionsFailed] = useState(false);
+
+  // Smooth UI Marker Interpolation Engine (Rapido/Swiggy style smooth movement)
+  const animateVehicleMarker = useCallback((targetLat, targetLng, heading = null) => {
+    if (!techMarkerRef.current || !window.google?.maps) return;
+
+    if (currentPosRef.current.lat == null || currentPosRef.current.lng == null) {
+      currentPosRef.current = { lat: targetLat, lng: targetLng };
+      techMarkerRef.current.setPosition(new window.google.maps.LatLng(targetLat, targetLng));
+      return;
+    }
+
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+    }
+
+    const startLat = currentPosRef.current.lat;
+    const startLng = currentPosRef.current.lng;
+    const duration = 800; // ms
+    const startTime = performance.now();
+
+    const step = (now) => {
+      const elapsed = now - startTime;
+      const progress = Math.min(1.0, elapsed / duration);
+      // Ease out cubic
+      const ease = 1 - Math.pow(1 - progress, 3);
+
+      const curLat = startLat + (targetLat - startLat) * ease;
+      const curLng = startLng + (targetLng - startLng) * ease;
+      currentPosRef.current = { lat: curLat, lng: curLng };
+
+      if (techMarkerRef.current && window.google?.maps) {
+        techMarkerRef.current.setPosition(new window.google.maps.LatLng(curLat, curLng));
+      }
+
+      if (progress < 1.0) {
+        animFrameRef.current = requestAnimationFrame(step);
+      } else {
+        currentPosRef.current = { lat: targetLat, lng: targetLng };
+      }
+    };
+
+    animFrameRef.current = requestAnimationFrame(step);
+  }, []);
+
   // Request road directions and ETA via Google Maps Directions API
   const updateRoadRoute = useCallback((originLat, originLng, destLat, destLng, force = false) => {
     if (!window.google?.maps || !directionsServiceRef.current || !directionsRendererRef.current) return;
 
     const now = Date.now();
-    // Throttle directions requests to at most once every 4 seconds
+    // Debounce & throttle directions requests: at most once every 4 seconds or >30m movement
     if (!force && now - lastDirectionsTimeRef.current < 4000) return;
 
-    // Check if technician moved significantly (> 40 meters) from last routed point
     if (!force && lastRoutedCoordsRef.current.lat != null && lastRoutedCoordsRef.current.lng != null) {
       const movedDist = calculateDistanceMeters(
         originLat,
@@ -243,7 +206,7 @@ export function JobTrackingMap({
         lastRoutedCoordsRef.current.lat,
         lastRoutedCoordsRef.current.lng
       );
-      if (movedDist != null && movedDist < 40 && now - lastDirectionsTimeRef.current < 20000) {
+      if (movedDist != null && movedDist < 30 && now - lastDirectionsTimeRef.current < 30000) {
         return;
       }
     }
@@ -264,6 +227,7 @@ export function JobTrackingMap({
       (result, status) => {
         if (status === window.google.maps.DirectionsStatus.OK && result) {
           directionsRendererRef.current.setDirections(result);
+          setDirectionsFailed(false);
           if (fallbackPolylineRef.current) {
             fallbackPolylineRef.current.setMap(null);
           }
@@ -273,26 +237,19 @@ export function JobTrackingMap({
             setRoadDistanceText(route.distance?.text || null);
           }
         } else {
-          // Fallback: draw geodesic polyline if driving route calculation is unavailable
-          if (mapRef.current) {
-            if (!fallbackPolylineRef.current) {
-              fallbackPolylineRef.current = new window.google.maps.Polyline({
-                geodesic: true,
-                strokeColor: '#2563EB',
-                strokeOpacity: 0.85,
-                strokeWeight: 6,
-                map: mapRef.current,
-              });
-            }
-            fallbackPolylineRef.current.setPath([origin, dest]);
-            fallbackPolylineRef.current.setMap(mapRef.current);
+          // Failure: Clean fallback without drawing a fake straight road route
+          setDirectionsFailed(true);
+          if (fallbackPolylineRef.current) {
+            fallbackPolylineRef.current.setMap(null);
           }
+          setRoadEtaText(null);
+          setRoadDistanceText(null);
         }
       }
     );
   }, []);
 
-  // Listen to live GPS location updates from single global watcher or TopHeader
+  // Listen to live GPS location updates from single global watcher
   useEffect(() => {
     const handleLocationUpdate = (e) => {
       const detail = e.detail;
@@ -301,15 +258,46 @@ export function JobTrackingMap({
           latitude: parseFloat(detail.latitude),
           longitude: parseFloat(detail.longitude),
           accuracy: detail.accuracy,
+          speed: detail.speed,
+          heading: detail.heading,
           updated_at: new Date().toISOString(),
         };
         setLiveTechCoords(newCoords);
 
-        // Smoothly animate technician marker on map
-        if (techMarkerRef.current && window.google?.maps?.LatLng) {
+        if (mapRef.current && window.google?.maps) {
           try {
-            const latLng = new window.google.maps.LatLng(newCoords.latitude, newCoords.longitude);
-            techMarkerRef.current.setPosition(latLng);
+            const google = window.google;
+            const latLng = new google.maps.LatLng(newCoords.latitude, newCoords.longitude);
+
+            if (!techMarkerRef.current) {
+              const technicianVehicleSvg = {
+                url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`
+                  <svg xmlns="http://www.w3.org/2000/svg" width="54" height="54" viewBox="0 0 54 54">
+                    <defs>
+                      <filter id="carShadow" x="-20%" y="-20%" width="140%" height="140%">
+                        <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#1E3A8A" flood-opacity="0.45"/>
+                      </filter>
+                    </defs>
+                    <circle cx="27" cy="27" r="25" fill="#3B82F6" fill-opacity="0.2"/>
+                    <circle cx="27" cy="27" r="18" fill="#2563EB" stroke="#FFFFFF" stroke-width="3" filter="url(#carShadow)"/>
+                    <path d="M20 29a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm14 0a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm-17-7l2-5h16l2 5h2a2 2 0 0 1 2 2v6h-2a3 3 0 0 1-6 0h-8a3 3 0 0 1-6 0h-2v-6a2 2 0 0 1 2-2h2zm2-1l-1.5 4h19l-1.5-4H21z" fill="#FFFFFF"/>
+                  </svg>
+                `)}`,
+                scaledSize: new google.maps.Size(48, 48),
+                anchor: new google.maps.Point(24, 24),
+              };
+              techMarkerRef.current = new google.maps.Marker({
+                position: latLng,
+                map: mapRef.current,
+                title: viewRole === 'customer' ? 'Technician Live Location' : 'You (Technician)',
+                icon: technicianVehicleSvg,
+                zIndex: 200,
+              });
+              currentPosRef.current = { lat: newCoords.latitude, lng: newCoords.longitude };
+            } else {
+              // Smooth vehicle marker interpolation
+              animateVehicleMarker(newCoords.latitude, newCoords.longitude, newCoords.heading);
+            }
 
             // Follow-me auto pan
             if (isFollowMe && mapRef.current) {
@@ -328,8 +316,11 @@ export function JobTrackingMap({
     window.addEventListener('workforce:location-updated', handleLocationUpdate);
     return () => {
       window.removeEventListener('workforce:location-updated', handleLocationUpdate);
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+      }
     };
-  }, [custLat, custLon, isFollowMe, updateRoadRoute]);
+  }, [animateVehicleMarker, custLat, custLon, isFollowMe, updateRoadRoute, viewRole]);
 
   // Initialize interactive Google Map with custom high-visibility SVG pins
   useEffect(() => {
@@ -631,15 +622,16 @@ export function JobTrackingMap({
     return { code: 'ON_THE_WAY', label: 'ON THE WAY', sub: 'Driving along authorized road route.', tone: 'slate' };
   }, [liveTechCoords, lastUpdateSecondsAgo, job?.status, isBackendArrived, distanceMeters, geofenceRadius]);
 
-  const displayDistance = roadDistanceText || (
-    distanceMeters != null
-      ? distanceMeters >= 1000
-        ? `${(distanceMeters / 1000).toFixed(1)} km`
-        : `${distanceMeters} m`
-      : 'Calculating...'
-  );
+  // Formatted direct distance fallback
+  const displayDirectDistance = distanceMeters != null
+    ? distanceMeters >= 1000
+      ? `${(distanceMeters / 1000).toFixed(1)} km`
+      : `${distanceMeters} m`
+    : 'Calculating...';
 
-  const displayEta = roadEtaText || (
+  const displayDistance = !directionsFailed && roadDistanceText ? roadDistanceText : displayDirectDistance;
+
+  const displayEta = !directionsFailed && roadEtaText ? roadEtaText : (
     distanceMeters != null
       ? distanceMeters <= 300
         ? 'Arriving now'
@@ -647,12 +639,33 @@ export function JobTrackingMap({
       : '--'
   );
 
+  // Telemetry Freshness Classification (Rapido/Swiggy Rule)
+  const freshnessInfo = useMemo(() => {
+    if (!liveTechCoords?.updated_at) return { label: 'ACQUIRING', tone: 'slate' };
+    if (lastUpdateSecondsAgo <= 5) return { label: 'LIVE', tone: 'emerald' };
+    if (lastUpdateSecondsAgo <= 15) return { label: 'UPDATING', tone: 'blue' };
+    if (lastUpdateSecondsAgo <= 30) return { label: 'DELAYED', tone: 'amber' };
+    if (lastUpdateSecondsAgo <= 60) return { label: 'STALE', tone: 'orange' };
+    return { label: 'LOCATION LOST', tone: 'rose' };
+  }, [liveTechCoords, lastUpdateSecondsAgo]);
+
   // GPS Accuracy & Quality Assessment
   const accuracyMeters = liveTechCoords?.accuracy != null ? Math.round(liveTechCoords.accuracy) : null;
   const isAccuracyLow = accuracyMeters != null && accuracyMeters > 50;
 
   return (
     <div className="w-full bg-white border border-slate-200 rounded-xl overflow-hidden shadow-lg">
+      {/* ── Directions API Failure Notice ── */}
+      {directionsFailed && (
+        <div className="bg-amber-500/15 border-b border-amber-500/30 px-3 py-1.5 flex items-center justify-between text-[11px] text-amber-900 font-medium">
+          <span className="flex items-center gap-1.5">
+            <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+            <span>Road route temporarily unavailable — Showing direct distance ({displayDirectDistance})</span>
+          </span>
+          <span className="text-[10px] text-amber-700 font-mono">Direct Line</span>
+        </div>
+      )}
+
       {/* ── Swiggy / Rapido Operational Header Tracking Panel ── */}
       <div className="p-3.5 bg-gradient-to-r from-slate-950 via-slate-900 to-blue-950 text-white">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -710,7 +723,7 @@ export function JobTrackingMap({
               <div className="bg-slate-800/90 border border-slate-700/80 rounded-lg px-3 py-1 text-center backdrop-blur-sm">
                 <span className="text-[10px] text-slate-400 block font-semibold uppercase tracking-wider flex items-center justify-center gap-1">
                   <Navigation className="w-3 h-3 text-emerald-400" />
-                  Remaining
+                  {directionsFailed ? 'Direct Dist' : 'Remaining'}
                 </span>
                 <span className="text-sm font-black font-mono text-white tracking-tight">
                   {displayDistance}
@@ -744,16 +757,20 @@ export function JobTrackingMap({
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0 text-[10px] font-mono">
+            {/* Freshness Badge */}
+            <span className={`px-2 py-0.5 rounded font-bold uppercase tracking-wider ${
+              freshnessInfo.tone === 'emerald' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' :
+              freshnessInfo.tone === 'blue' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30' :
+              freshnessInfo.tone === 'amber' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30' :
+              freshnessInfo.tone === 'orange' ? 'bg-orange-500/20 text-orange-300 border border-orange-500/30' :
+              'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+            }`}>
+              ● {freshnessInfo.label} ({lastUpdateSecondsAgo}s)
+            </span>
+
             {accuracyMeters != null && (
               <span className={`px-2 py-0.5 rounded ${isAccuracyLow ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30' : 'bg-slate-800 text-slate-300'}`}>
                 {isAccuracyLow ? `⚠️ Low GPS (±${accuracyMeters}m)` : `GPS ±${accuracyMeters}m`}
-              </span>
-            )}
-            {lastUpdateSecondsAgo > 0 && (
-              <span className={`px-2 py-0.5 rounded ${lastUpdateSecondsAgo > 120 ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30' : 'bg-slate-800 text-slate-400'}`}>
-                {lastUpdateSecondsAgo > 120
-                  ? `⚠️ Last updated ${Math.round(lastUpdateSecondsAgo / 60)}m ago`
-                  : `Updated ${lastUpdateSecondsAgo}s ago`}
               </span>
             )}
           </div>

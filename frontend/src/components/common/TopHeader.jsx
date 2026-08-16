@@ -55,8 +55,9 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
     setLocState('locating');
     try {
       const pos = await getGPSPosition(true);
-      const { latitude, longitude, accuracy } = pos.coords;
-      await apiUpdateLocationFull(latitude, longitude, accuracy);
+      const { latitude, longitude, accuracy, speed, heading } = pos.coords;
+      const captured_at = new Date(pos.timestamp || Date.now()).toISOString();
+      await apiUpdateLocationFull(latitude, longitude, accuracy, speed, heading, captured_at);
       setLocCoords({
         latitude,
         longitude,
@@ -70,6 +71,9 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
             latitude,
             longitude,
             accuracy,
+            speed,
+            heading,
+            captured_at,
             timestamp: pos.timestamp || Date.now(),
             source: 'header_scan',
           },

@@ -327,6 +327,57 @@ class WorkforceJobRescheduleSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
+class JobPaymentSerializer(serializers.ModelSerializer):
+    """
+    Public/Employee-safe payment details serializer.
+    NEVER exposes payment_confirmation_otp_hash, otp_attempts, or internal secrets.
+    """
+    class Meta:
+        from .models import JobPayment
+        model = JobPayment
+        fields = [
+            "id",
+            "job",
+            "payment_method",
+            "payment_status",
+            "amount_due",
+            "amount_paid",
+            "amount_received",
+            "change_returned",
+            "currency",
+            "gateway_transaction_id",
+            "cash_collected_at",
+            "customer_confirmed_at",
+            "customer_confirmation_method",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+
+class PaymentCollectionEventSerializer(serializers.ModelSerializer):
+    actor_name = serializers.SerializerMethodField()
+
+    class Meta:
+        from .models import PaymentCollectionEvent
+        model = PaymentCollectionEvent
+        fields = [
+            "id",
+            "job_payment",
+            "event_type",
+            "amount",
+            "metadata",
+            "actor_name",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_actor_name(self, obj):
+        if obj.actor_user:
+            return obj.actor_user.get_full_name() or obj.actor_user.username
+        return "System"
+
+
 class WorkforceJobSerializer(serializers.ModelSerializer):
     customer_display_name = serializers.SerializerMethodField()
     service_title = serializers.SerializerMethodField()
@@ -334,6 +385,7 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     extensions = serializers.SerializerMethodField()
     active_extension = serializers.SerializerMethodField()
     distance_km = serializers.SerializerMethodField()
+    payment = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceRequest
@@ -359,6 +411,7 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "total_amount",
             "payment_status",
             "payment_method",
+            "payment",
             "customer_display_name",
             "active_offer",
             "extensions",
@@ -428,6 +481,30 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         if active:
             return WorkforceWorkExtensionSerializer(active).data
         return None
+
+    def get_payment(self, obj):
+        from .models import JobPayment
+        pmt = getattr(obj, "payment_record", None)
+        if not pmt:
+            pmt = JobPayment.objects.filter(job=obj).first()
+        if not pmt:
+            is_online = (obj.payment_method or "").upper() in ["ONLINE", "PREPAID"]
+            is_paid = obj.payment_status in ["paid", "collected"]
+            return {
+                "id": None,
+                "job": obj.id,
+                "payment_method": "ONLINE" if is_online else "CASH_ON_SERVICE",
+                "payment_status": "PAID" if is_paid else "PENDING",
+                "amount_due": str(obj.total_amount or "0.00"),
+                "amount_paid": str(obj.total_amount if is_paid else "0.00"),
+                "amount_received": None,
+                "change_returned": None,
+                "currency": "INR",
+                "cash_collected_at": None,
+                "customer_confirmed_at": None,
+                "customer_confirmation_method": "",
+            }
+        return JobPaymentSerializer(pmt).data
 
 
 class WorkforceEmployeeChangeRequestSerializer(serializers.ModelSerializer):

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { AlertCircle, AlertTriangle, CheckCircle2, Info, X } from 'lucide-react';
 
 export function ErrorState({
@@ -6,8 +6,18 @@ export function ErrorState({
   message = '',
   type = 'error', // 'error', 'warning', 'info', 'success'
   onDismiss = null,
+  autoDismissMs = 5000,
   className = '',
 }) {
+  useEffect(() => {
+    if (onDismiss && autoDismissMs > 0 && (message || title)) {
+      const timer = setTimeout(() => {
+        onDismiss();
+      }, autoDismissMs);
+      return () => clearTimeout(timer);
+    }
+  }, [message, title, onDismiss, autoDismissMs]);
+
   if (!message && !title) return null;
 
   const configs = {

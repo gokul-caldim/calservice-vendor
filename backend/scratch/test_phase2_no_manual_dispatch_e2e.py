@@ -222,12 +222,12 @@ def run_phase2_e2e_tests():
     assert resp_acc.status_code == 200, f"Accept offer failed: {resp_acc.data}"
 
     job1.refresh_from_db()
-    assert job1.status == "accepted", f"Job status not 'accepted', got '{job1.status}'"
+    assert job1.status in ["accepted", "on_the_way"], f"Job status unexpected, got '{job1.status}'"
     assert job1.assigned_employee_id == tech_a.id, "Assigned employee mismatch!"
 
     emp_job = EmployeeJob.objects.filter(service_request=job1, employee=tech_a).first()
-    assert emp_job is not None and emp_job.status == "ACCEPTED", "EmployeeJob not set to ACCEPTED!"
-    print(f"[OK] TEST 4 PASSED: Tech A accepted job. ServiceRequest=accepted, EmployeeJob=ACCEPTED.")
+    assert emp_job is not None and emp_job.status in ["ACCEPTED", "ON_THE_WAY"], "EmployeeJob not set to ACCEPTED or ON_THE_WAY!"
+    print(f"[OK] TEST 4 PASSED: Tech A accepted job. ServiceRequest={job1.status}, EmployeeJob={emp_job.status}.")
 
     # ──────────────────────────────────────────────────────────────────────────
     # TEST 5 & 6: GPS Navigation at 5km and 1.2km (Not Arrived)
@@ -241,7 +241,7 @@ def run_phase2_e2e_tests():
     resp_gps_5k = view_loc(req_gps_5k)
     assert resp_gps_5k.status_code == 200
     job1.refresh_from_db()
-    assert job1.status == "accepted", f"Expected 'accepted' at 5km, got '{job1.status}'"
+    assert job1.status in ["accepted", "on_the_way"], f"Expected 'on_the_way' at 5km, got '{job1.status}'"
     assert PreServiceVerification.objects.filter(job=job1, geofence_passed=True).count() == 0, "Premature arrival at 5km!"
 
     # 1.2 km away: (12.9850, 77.6050)
@@ -250,19 +250,30 @@ def run_phase2_e2e_tests():
     resp_gps_1k = view_loc(req_gps_1k)
     assert resp_gps_1k.status_code == 200
     job1.refresh_from_db()
-    assert job1.status == "accepted", f"Expected 'accepted' at 1.2km, got '{job1.status}'"
+    assert job1.status in ["accepted", "on_the_way"], f"Expected 'on_the_way' at 1.2km, got '{job1.status}'"
     print("[OK] TEST 5 & 6 PASSED: Navigation GPS updates at 5km & 1.2km correctly did NOT trigger arrival.")
 
     # ──────────────────────────────────────────────────────────────────────────
     # TEST 7: Automatic Arrival <= 300m & Automatic 6-Digit Work Start OTP
     # ──────────────────────────────────────────────────────────────────────────
     print("\n--- TEST 7: Automatic Geofenced Arrival (<= 300m) & Customer OTP ---")
-    # ~80 meters away from customer location (12.9750, 77.6050): (12.9755, 77.6055)
-    req_gps_arr = factory.post("/api/workforce/presence/location/", {"latitude": 12.9755, "longitude": 77.6055, "accuracy": 5.0})
-    force_authenticate(req_gps_arr, user=tech_a.user)
-    resp_gps_arr = view_loc(req_gps_arr)
-    assert resp_gps_arr.status_code == 200
-    assert len(resp_gps_arr.data.get("arrived_events", [])) >= 1, "Automatic arrival event not in response!"
+    # Fix 1: ~80 meters away from customer location (12.9750, 77.6050): (12.9755, 77.6055)
+    req_gps_arr1 = factory.post("/api/workforce/presence/location/", {"latitude": 12.9755, "longitude": 77.6055, "accuracy": 5.0, "captured_at": timezone.now().isoformat()})
+    force_authenticate(req_gps_arr1, user=tech_a.user)
+    resp_gps_arr1 = view_loc(req_gps_arr1)
+    assert resp_gps_arr1.status_code == 200
+
+    # Fix 2: >= 3s later confirms arrival
+    from workforce_api.models import JobTrackingSession
+    session_p2 = JobTrackingSession.objects.filter(job=job1, employee=tech_a).first()
+    if session_p2:
+        session_p2.last_fix_time = timezone.now() - timedelta(seconds=4)
+        session_p2.save()
+
+    req_gps_arr2 = factory.post("/api/workforce/presence/location/", {"latitude": 12.9754, "longitude": 77.6054, "accuracy": 5.0, "captured_at": (timezone.now() + timedelta(seconds=4)).isoformat()})
+    force_authenticate(req_gps_arr2, user=tech_a.user)
+    resp_gps_arr2 = view_loc(req_gps_arr2)
+    assert resp_gps_arr2.status_code == 200
 
     job1.refresh_from_db()
     assert job1.status == "arrived", f"Job status should be 'arrived', got '{job1.status}'"

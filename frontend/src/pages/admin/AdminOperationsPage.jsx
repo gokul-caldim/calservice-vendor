@@ -36,6 +36,7 @@ import { StatusBadge } from '../../components/enterprise/StatusBadge.jsx';
 import { ErrorState } from '../../components/enterprise/ErrorState.jsx';
 import { LoadingState } from '../../components/enterprise/LoadingState.jsx';
 import { LocationPickerMap } from '../../components/common/LocationPickerMap.jsx';
+import { loadMapsApi } from '../../utils/loadGoogleMaps.js';
 import { useReverseGeocode } from '../../hooks/useReverseGeocode.js';
 import {
   Send,
@@ -90,21 +91,9 @@ function FleetMapVisual({ fleetData }) {
       setApiError('VITE_GOOGLE_MAPS_KEY not configured.');
       return;
     }
-    if (window.google?.maps) { setApiLoaded(true); return; }
-    const existing = document.getElementById('gmap-script');
-    if (existing) {
-      existing.addEventListener('load', () => setApiLoaded(true));
-      return;
-    }
-    const script = document.createElement('script');
-    script.id = 'gmap-script';
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=places&loading=async`;
-    script.async = true;
-    script.defer = true;
-    script.onload = () => setApiLoaded(true);
-    script.onerror = () => setApiError('Failed to load Google Maps.');
-    document.head.appendChild(script);
-
+    loadMapsApi(apiKey)
+      .then(() => setApiLoaded(true))
+      .catch((err) => setApiError(err?.message || 'Failed to load Google Maps.'));
   }, [apiKey]);
 
   // Init map once API loaded
