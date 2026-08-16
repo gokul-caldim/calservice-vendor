@@ -235,6 +235,47 @@ export function OnboardingWizardPage() {
     setFormData((prev) => ({ ...prev, services: updated }));
   };
 
+  const handleToggleCategoryAll = (cat) => {
+    if (!cat?.services || cat.services.length === 0) return;
+    const catSvcIds = new Set(cat.services.map((s) => s.id));
+    const allSelected = cat.services.every((s) => formData.services.some((sel) => sel.id === s.id));
+
+    let updated;
+    if (allSelected) {
+      // Deselect all services in this category
+      updated = formData.services.filter((s) => !catSvcIds.has(s.id));
+    } else {
+      // Select all services in this category
+      const otherServices = formData.services.filter((s) => !catSvcIds.has(s.id));
+      const newCatServices = cat.services.map((svc) => ({
+        id: svc.id,
+        name: svc.name,
+        category: cat.name || svc.category_name || '',
+      }));
+      updated = [...otherServices, ...newCatServices];
+    }
+    setFormData((prev) => ({ ...prev, services: updated }));
+  };
+
+  const handleToggleAllServices = () => {
+    const allServices = (catalog || []).flatMap((cat) =>
+      (cat.services || []).map((s) => ({
+        id: s.id,
+        name: s.name,
+        category: cat.name || '',
+      }))
+    );
+    const isAllGlobalSelected =
+      allServices.length > 0 &&
+      allServices.every((s) => formData.services.some((sel) => sel.id === s.id));
+
+    if (isAllGlobalSelected) {
+      setFormData((prev) => ({ ...prev, services: [] }));
+    } else {
+      setFormData((prev) => ({ ...prev, services: allServices }));
+    }
+  };
+
   const handleSubmitApplication = async () => {
     if (!formData.declarationAccepted) {
       setError('Please accept the declaration to submit your application.');
@@ -559,41 +600,79 @@ export function OnboardingWizardPage() {
           {/* ── STEP 3: SERVICES ── */}
           {currentStep === 3 && (
             <div className="space-y-3 text-xs">
-              <div>
-                <h2 className="text-sm font-bold text-slate-800 flex items-center gap-1.5">
-                  <Wrench className="w-4 h-4 text-blue-600" />
-                  3. Select Services You Provide
-                </h2>
-                <p className="text-slate-500 text-[11px]">
-                  Select the services you are qualified to perform. Each requested service will be reviewed for Admin authorization.
-                </p>
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-slate-100 pb-2.5">
+                <div>
+                  <h2 className="text-sm font-bold text-slate-800 flex items-center gap-1.5">
+                    <Wrench className="w-4 h-4 text-blue-600" />
+                    3. Select Services You Provide
+                  </h2>
+                  <p className="text-slate-500 text-[11px] mt-0.5">
+                    Select the services you are qualified to perform ({formData.services.length} selected). Each requested service will be reviewed for Admin authorization.
+                  </p>
+                </div>
+                {catalog && catalog.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleToggleAllServices}
+                    className="self-start sm:self-auto text-xs font-bold px-3 py-1.5 rounded-lg border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 transition-colors shadow-xs"
+                  >
+                    {catalog.flatMap((c) => c.services || []).length > 0 &&
+                    catalog.flatMap((c) => c.services || []).every((s) => formData.services.some((sel) => sel.id === s.id))
+                      ? 'Deselect All Services'
+                      : 'Select All Services'}
+                  </button>
+                )}
               </div>
 
-              <div className="space-y-3 pt-2 max-h-[400px] overflow-y-auto">
+              <div className="space-y-3 pt-1 max-h-[420px] overflow-y-auto pr-1">
                 {catalog && catalog.length > 0 ? (
-                  catalog.map((cat) => (
-                    <div key={cat.id} className="border border-slate-200 rounded p-3 bg-slate-50/50">
-                      <h3 className="font-bold text-slate-800 uppercase tracking-wider text-[11px] mb-2">
-                        {cat.name} ({cat.services?.length || 0})
-                      </h3>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        {cat.services &&
-                          cat.services.map((svc) => {
+                  catalog.map((cat) => {
+                    const catServices = cat.services || [];
+                    const selectedCount = catServices.filter((s) => formData.services.some((sel) => sel.id === s.id)).length;
+                    const allCatSelected = catServices.length > 0 && selectedCount === catServices.length;
+
+                    return (
+                      <div key={cat.id} className="border border-slate-200 rounded-lg p-3 bg-slate-50/50 shadow-xs">
+                        <div className="flex items-center justify-between gap-2 mb-2.5 border-b border-slate-200/80 pb-2">
+                          <div className="flex items-center gap-2">
+                            <h3 className="font-bold text-slate-800 uppercase tracking-wider text-[11px]">
+                              {cat.name} ({catServices.length})
+                            </h3>
+                            {selectedCount > 0 && (
+                              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800">
+                                {selectedCount}/{catServices.length} Selected
+                              </span>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleToggleCategoryAll(cat)}
+                            className={`text-[11px] font-bold px-2.5 py-1 rounded transition-all flex items-center gap-1 border shadow-xs active:scale-95 ${
+                              allCatSelected
+                                ? 'bg-blue-600 border-blue-600 text-white hover:bg-blue-700'
+                                : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100 hover:border-slate-400'
+                            }`}
+                          >
+                            <span>{allCatSelected ? '✓ Deselect All' : 'Select All'}</span>
+                          </button>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {catServices.map((svc) => {
                             const isSelected = formData.services.some((s) => s.id === svc.id);
                             return (
                               <label
                                 key={svc.id}
-                                className={`p-2.5 rounded border text-left flex items-start gap-2 cursor-pointer transition-colors ${
+                                className={`p-2.5 rounded-lg border text-left flex items-start gap-2.5 cursor-pointer transition-all ${
                                   isSelected
-                                    ? 'bg-blue-50/80 border-blue-300 text-blue-900 font-semibold'
-                                    : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                                    ? 'bg-blue-50/90 border-blue-300 text-blue-900 font-semibold shadow-xs'
+                                    : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
                                 }`}
                               >
                                 <input
                                   type="checkbox"
                                   checked={isSelected}
                                   onChange={() => handleToggleService({ ...svc, category_name: cat.name })}
-                                  className="mt-0.5 rounded border-slate-300 text-blue-600"
+                                  className="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
                                 />
                                 <div className="min-w-0 flex-1">
                                   <p className="text-xs leading-tight">{svc.name}</p>
@@ -601,9 +680,10 @@ export function OnboardingWizardPage() {
                               </label>
                             );
                           })}
+                        </div>
                       </div>
-                    </div>
-                  ))
+                    );
+                  })
                 ) : (
                   <p className="text-slate-500 text-center py-6">Loading service catalog...</p>
                 )}

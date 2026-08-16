@@ -15,7 +15,6 @@ import React, { useEffect, useState, useRef, useCallback } from 'react';
 import {
   apiGetAdminApplications,
   apiGetEligibleTechnicians,
-  apiDispatchAssign,
   apiTriggerAutoDispatch,
   apiGetWorkforceJobs,
   apiGetFleetMap,
@@ -37,6 +36,7 @@ import { StatusBadge } from '../../components/enterprise/StatusBadge.jsx';
 import { ErrorState } from '../../components/enterprise/ErrorState.jsx';
 import { LoadingState } from '../../components/enterprise/LoadingState.jsx';
 import { LocationPickerMap } from '../../components/common/LocationPickerMap.jsx';
+import { loadMapsApi } from '../../utils/loadGoogleMaps.js';
 import { useReverseGeocode } from '../../hooks/useReverseGeocode.js';
 import {
   Send,
@@ -91,21 +91,9 @@ function FleetMapVisual({ fleetData }) {
       setApiError('VITE_GOOGLE_MAPS_KEY not configured.');
       return;
     }
-    if (window.google?.maps) { setApiLoaded(true); return; }
-    const existing = document.getElementById('gmap-script');
-    if (existing) {
-      existing.addEventListener('load', () => setApiLoaded(true));
-      return;
-    }
-    const script = document.createElement('script');
-    script.id = 'gmap-script';
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=places&loading=async`;
-    script.async = true;
-    script.defer = true;
-    script.onload = () => setApiLoaded(true);
-    script.onerror = () => setApiError('Failed to load Google Maps.');
-    document.head.appendChild(script);
-
+    loadMapsApi(apiKey)
+      .then(() => setApiLoaded(true))
+      .catch((err) => setApiError(err?.message || 'Failed to load Google Maps.'));
   }, [apiKey]);
 
   // Init map once API loaded
@@ -493,22 +481,6 @@ export function AdminOperationsPage() {
     return () => clearInterval(interval);
   }, [activeTab]);
 
-  const handleDispatch = async (techId) => {
-    if (!selectedJob) return;
-    try {
-      setDispatchLoading(true);
-      setStatusMsg({ type: '', text: '' });
-      await apiDispatchAssign(selectedJob.id, techId);
-      setStatusMsg({ type: 'success', text: `Job #${selectedJob.id} successfully assigned & dispatched!` });
-      await loadData();
-      setTimeout(() => setStatusMsg({ type: '', text: '' }), 4000);
-    } catch (err) {
-      setStatusMsg({ type: 'error', text: err.message || 'Dispatch assignment failed.' });
-    } finally {
-      setDispatchLoading(false);
-    }
-  };
-
   const handleTriggerAutoDispatch = async () => {
     if (!selectedJob) return;
     try {
@@ -618,7 +590,7 @@ export function AdminOperationsPage() {
   const fleetWithLocation = fleetMap.filter((u) => u.has_location).length;
 
   const tabs = [
-    { id: 'dispatch', label: 'Dispatch Matrix', icon: Send },
+    { id: 'dispatch', label: 'Automated Dispatch Monitor', icon: Send },
     {
       id: 'fleet_map',
       label: `Live Fleet Telemetry (${Array.isArray(fleetMap) ? fleetMap.length : 0})`,
@@ -707,19 +679,22 @@ export function AdminOperationsPage() {
 
           <div className="p-4 sm:p-5">
 
-            {/* ── TAB 1: DISPATCH CONSOLE ── */}
+            {/* ── TAB 1: AUTOMATED DISPATCH RADAR & MONITOR ── */}
             {activeTab === 'dispatch' && (
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-                {/* Unassigned Bookings Column (5 cols) */}
+                {/* Service Request Queue Column (5 cols) */}
                 <div className="lg:col-span-5 border border-slate-200 rounded overflow-hidden flex flex-col">
                   <div className="bg-slate-50 px-3.5 py-2.5 border-b border-slate-200 flex items-center justify-between">
                     <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
                       <Clock className="w-3.5 h-3.5 text-blue-600" />
-                      1. Select Job to Dispatch ({jobs.length})
+                      1. Customer Service Requests ({jobs.length})
                     </h3>
+                    <span className="text-[10px] font-mono text-slate-500 bg-slate-200/70 px-1.5 py-0.5 rounded">
+                      Auto-Dispatched
+                    </span>
                   </div>
 
-                  <div className="divide-y divide-slate-100 max-h-[500px] overflow-y-auto">
+                  <div className="divide-y divide-slate-100 max-h-[520px] overflow-y-auto">
                     {jobs.length > 0 ? (
                       jobs.map((j) => {
                         const isSelected = selectedJob?.id === j.id;
@@ -738,12 +713,21 @@ export function AdminOperationsPage() {
                               <StatusBadge status={j.status} size="xs" />
                             </div>
                             <p className="text-xs font-bold text-slate-900 truncate">
-                              {j.service_title || j.service_category}
+                              {j.service_title || j.service_category || j.issue_title}
                             </p>
-                            <p className="text-[11px] text-slate-500 truncate mt-0.5">{j.address}</p>
-                            <p className="text-[10px] text-slate-400 font-mono mt-1">
-                              Scheduled: {j.preferred_date || 'Today'} {j.preferred_time || ''}
-                            </p>
+                            <p className="text-[11px] text-slate-500 truncate mt-0.5">{j.address || 'Location provided in GPS coordinates'}</p>
+                            <div className="flex items-center justify-between mt-1 pt-1 border-t border-slate-100 text-[10px] text-slate-500">
+                              <span>
+                                {j.assigned_employee
+                                  ? `Assigned: ${j.assigned_employee.name || j.assigned_employee.employee_id || 'Tech'}`
+                                  : j.status === 'assigned'
+                                  ? 'Offer Active (Awaiting Acceptance)'
+                                  : 'Auto-Dispatch Active'}
+                              </span>
+                              <span className="font-mono font-bold text-slate-600">
+                                {j.preferred_date || 'Today'}
+                              </span>
+                            </div>
                           </div>
                         );
                       })
@@ -755,19 +739,20 @@ export function AdminOperationsPage() {
                   </div>
                 </div>
 
-                {/* Eligible Technicians Column (7 cols) */}
+                {/* Automated Dispatch Telemetry & Candidate Monitor Column (7 cols) */}
                 <div className="lg:col-span-7 border border-slate-200 rounded overflow-hidden flex flex-col">
                   <div className="bg-slate-50 px-3.5 py-2.5 border-b border-slate-200 flex items-center justify-between">
                     <div>
                       <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
                         <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
-                        2. Skill-Matched Eligible Technicians ({eligibleFleet.length})
+                        2. Live Automated Geo-Dispatch Engine Monitor
                       </h3>
                       <span className="text-[11px] text-slate-500">
-                        Target Job:{' '}
+                        Inspecting Job:{' '}
                         <strong className="text-blue-600">
                           {selectedJob ? selectedJob.request_id || `SR-${selectedJob.id}` : 'None Selected'}
                         </strong>
+                        {selectedJob?.status && ` (${selectedJob.status.toUpperCase()})`}
                       </span>
                     </div>
                     {selectedJob && (
@@ -775,15 +760,23 @@ export function AdminOperationsPage() {
                         type="button"
                         onClick={handleTriggerAutoDispatch}
                         disabled={dispatchLoading}
-                        className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs inline-flex items-center gap-1 shadow-sm"
+                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs inline-flex items-center gap-1 shadow-sm transition-colors"
                       >
                         <Sparkles className="w-3.5 h-3.5" />
-                        {dispatchLoading ? 'Dispatching...' : 'Run Auto Dispatch'}
+                        {dispatchLoading ? 'Reconciling...' : 'Re-evaluate Auto-Dispatch'}
                       </button>
                     )}
                   </div>
 
-                  <div className="divide-y divide-slate-100 max-h-[500px] overflow-y-auto">
+                  {/* Operational Protocol Banner */}
+                  <div className="p-3 bg-emerald-50/70 border-b border-emerald-200/60 text-[11px] text-emerald-900 flex items-start gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold">Autonomous Dispatch Active:</span> Jobs are automatically assigned to nearest eligible technicians using the <strong>9-Gate Employee Eligibility Engine</strong> (real-time browser GPS &le; 300s freshness window, Haversine proximity, skill match, and shift clock-in state). Zero manual dispatch required.
+                    </div>
+                  </div>
+
+                  <div className="divide-y divide-slate-100 max-h-[440px] overflow-y-auto">
                     {eligibleFleet.length > 0 ? (
                       eligibleFleet.map((tech) => (
                         <div
@@ -802,6 +795,11 @@ export function AdminOperationsPage() {
                                   label={tech.is_online ? 'Online' : 'Offline'}
                                   size="xs"
                                 />
+                                {tech.is_clocked_in && (
+                                  <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 text-[10px] font-bold border border-blue-200">
+                                    Shift Active (+10)
+                                  </span>
+                                )}
                               </div>
                               <p className="text-[11px] text-slate-500 font-mono">
                                 {tech.employee_id} • {tech.phone || 'No phone'}
@@ -812,22 +810,25 @@ export function AdminOperationsPage() {
                             </div>
                           </div>
 
-                          <div className="flex items-center shrink-0">
-                            <button
-                              type="button"
-                              onClick={() => handleDispatch(tech.id)}
-                              disabled={dispatchLoading || !selectedJob}
-                              className="w-full sm:w-auto px-3.5 py-1.5 rounded bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-xs shadow-sm transition-colors flex items-center justify-center gap-1"
-                            >
-                              <Send className="w-3 h-3" />
-                              <span>Assign & Dispatch</span>
-                            </button>
+                          <div className="flex flex-col items-end gap-1 text-right shrink-0">
+                            {tech.distance_km != null ? (
+                              <span className="font-mono text-xs font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                                {tech.distance_km.toFixed(1)} km away
+                              </span>
+                            ) : (
+                              <span className="text-[10px] text-slate-400 font-mono">
+                                Proximity Pending GPS
+                              </span>
+                            )}
+                            <span className="text-[10px] text-emerald-700 font-semibold">
+                              Eligible Candidate
+                            </span>
                           </div>
                         </div>
                       ))
                     ) : (
                       <div className="p-12 text-center text-xs text-slate-500">
-                        No eligible technicians currently available for this service category.
+                        No online qualified technicians currently within operational radius for this service request.
                       </div>
                     )}
                   </div>

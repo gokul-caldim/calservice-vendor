@@ -104,10 +104,9 @@ export async function apiGetPresenceStatus() {
   return await apiRequest('/workforce/presence/status/');
 }
 
-// ── Jobs, Stepper, Proof & Cash Collection (Phases 15–16) ─────────────────────
-
-export async function apiGetWorkforceJobs() {
-  return await apiRequest('/workforce/jobs/');
+export async function apiGetWorkforceJobs(status = 'active') {
+  const query = status ? `?status=${encodeURIComponent(status)}` : '';
+  return await apiRequest(`/workforce/jobs/${query}`);
 }
 
 export async function apiTransitionJob(jobId, targetStatus) {
@@ -144,6 +143,12 @@ export async function apiVerifyOTP(jobId, otp) {
   });
 }
 
+export async function apiResendOTP(jobId) {
+  return await apiRequest(`/workforce/jobs/${jobId}/resend-otp/`, {
+    method: 'POST',
+  });
+}
+
 export async function apiUploadPreServicePhoto(jobId, photoType, file) {
   const formData = new FormData();
   formData.append('photo_type', photoType);
@@ -167,10 +172,32 @@ export async function apiUploadJobProof(jobId, formData) {
   });
 }
 
-export async function apiCollectJobCash(jobId, amount) {
-  return await apiRequest(`/workforce/jobs/${jobId}/collect-cash/`, {
+export async function apiGetJobPayment(jobId) {
+  return await apiRequest(`/workforce/jobs/${jobId}/payment/`);
+}
+
+export async function apiCollectJobCash(jobId, amountReceived) {
+  return await apiRequest(`/workforce/jobs/${jobId}/payment/collect/`, {
     method: 'POST',
-    json: { amount },
+    json: { amount_received: amountReceived },
+  });
+}
+
+export async function apiVerifyPaymentOTP(jobId, otp) {
+  return await apiRequest(`/workforce/jobs/${jobId}/payment/verify-otp/`, {
+    method: 'POST',
+    json: { otp },
+  });
+}
+
+export async function apiGetCustomerJobPayment(jobId) {
+  return await apiRequest(`/workforce/customer/jobs/${jobId}/payment/`);
+}
+
+export async function apiCustomerConfirmPayment(jobId, payload) {
+  return await apiRequest(`/workforce/customer/jobs/${jobId}/payment/confirm/`, {
+    method: 'POST',
+    json: payload,
   });
 }
 
@@ -271,6 +298,18 @@ export async function apiVerifyDocument(applicationId, docCategory, action, reas
   });
 }
 
+export async function apiBulkVerifyDocuments(applicationId, categories, action, reason = '', allPending = false) {
+  return await apiRequest(`/workforce/admin/applications/${applicationId}/documents/bulk-verify/`, {
+    method: 'POST',
+    json: {
+      categories,
+      action,
+      reason,
+      all_pending: allPending,
+    },
+  });
+}
+
 export async function apiRequestService(serviceId, name = '') {
   return await apiRequest('/workforce/services/request/', {
     method: 'POST',
@@ -293,6 +332,18 @@ export async function apiDecideService(applicationId, serviceId, action, reason 
   return await apiRequest(`/workforce/admin/applications/${applicationId}/service/${serviceId}/decide/`, {
     method: 'POST',
     json: { action, reason },
+  });
+}
+
+export async function apiBulkDecideServices(applicationId, serviceIds, action, reason = '', allPending = false) {
+  return await apiRequest(`/workforce/admin/applications/${applicationId}/services/bulk-decide/`, {
+    method: 'POST',
+    json: {
+      service_ids: serviceIds,
+      action,
+      reason,
+      all_pending: allPending,
+    },
   });
 }
 
@@ -674,9 +725,15 @@ export async function apiDeleteSavedLocation(id) {
 
 // ── Live GPS Location Update (enhanced with accuracy) ─────────────────────────
 
-export async function apiUpdateLocationFull(latitude, longitude, accuracy = null) {
-  const payload = { latitude, longitude };
+export async function apiUpdateLocationFull(latitude, longitude, accuracy = null, speed = null, heading = null, captured_at = null) {
+  const payload = {
+    latitude,
+    longitude,
+    captured_at: captured_at || new Date().toISOString(),
+  };
   if (accuracy != null) payload.accuracy = accuracy;
+  if (speed != null) payload.speed = speed;
+  if (heading != null) payload.heading = heading;
   return await apiRequest('/workforce/presence/location/', {
     method: 'POST',
     json: payload,

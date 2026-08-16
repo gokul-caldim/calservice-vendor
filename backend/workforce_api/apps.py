@@ -4,6 +4,8 @@ from django.apps import AppConfig
 def sync_workforce_schema(sender, **kwargs):
     try:
         from django.db import connection
+        if connection.vendor != "postgresql":
+            return
         with connection.cursor() as cursor:
             cursor.execute("""
                 ALTER TABLE workforce_pre_service_verification
@@ -176,8 +178,6 @@ def sync_workforce_schema(sender, **kwargs):
         pass
 
 
-
-
 class WorkforceApiConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "workforce_api"
@@ -186,7 +186,4 @@ class WorkforceApiConfig(AppConfig):
     def ready(self):
         from django.db.models.signals import post_migrate
         post_migrate.connect(sync_workforce_schema, sender=self)
-        try:
-            sync_workforce_schema(self)
-        except Exception:
-            pass
+

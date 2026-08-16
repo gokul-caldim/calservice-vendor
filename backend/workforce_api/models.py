@@ -311,25 +311,6 @@ class WorkforceNotification(models.Model):
         return f"To {self.recipient.username}: {self.title}"
 
 
-class WorkforceEventLog(models.Model):
-    event_type = models.CharField(max_length=100, db_index=True)
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-    )
-    payload = models.JSONField(default=dict, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
-
-    class Meta:
-        db_table = "workforce_event_log"
-        ordering = ["-created_at"]
-
-    def __str__(self):
-        return f"Event {self.event_type} at {self.created_at}"
-
-
 class WorkforcePayPeriod(models.Model):
     class Status(models.TextChoices):
         DRAFT = "DRAFT", "Draft"
@@ -947,6 +928,311 @@ class EmployeeSavedLocation(models.Model):
 
     def __str__(self):
         return f"{self.employee_id} — {self.name} ({self.label})"
+
+
+class JobTrackingSession(models.Model):
+    """
+    Tracks an active en-route / on-site trip for an assigned job.
+    Enforces one active tracking session per job.
+    """
+    class SessionStatus(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        COMPLETED = "COMPLETED", "Completed"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    company = models.ForeignKey(
+        "companies.Company",
+        on_delete=models.CASCADE,
+        related_name="job_tracking_sessions",
+    )
+    job = models.ForeignKey(
+        "service_requests.ServiceRequest",
+        on_delete=models.CASCADE,
+        related_name="tracking_sessions",
+    )
+    employee = models.ForeignKey(
+        "employees.Employee",
+        on_delete=models.CASCADE,
+        related_name="tracking_sessions",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=SessionStatus.choices,
+        default=SessionStatus.ACTIVE,
+        db_index=True,
+    )
+    started_at = models.DateTimeField(auto_now_add=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+
+    # Latest telemetry snapshot
+    last_latitude = models.FloatField(null=True, blank=True)
+    last_longitude = models.FloatField(null=True, blank=True)
+    last_accuracy = models.FloatField(null=True, blank=True)
+    last_speed = models.FloatField(null=True, blank=True)
+    last_heading = models.FloatField(null=True, blank=True)
+    last_captured_at = models.DateTimeField(null=True, blank=True)
+    last_received_at = models.DateTimeField(null=True, blank=True)
+
+    # Consecutive arrival confirmation tracking
+    consecutive_arrival_fixes = models.IntegerField(default=0)
+    last_fix_lat = models.FloatField(null=True, blank=True)
+    last_fix_lon = models.FloatField(null=True, blank=True)
+    last_fix_time = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "workforce_job_tracking_session"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["job", "status"]),
+            models.Index(fields=["employee", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Tracking Session #{self.id} (Job #{self.job_id}, Emp #{self.employee_id}, {self.status})"
+
+
+class JobLocationPoint(models.Model):
+    """
+    Throttled historical GPS telemetry points along an active trip.
+    Persisted on meaningful movement (>20m) or interval (>30s) or lifecycle transitions.
+    """
+    tracking_session = models.ForeignKey(
+        JobTrackingSession,
+        on_delete=models.CASCADE,
+        related_name="location_points",
+    )
+    job = models.ForeignKey(
+        "service_requests.ServiceRequest",
+        on_delete=models.CASCADE,
+        related_name="telemetry_points",
+    )
+    employee = models.ForeignKey(
+        "employees.Employee",
+        on_delete=models.CASCADE,
+        related_name="telemetry_points",
+    )
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+    accuracy = models.FloatField(null=True, blank=True)
+    speed = models.FloatField(null=True, blank=True)
+    heading = models.FloatField(null=True, blank=True)
+    captured_at = models.DateTimeField(db_index=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+    sequence_number = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "workforce_job_location_point"
+        ordering = ["tracking_session", "sequence_number", "created_at"]
+        indexes = [
+            models.Index(fields=["tracking_session", "created_at"]),
+            models.Index(fields=["job", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Point #{self.sequence_number} for Session #{self.tracking_session_id} ({self.latitude}, {self.longitude})"
+
+
+class JobPayment(models.Model):
+    """
+    Authoritative Payment State Machine Model for Workforce Jobs.
+    Maintains separate lifecycle from GPS dispatch, travel, and arrival.
+    Supports ONLINE (gateway-verified) and CASH_ON_SERVICE (with dual confirmation: Direct or separate Payment OTP).
+    """
+    class PaymentMethod(models.TextChoices):
+        ONLINE = "ONLINE", "Online Payment"
+        CASH_ON_SERVICE = "CASH_ON_SERVICE", "Cash on Service"
+
+    class PaymentStatus(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        AUTHORIZED = "AUTHORIZED", "Authorized"
+        PAID = "PAID", "Paid"
+        CASH_PENDING = "CASH_PENDING", "Cash Collection Pending"
+        FAILED = "FAILED", "Failed"
+        REFUNDED = "REFUNDED", "Refunded"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    job = models.OneToOneField(
+        "service_requests.ServiceRequest",
+        on_delete=models.CASCADE,
+        related_name="payment_record",
+        unique=True,
+    )
+    employee = models.ForeignKey(
+        "employees.Employee",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="job_payments",
+    )
+    company = models.ForeignKey(
+        "companies.Company",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="job_payments",
+    )
+    payment_method = models.CharField(
+        max_length=30,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.CASH_ON_SERVICE,
+        db_index=True,
+    )
+    payment_status = models.CharField(
+        max_length=30,
+        choices=PaymentStatus.choices,
+        default=PaymentStatus.PENDING,
+        db_index=True,
+    )
+    amount_due = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0.00,
+    )
+    amount_paid = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0.00,
+    )
+    amount_received = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    change_returned = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    currency = models.CharField(
+        max_length=10,
+        default="INR",
+    )
+    gateway_transaction_id = models.CharField(
+        max_length=200,
+        blank=True,
+        null=True,
+    )
+    cash_collected_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+    cash_collected_by = models.ForeignKey(
+        "employees.Employee",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="collected_payments",
+    )
+    customer_confirmed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+    customer_confirmation_method = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+    )
+    # Hashed OTP storage using Django make_password / check_password (never plaintext)
+    payment_confirmation_otp_hash = models.CharField(
+        max_length=256,
+        blank=True,
+        null=True,
+    )
+    otp_expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+    otp_attempts = models.IntegerField(
+        default=0,
+    )
+    otp_used_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "workforce_job_payment"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["job", "payment_status"]),
+            models.Index(fields=["employee", "payment_status"]),
+            models.Index(fields=["company", "payment_status"]),
+        ]
+
+    def __str__(self):
+        return f"Payment #{self.id} for Job #{self.job_id} ({self.payment_method} - {self.payment_status} - ₹{self.amount_due})"
+
+
+class PaymentCollectionEvent(models.Model):
+    """
+    Immutable Audit Trail for all Payment & Cash Collection Lifecycle Events.
+    """
+    class EventType(models.TextChoices):
+        PAYMENT_CREATED = "PAYMENT_CREATED", "Payment Record Created"
+        PAYMENT_PENDING = "PAYMENT_PENDING", "Payment Pending"
+        CASH_COLLECTION_STARTED = "CASH_COLLECTION_STARTED", "Cash Collection Started"
+        CASH_REPORTED = "CASH_REPORTED", "Cash Collection Reported"
+        CUSTOMER_CONFIRMATION_SENT = "CUSTOMER_CONFIRMATION_SENT", "Customer Confirmation Sent"
+        CUSTOMER_CONFIRMED = "CUSTOMER_CONFIRMED", "Customer Confirmed Payment"
+        CASH_COLLECTED = "CASH_COLLECTED", "Cash Collected"
+        PAYMENT_PAID = "PAYMENT_PAID", "Payment Marked Paid"
+        PAYMENT_FAILED = "PAYMENT_FAILED", "Payment Failed"
+        PAYMENT_REFUNDED = "PAYMENT_REFUNDED", "Payment Refunded"
+        PAYMENT_DISPUTED = "PAYMENT_DISPUTED", "Payment Disputed by Customer"
+
+    job_payment = models.ForeignKey(
+        JobPayment,
+        on_delete=models.CASCADE,
+        related_name="events",
+    )
+    employee = models.ForeignKey(
+        "employees.Employee",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    actor_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    event_type = models.CharField(
+        max_length=50,
+        db_index=True,
+    )
+    amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    metadata = models.JSONField(
+        default=dict,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "workforce_payment_collection_event"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["job_payment", "created_at"]),
+            models.Index(fields=["event_type", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"PaymentEvent #{self.id} ({self.event_type}) for Payment #{self.job_payment_id}"
+
+
 
 
 

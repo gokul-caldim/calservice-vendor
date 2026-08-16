@@ -3,7 +3,9 @@ import { useParams, useNavigate, Link } from 'react-router-dom';
 import {
   apiGetAdminApplicationDetail,
   apiVerifyDocument,
+  apiBulkVerifyDocuments,
   apiDecideService,
+  apiBulkDecideServices,
   apiRequestCorrection,
   apiApproveApplication,
   apiRejectApplication,
@@ -72,6 +74,69 @@ export function AdminApplicationDetailPage() {
     loadDetail();
   }, [id]);
 
+  // Auto-dismiss transient notifications
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => setError(''), 4500);
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
+
+  useEffect(() => {
+    if (successMsg) {
+      const timer = setTimeout(() => setSuccessMsg(''), 4500);
+      return () => clearTimeout(timer);
+    }
+  }, [successMsg]);
+
+  const [selectedDocKeys, setSelectedDocKeys] = useState(new Set());
+
+  const handleToggleSelectDoc = (docKey) => {
+    setSelectedDocKeys((prev) => {
+      const next = new Set(prev);
+      const key = String(docKey);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const handleToggleSelectAllDocs = (allDocKeysList) => {
+    if (selectedDocKeys.size === allDocKeysList.length && allDocKeysList.length > 0) {
+      setSelectedDocKeys(new Set());
+    } else {
+      setSelectedDocKeys(new Set(allDocKeysList));
+    }
+  };
+
+  const handleBulkDocumentAction = async (action, allPending = false) => {
+    const categoriesToDecide = allPending ? [] : Array.from(selectedDocKeys);
+    if (!allPending && categoriesToDecide.length === 0) {
+      setError('Please select at least one document.');
+      return;
+    }
+
+    let reason = '';
+    if (action === 'reject') {
+      reason = prompt('Enter specific reason for rejecting selected document(s):') || '';
+      if (!reason.trim()) return;
+    }
+
+    try {
+      setActionLoading(true);
+      setError('');
+      const res = await apiBulkVerifyDocuments(id, categoriesToDecide, action, reason, allPending);
+      setSuccessMsg(res.message || `Documents ${action}d successfully.`);
+      setSelectedDocKeys(new Set());
+      await loadDetail();
+      setTimeout(() => setSuccessMsg(''), 3000);
+    } catch (err) {
+      setError(err.message || `Bulk document ${action} failed.`);
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
   const handleDocAction = async (docCategory, action) => {
     let reason = '';
     if (action === 'reject') {
@@ -84,10 +149,57 @@ export function AdminApplicationDetailPage() {
       setError('');
       await apiVerifyDocument(id, docCategory, action, reason);
       setSuccessMsg(`Document marked as ${action}d.`);
+      setSelectedDocKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(String(docCategory));
+        return next;
+      });
       await loadDetail();
       setTimeout(() => setSuccessMsg(''), 3000);
     } catch (err) {
       setError(err.message || 'Document verification failed.');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const [selectedServiceIds, setSelectedServiceIds] = useState(new Set());
+
+  const handleToggleSelectService = (serviceId) => {
+    setSelectedServiceIds((prev) => {
+      const next = new Set(prev);
+      const sid = String(serviceId);
+      if (next.has(sid)) next.delete(sid);
+      else next.add(sid);
+      return next;
+    });
+  };
+
+  const handleToggleSelectAllServices = (allServicesList) => {
+    if (selectedServiceIds.size === allServicesList.length && allServicesList.length > 0) {
+      setSelectedServiceIds(new Set());
+    } else {
+      setSelectedServiceIds(new Set(allServicesList.map((s) => String(s.id))));
+    }
+  };
+
+  const handleBulkServiceAction = async (action, allPending = false) => {
+    const idsToDecide = allPending ? [] : Array.from(selectedServiceIds);
+    if (!allPending && idsToDecide.length === 0) {
+      setError('Please select at least one service.');
+      return;
+    }
+
+    try {
+      setActionLoading(true);
+      setError('');
+      const res = await apiBulkDecideServices(id, idsToDecide, action, '', allPending);
+      setSuccessMsg(res.message || `Services ${action}d successfully.`);
+      setSelectedServiceIds(new Set());
+      await loadDetail();
+      setTimeout(() => setSuccessMsg(''), 3000);
+    } catch (err) {
+      setError(err.message || `Bulk service ${action} failed.`);
     } finally {
       setActionLoading(false);
     }
@@ -99,6 +211,11 @@ export function AdminApplicationDetailPage() {
       setError('');
       await apiDecideService(id, serviceId, action);
       setSuccessMsg(`Service ${action}d successfully.`);
+      setSelectedServiceIds((prev) => {
+        const next = new Set(prev);
+        next.delete(String(serviceId));
+        return next;
+      });
       await loadDetail();
       setTimeout(() => setSuccessMsg(''), 3000);
     } catch (err) {
@@ -401,21 +518,86 @@ export function AdminApplicationDetailPage() {
             {/* ── TAB 3: SERVICES AUTHORIZATION MATRIX (Rule 1) ── */}
             {activeTab === 'services' && (
               <div className="space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-slate-50 border border-slate-200 rounded-lg p-3">
                   <div>
                     <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
                       Per-Service Authorization Matrix
                     </h3>
-                    <p className="text-[11px] text-slate-500">
-                      Technicians can ONLY be dispatched jobs for services explicitly marked as <strong>APPROVED</strong>.
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      Technicians can ONLY be dispatched jobs for services explicitly marked as <strong className="text-slate-800">APPROVED</strong>.
                     </p>
+                  </div>
+
+                  {/* Bulk Action Controls Bar */}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {selectedServiceIds.size > 0 ? (
+                      <>
+                        <span className="text-xs font-bold text-blue-700 bg-blue-50 border border-blue-200 px-2.5 py-1 rounded">
+                          {selectedServiceIds.size} Selected
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleBulkServiceAction('approve')}
+                          disabled={actionLoading}
+                          className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded transition-colors shadow-xs flex items-center gap-1 active:scale-95 disabled:opacity-50"
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Approve Selected ({selectedServiceIds.size})</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleBulkServiceAction('reject')}
+                          disabled={actionLoading}
+                          className="px-3 py-1 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded transition-colors shadow-xs flex items-center gap-1 active:scale-95 disabled:opacity-50"
+                        >
+                          <XCircle className="w-3.5 h-3.5" />
+                          <span>Reject Selected ({selectedServiceIds.size})</span>
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        {services.some((s) => s.status !== 'approved') && (
+                          <button
+                            type="button"
+                            onClick={() => handleBulkServiceAction('approve', true)}
+                            disabled={actionLoading}
+                            className="px-3 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 font-bold text-xs rounded transition-colors shadow-xs flex items-center gap-1 active:scale-95 disabled:opacity-50"
+                            title="Approve all non-approved / pending services in 1 click"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>Approve All Pending</span>
+                          </button>
+                        )}
+                        {services.some((s) => s.status !== 'rejected') && (
+                          <button
+                            type="button"
+                            onClick={() => handleBulkServiceAction('reject', true)}
+                            disabled={actionLoading}
+                            className="px-3 py-1 bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-300 font-bold text-xs rounded transition-colors shadow-xs flex items-center gap-1 active:scale-95 disabled:opacity-50"
+                            title="Reject all non-approved services in 1 click"
+                          >
+                            <XCircle className="w-3.5 h-3.5 text-rose-600" />
+                            <span>Reject All Pending</span>
+                          </button>
+                        )}
+                      </>
+                    )}
                   </div>
                 </div>
 
-                <div className="border border-slate-200 rounded overflow-hidden">
+                <div className="border border-slate-200 rounded-lg overflow-hidden shadow-xs">
                   <table className="w-full text-left text-xs">
                     <thead className="bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-600 uppercase">
                       <tr>
+                        <th className="px-3 py-2.5 w-10 text-center">
+                          <input
+                            type="checkbox"
+                            checked={services.length > 0 && selectedServiceIds.size === services.length}
+                            onChange={() => handleToggleSelectAllServices(services)}
+                            className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                            title={selectedServiceIds.size === services.length ? 'Deselect All' : 'Select All'}
+                          />
+                        </th>
                         <th className="px-4 py-2.5">Service Name</th>
                         <th className="px-4 py-2.5">Category ID</th>
                         <th className="px-4 py-2.5">Authorization Status</th>
@@ -427,9 +609,18 @@ export function AdminApplicationDetailPage() {
                         services.map((svc) => {
                           const isApproved = svc.status === 'approved';
                           const isRejected = svc.status === 'rejected';
+                          const isChecked = selectedServiceIds.has(String(svc.id));
 
                           return (
-                            <tr key={svc.id} className="hover:bg-slate-50/50">
+                            <tr key={svc.id} className={`transition-colors ${isChecked ? 'bg-blue-50/50' : 'hover:bg-slate-50/50'}`}>
+                              <td className="px-3 py-2.5 text-center">
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={() => handleToggleSelectService(svc.id)}
+                                  className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                                />
+                              </td>
                               <td className="px-4 py-2.5 font-bold text-slate-800">{svc.name}</td>
                               <td className="px-4 py-2.5 font-mono text-slate-500 text-[11px]">{svc.id}</td>
                               <td className="px-4 py-2.5">
@@ -443,7 +634,7 @@ export function AdminApplicationDetailPage() {
                                   className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
                                     isApproved
                                       ? 'bg-emerald-100 text-emerald-800 opacity-60 cursor-default'
-                                      : 'border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-emerald-900'
+                                      : 'border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 shadow-2xs active:scale-95'
                                   }`}
                                 >
                                   Approve
@@ -455,7 +646,7 @@ export function AdminApplicationDetailPage() {
                                   className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
                                     isRejected
                                       ? 'bg-rose-100 text-rose-800 opacity-60 cursor-default'
-                                      : 'border border-rose-300 bg-rose-50 hover:bg-rose-100 text-rose-900'
+                                      : 'border border-rose-300 bg-rose-50 hover:bg-rose-100 text-rose-900 shadow-2xs active:scale-95'
                                   }`}
                                 >
                                   Reject
@@ -466,7 +657,7 @@ export function AdminApplicationDetailPage() {
                         })
                       ) : (
                         <tr>
-                          <td colSpan={4} className="px-4 py-8 text-center text-slate-500">
+                          <td colSpan={5} className="px-4 py-8 text-center text-slate-500">
                             No requested services in this application dossier.
                           </td>
                         </tr>
@@ -480,14 +671,86 @@ export function AdminApplicationDetailPage() {
             {/* ── TAB 4: DOCUMENTS VERIFICATION ── */}
             {activeTab === 'documents' && (
               <div className="space-y-3">
-                <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                  Uploaded Identification & Compliance Files
-                </h3>
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-slate-50 border border-slate-200 rounded-lg p-3">
+                  <div>
+                    <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                      Uploaded Identification & Compliance Files
+                    </h3>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      Verify mandatory government IDs, address proof, and bank credentials.
+                    </p>
+                  </div>
 
-                <div className="border border-slate-200 rounded overflow-hidden">
+                  {/* Bulk Action Controls Bar for Documents */}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {selectedDocKeys.size > 0 ? (
+                      <>
+                        <span className="text-xs font-bold text-blue-700 bg-blue-50 border border-blue-200 px-2.5 py-1 rounded">
+                          {selectedDocKeys.size} Selected
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleBulkDocumentAction('approve')}
+                          disabled={actionLoading}
+                          className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded transition-colors shadow-xs flex items-center gap-1 active:scale-95 disabled:opacity-50"
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Approve Selected ({selectedDocKeys.size})</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleBulkDocumentAction('reject')}
+                          disabled={actionLoading}
+                          className="px-3 py-1 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded transition-colors shadow-xs flex items-center gap-1 active:scale-95 disabled:opacity-50"
+                        >
+                          <XCircle className="w-3.5 h-3.5" />
+                          <span>Reject Selected ({selectedDocKeys.size})</span>
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        {Object.values(docs).some((d) => d.status !== 'approved') && (
+                          <button
+                            type="button"
+                            onClick={() => handleBulkDocumentAction('approve', true)}
+                            disabled={actionLoading}
+                            className="px-3 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 font-bold text-xs rounded transition-colors shadow-xs flex items-center gap-1 active:scale-95 disabled:opacity-50"
+                            title="Approve all non-approved / uploaded documents in 1 click"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>Approve All Pending</span>
+                          </button>
+                        )}
+                        {Object.values(docs).some((d) => d.status !== 'rejected') && (
+                          <button
+                            type="button"
+                            onClick={() => handleBulkDocumentAction('reject', true)}
+                            disabled={actionLoading}
+                            className="px-3 py-1 bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-300 font-bold text-xs rounded transition-colors shadow-xs flex items-center gap-1 active:scale-95 disabled:opacity-50"
+                            title="Reject all non-approved documents in 1 click"
+                          >
+                            <XCircle className="w-3.5 h-3.5 text-rose-600" />
+                            <span>Reject All Pending</span>
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                <div className="border border-slate-200 rounded-lg overflow-hidden shadow-xs">
                   <table className="w-full text-left text-xs">
                     <thead className="bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-600 uppercase">
                       <tr>
+                        <th className="px-3 py-2.5 w-10 text-center">
+                          <input
+                            type="checkbox"
+                            checked={Object.keys(docs).length > 0 && selectedDocKeys.size === Object.keys(docs).length}
+                            onChange={() => handleToggleSelectAllDocs(Object.keys(docs))}
+                            className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                            title={selectedDocKeys.size === Object.keys(docs).length ? 'Deselect All' : 'Select All'}
+                          />
+                        </th>
                         <th className="px-4 py-2.5">Document Type</th>
                         <th className="px-4 py-2.5">Status</th>
                         <th className="px-4 py-2.5">Review Flag / Reason</th>
@@ -495,68 +758,85 @@ export function AdminApplicationDetailPage() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {Object.entries(docs).map(([key, doc]) => {
-                        const isApproved = doc.status === 'approved';
-                        const isRejected = doc.status === 'rejected';
+                      {Object.entries(docs).length > 0 ? (
+                        Object.entries(docs).map(([key, doc]) => {
+                          const isApproved = doc.status === 'approved';
+                          const isRejected = doc.status === 'rejected';
+                          const isChecked = selectedDocKeys.has(String(key));
 
-                        return (
-                          <tr key={key} className="hover:bg-slate-50/50">
-                            <td className="px-4 py-3 font-semibold text-slate-900">
-                              <div className="flex items-center gap-2">
-                                <FileText className="w-4 h-4 text-slate-500" />
-                                <span>{doc.title || key}</span>
-                              </div>
-                            </td>
-                            <td className="px-4 py-3">
-                              <StatusBadge status={doc.status} />
-                            </td>
-                            <td className="px-4 py-3 text-slate-600">
-                              {doc.rejection_reason ? (
-                                <span className="text-rose-600 font-semibold">{doc.rejection_reason}</span>
-                              ) : (
-                                <span className="text-slate-400">—</span>
-                              )}
-                            </td>
-                            <td className="px-4 py-3 text-right space-x-1.5">
-                              {doc.file_url && (
-                                <a
-                                  href={doc.file_url}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 font-semibold text-xs inline-flex items-center gap-1 transition-colors"
+                          return (
+                            <tr key={key} className={`transition-colors ${isChecked ? 'bg-blue-50/50' : 'hover:bg-slate-50/50'}`}>
+                              <td className="px-3 py-3 text-center">
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={() => handleToggleSelectDoc(key)}
+                                  className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                                />
+                              </td>
+                              <td className="px-4 py-3 font-semibold text-slate-900">
+                                <div className="flex items-center gap-2">
+                                  <FileText className="w-4 h-4 text-slate-500" />
+                                  <span>{doc.title || key}</span>
+                                </div>
+                              </td>
+                              <td className="px-4 py-3">
+                                <StatusBadge status={doc.status} />
+                              </td>
+                              <td className="px-4 py-3 text-slate-600">
+                                {doc.rejection_reason ? (
+                                  <span className="text-rose-600 font-semibold">{doc.rejection_reason}</span>
+                                ) : (
+                                  <span className="text-slate-400">—</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-3 text-right space-x-1.5">
+                                {doc.file_url && (
+                                  <a
+                                    href={doc.file_url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 font-semibold text-xs inline-flex items-center gap-1 transition-colors"
+                                  >
+                                    <span>View File</span>
+                                    <ExternalLink className="w-3 h-3 text-slate-400" />
+                                  </a>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleDocAction(key, 'approve')}
+                                  disabled={actionLoading || isApproved}
+                                  className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
+                                    isApproved
+                                      ? 'bg-emerald-100 text-emerald-800 opacity-60 cursor-default'
+                                      : 'border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 shadow-2xs active:scale-95'
+                                  }`}
                                 >
-                                  <span>View File</span>
-                                  <ExternalLink className="w-3 h-3" />
-                                </a>
-                              )}
-                              <button
-                                type="button"
-                                onClick={() => handleDocAction(key, 'approve')}
-                                disabled={actionLoading || isApproved}
-                                className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
-                                  isApproved
-                                    ? 'bg-emerald-100 text-emerald-800 opacity-60 cursor-default'
-                                    : 'border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-emerald-900'
-                                }`}
-                              >
-                                Verify
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleDocAction(key, 'reject')}
-                                disabled={actionLoading || isRejected}
-                                className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
-                                  isRejected
-                                    ? 'bg-rose-100 text-rose-800 opacity-60 cursor-default'
-                                    : 'border border-rose-300 bg-rose-50 hover:bg-rose-100 text-rose-900'
-                                }`}
-                              >
-                                Reject
-                              </button>
-                            </td>
-                          </tr>
-                        );
-                      })}
+                                  Approve
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDocAction(key, 'reject')}
+                                  disabled={actionLoading || isRejected}
+                                  className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
+                                    isRejected
+                                      ? 'bg-rose-100 text-rose-800 opacity-60 cursor-default'
+                                      : 'border border-rose-300 bg-rose-50 hover:bg-rose-100 text-rose-900 shadow-2xs active:scale-95'
+                                  }`}
+                                >
+                                  Reject
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      ) : (
+                        <tr>
+                          <td colSpan={5} className="px-4 py-8 text-center text-slate-500">
+                            No documents uploaded in this application dossier.
+                          </td>
+                        </tr>
+                      )}
                     </tbody>
                   </table>
                 </div>

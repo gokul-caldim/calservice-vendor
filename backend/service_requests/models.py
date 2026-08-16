@@ -190,8 +190,8 @@ class ServiceRequest(models.Model):
 
         if is_new and self.status in ["new_request", "confirmed", "draft"]:
             try:
-                from workforce_api.views import run_automatic_dispatch
-                run_automatic_dispatch(self)
+                from workforce_api.services.automatic_dispatch import dispatch_job
+                dispatch_job(self)
             except Exception:
                 pass
 
@@ -251,6 +251,20 @@ class ServiceRequest(models.Model):
                 msg = f"Secondary specialist job #{ext.specialist_job.id} (Extension #{ext.id}) is still in '{ext.specialist_job.status}' state."
                 if msg not in pending_dependencies:
                     pending_dependencies.append(msg)
+
+        # 4. Check payment state machine: If cash collection is pending, job cannot close
+        try:
+            from workforce_api.models import JobPayment
+            pmt = getattr(self, "payment_record", None) or JobPayment.objects.filter(job=self).first()
+            if pmt:
+                if pmt.payment_status == JobPayment.PaymentStatus.CASH_PENDING:
+                    pending_dependencies.append("Cash payment collection has been reported but is awaiting customer confirmation.")
+                elif pmt.payment_status == JobPayment.PaymentStatus.PENDING and pmt.payment_method == JobPayment.PaymentMethod.CASH_ON_SERVICE:
+                    pending_dependencies.append("Cash on service payment collection is required before closing job.")
+                elif pmt.payment_status not in [JobPayment.PaymentStatus.PAID, "PAID", "paid"]:
+                    pending_dependencies.append(f"Payment is in '{pmt.payment_status}' state (must be PAID before closing job).")
+        except Exception:
+            pass
 
         is_ready = len(pending_dependencies) == 0
         reason = "Ready for completion." if is_ready else f"Cannot complete ServiceRequest: {'; '.join(pending_dependencies)}"

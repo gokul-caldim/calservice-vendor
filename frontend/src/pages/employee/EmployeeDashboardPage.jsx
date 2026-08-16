@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useLocation } from 'react-router-dom';
 import { useAuth } from '../../context/AuthProvider.jsx';
 import {
@@ -7,6 +7,8 @@ import {
   apiGetOnboardingProfile,
   apiUploadJobProof,
   apiCollectJobCash,
+  apiVerifyPaymentOTP,
+  apiGetJobPayment,
   apiRequestWorkExtension,
   apiCustomerDecideExtension,
   apiProgressExtension,
@@ -21,23 +23,25 @@ import {
   apiGetMySkills,
   apiAcceptJobOffer,
   apiRejectJobOffer,
-  apiVerifyArrival,
   apiVerifyOTP,
+  apiResendOTP,
   apiUploadPreServicePhoto,
   apiGetPreServiceStatus,
   apiGetCatalog,
   apiRequestService,
   apiRemoveService,
+  apiVerifyArrival,
 } from '../../api/workforceService.js';
 import { apiClockIn } from '../../api/clockInApi.js';
 import { ClockInCard } from '../../components/employee/ClockInCard.jsx';
+import { JobTrackingMap } from '../../components/employee/JobTrackingMap.jsx';
 
 import { AppShell } from '../../components/common/AppShell.jsx';
 import { StatusBadge } from '../../components/enterprise/StatusBadge.jsx';
 import { Modal } from '../../components/enterprise/Modal.jsx';
 import { ErrorState } from '../../components/enterprise/ErrorState.jsx';
-import { LoadingState } from '../../components/enterprise/LoadingState.jsx';
-import { useLocationTracker } from '../../hooks/useGPSPosition.js';
+import { LiveCameraCaptureModal } from '../../components/common/LiveCameraCaptureModal.jsx';
+import { useLocationTracker, getGPSPosition } from '../../hooks/useGPSPosition.js';
 import { apiUpdateLocationFull } from '../../api/workforceService.js';
 import {
   Wrench,
@@ -57,7 +61,6 @@ import {
   Upload,
   PlusCircle,
   ShoppingBag,
-  Coffee,
   Sun,
   Moon,
   Send,
@@ -65,6 +68,10 @@ import {
   Award,
   FileText,
   Settings as SettingsIcon,
+  Sparkles,
+  Compass,
+  Briefcase,
+  RefreshCw,
 } from 'lucide-react';
 
 export function EmployeeDashboardPage() {
@@ -74,6 +81,8 @@ export function EmployeeDashboardPage() {
   const hash = location.hash;
 
   const [jobs, setJobs] = useState([]);
+  const [allJobs, setAllJobs] = useState([]);
+  const [jobQueueTab, setJobQueueTab] = useState('active'); // 'active' | 'completed' | 'all'
   const [profile, setProfile] = useState(null);
   const [timeTracking, setTimeTracking] = useState(null);
   const [schedules, setSchedules] = useState([]);
@@ -82,32 +91,49 @@ export function EmployeeDashboardPage() {
   const [complianceRecords, setComplianceRecords] = useState([]);
   const [skills, setSkills] = useState([]);
 
+  // Decline Offer Modal State
+  const [declineModalJob, setDeclineModalJob] = useState(null);
+  const [selectedDeclineReason, setSelectedDeclineReason] = useState('Too far');
+  const [customDeclineReason, setCustomDeclineReason] = useState('');
+  const [isDecliningOffer, setIsDecliningOffer] = useState(false);
+
+  const incomingOffers = allJobs.filter(
+    (j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired
+  );
+  const activeJobs = allJobs.filter(
+    (j) => !['completed', 'cancelled'].includes((j.status || '').toLowerCase()) && j.active_offer?.status !== 'OFFERED'
+  );
+  const completedJobs = allJobs.filter((j) => (j.status || '').toLowerCase() === 'completed');
+  const displayedJobs = jobQueueTab === 'completed' ? completedJobs : (jobQueueTab === 'all' ? allJobs : activeJobs);
+
   const isOnline = Boolean(user?.isOnline || employee?.is_online);
   const isClockedIn = Boolean(timeTracking?.is_clocked_in);
   const isBreak = timeTracking?.shift_status === 'on_break';
 
-  // ── Live GPS Tracking ────────────────────────────────────────────────────────
-  // Start tracking when employee is ONLINE, stop when OFFLINE.
-  // Pushes real browser GPS to /workforce/presence/location/ (User.last_known_location).
-  // No mock coordinates. Errors are silent — GPS denial does not block the dashboard.
-  const handleGPSPosition = useCallback(
-    async ({ latitude, longitude, accuracy }) => {
-      try {
-        await apiUpdateLocationFull(latitude, longitude, accuracy);
-      } catch (_) {
-        // Silent — GPS update failure should not disrupt the employee dashboard UI
-      }
-    },
-    [],
+  const [currentLocation, setCurrentLocation] = useState(
+    user?.last_known_location || employee?.user?.last_known_location || null
   );
-
-  useLocationTracker(isOnline, handleGPSPosition);
-  // ────────────────────────────────────────────────────────────────────────────
+  const [gpsErrorState, setGpsErrorState] = useState(null);
 
   const [isLoading, setIsLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(null);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+
+  // Auto-dismiss error and success notification banners after 4.5 seconds
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => setError(''), 4500);
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
+
+  useEffect(() => {
+    if (successMsg) {
+      const timer = setTimeout(() => setSuccessMsg(''), 4500);
+      return () => clearTimeout(timer);
+    }
+  }, [successMsg]);
 
   // Selected job for detailed inspection workspace
   const [selectedJob, setSelectedJob] = useState(null);
@@ -123,7 +149,63 @@ export function EmployeeDashboardPage() {
   });
   const [otpInput, setOtpInput] = useState('');
 
+  // ── Live GPS Tracking ────────────────────────────────────────────────────────
+  // Single continuous browser GPS watcher managed via useLocationTracker.
+  // Pushes real browser GPS to /workforce/presence/location/ (User.last_known_location).
+  // Stable ref so handleGPSPosition can read selectedJob without being re-created on every job change
+  const selectedJobRef = useRef(null);
+  // loadDashboard ref so GPS callback can call it without stale closure
+  const loadDashboardRef = useRef(null);
 
+  const handleGPSPosition = useCallback(
+    async ({ latitude, longitude, accuracy, speed, heading, captured_at }) => {
+      setGpsErrorState(null);
+      const newLoc = {
+        latitude,
+        longitude,
+        accuracy,
+        speed,
+        heading,
+        captured_at,
+        updated_at: new Date().toISOString(),
+      };
+      setCurrentLocation(newLoc);
+      try {
+        const res = await apiUpdateLocationFull(latitude, longitude, accuracy, speed, heading, captured_at);
+        // Check if automatic arrival was triggered by this GPS fix
+        const currentJob = selectedJobRef.current;
+        if (res?.arrived_events?.length > 0 && currentJob) {
+          const thisArrived = res.arrived_events.find((e) => e.job_id === currentJob.id);
+          if (thisArrived) {
+            setPreServiceState((prev) => ({ ...prev, geofence_passed: true }));
+            setSelectedJob((prev) => (prev ? { ...prev, status: 'arrived' } : prev));
+            setSuccessMsg('Arrival Verified Automatically! Customer Work Start OTP is ready.');
+            if (loadDashboardRef.current) loadDashboardRef.current();
+          }
+        }
+      } catch (_) {
+        // Silent — GPS update failure should not disrupt the employee dashboard UI
+      }
+    },
+    // Stable empty deps — reads selectedJob via ref to avoid GPS watcher churn
+    [],
+  );
+
+  const handleGPSError = useCallback((err) => {
+    setGpsErrorState(err);
+  }, []);
+
+  useLocationTracker(isOnline, handleGPSPosition, handleGPSError);
+  // ────────────────────────────────────────────────────────────────────────────────
+
+  // Payment & Cash Collection State
+  const [cashModalJob, setCashModalJob] = useState(null);
+  const [cashAmountReceived, setCashAmountReceived] = useState('');
+  const [isCollectingCash, setIsCollectingCash] = useState(false);
+  const [paymentOtpInput, setPaymentOtpInput] = useState('');
+  const [isVerifyingPaymentOtp, setIsVerifyingPaymentOtp] = useState(false);
+
+  // Fetch pre-service status once on job selection
   useEffect(() => {
     if (selectedJob?.id) {
       apiGetPreServiceStatus(selectedJob.id)
@@ -132,35 +214,27 @@ export function EmployeeDashboardPage() {
     }
   }, [selectedJob?.id]);
 
-  const handleArriveAtLocation = async () => {
-    if (!selectedJob) return;
-    if (!navigator.geolocation) {
-      setError('Browser Geolocation is not supported by your browser.');
+  // Poll pre-service status every 4s while job is active and arrival not yet confirmed
+  useEffect(() => {
+    const activeStatuses = ['accepted', 'on_the_way', 'arrived'];
+    if (
+      !selectedJob?.id ||
+      !activeStatuses.includes((selectedJob.status || '').toLowerCase()) ||
+      preServiceState.geofence_passed
+    ) {
       return;
     }
-
-    setActionLoading(selectedJob.id);
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        try {
-          const res = await apiVerifyArrival(selectedJob.id, pos.coords.latitude, pos.coords.longitude);
-          setSuccessMsg(res.message || 'Arrival verified!');
-          setPreServiceState((prev) => ({ ...prev, geofence_passed: true }));
-          await loadDashboard();
-          setTimeout(() => setSuccessMsg(''), 4000);
-        } catch (err) {
-          setError(err.message || 'Arrival geofence verification failed.');
-        } finally {
-          setActionLoading(null);
+    const interval = setInterval(async () => {
+      try {
+        const res = await apiGetPreServiceStatus(selectedJob.id);
+        if (res?.geofence_passed) {
+          setPreServiceState(res);
+          setSelectedJob((prev) => (prev ? { ...prev, status: 'arrived' } : prev));
         }
-      },
-      (err) => {
-        setError(`GPS error: ${err.message}`);
-        setActionLoading(null);
-      },
-      { enableHighAccuracy: true, timeout: 10000 }
-    );
-  };
+      } catch (_) {}
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [selectedJob?.id, selectedJob?.status, preServiceState.geofence_passed]);
 
   const handleVerifyOtpSubmit = async () => {
     if (!selectedJob || !otpInput.trim()) return;
@@ -169,9 +243,24 @@ export function EmployeeDashboardPage() {
       const res = await apiVerifyOTP(selectedJob.id, otpInput.trim());
       setSuccessMsg(res.message || 'Customer OTP verified!');
       setPreServiceState((prev) => ({ ...prev, otp_verified: true, is_complete: res.is_complete }));
+      await loadDashboard();
       setTimeout(() => setSuccessMsg(''), 4000);
     } catch (err) {
       setError(err.message || 'Invalid Customer OTP code.');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleResendOtp = async () => {
+    if (!selectedJob) return;
+    try {
+      setActionLoading(selectedJob.id);
+      const res = await apiResendOTP(selectedJob.id);
+      setSuccessMsg(res.message || 'Fresh OTP generated and sent to customer!');
+      setTimeout(() => setSuccessMsg(''), 4000);
+    } catch (err) {
+      setError(err.message || 'Failed to resend OTP.');
     } finally {
       setActionLoading(null);
     }
@@ -188,6 +277,7 @@ export function EmployeeDashboardPage() {
         [`${photoType}_photo`]: true,
         is_complete: res.is_complete,
       }));
+      await loadDashboard();
       setTimeout(() => setSuccessMsg(''), 4000);
     } catch (err) {
       setError(err.message || 'Photo upload failed.');
@@ -196,39 +286,53 @@ export function EmployeeDashboardPage() {
     }
   };
 
-  const handleDirectJobClockIn = () => {
+  const handleDirectJobClockIn = async () => {
     if (!selectedJob) return;
-    if (!navigator.geolocation) {
-      setError('Browser Geolocation is not supported by your browser.');
-      return;
-    }
     setActionLoading(selectedJob.id);
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        try {
-          const res = await apiClockIn({
-            lat: pos.coords.latitude,
-            lon: pos.coords.longitude,
-            accuracy: pos.coords.accuracy,
-            timestamp: pos.timestamp || Date.now(),
-            address: selectedJob.address || 'GPS Verified Customer Location',
-          });
-          setSuccessMsg(res.message || 'Clocked in successfully! Job is now IN PROGRESS.');
-          await loadDashboard();
-          setSelectedJob((prev) => (prev ? { ...prev, status: 'in_progress' } : null));
-          setTimeout(() => setSuccessMsg(''), 4000);
-        } catch (err) {
-          setError(err.message || 'Clock-in failed');
-        } finally {
-          setActionLoading(null);
-        }
-      },
-      (err) => {
-        setActionLoading(null);
-        setError(`Location Error: ${err.message || 'GPS location denied or unavailable'}`);
-      },
-      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
-    );
+    setError('');
+    try {
+      const pos = await getGPSPosition(true);
+      const lat = pos?.coords?.latitude ?? pos?.latitude;
+      const lon = pos?.coords?.longitude ?? pos?.longitude;
+      const accuracy = pos?.coords?.accuracy ?? pos?.accuracy;
+      if (lat == null || lon == null) throw new Error('Unable to retrieve GPS coordinates for clock-in.');
+      const res = await apiClockIn({
+        lat,
+        lon,
+        accuracy,
+        timestamp: pos?.timestamp || Date.now(),
+        address: selectedJob.address || 'GPS Verified Customer Location',
+      });
+      setSuccessMsg(res.message || 'Clocked in successfully! Job is now IN PROGRESS.');
+      await loadDashboard();
+      setSelectedJob((prev) => (prev ? { ...prev, status: 'in_progress' } : null));
+      setTimeout(() => setSuccessMsg(''), 4000);
+    } catch (err) {
+      setError(err.message || 'Clock-in failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleManualVerifyArrival = async () => {
+    if (!selectedJob?.id) return;
+    try {
+      setActionLoading(selectedJob.id);
+      setError('');
+      const pos = await getGPSPosition(true);
+      const lat = pos?.coords?.latitude ?? pos?.latitude;
+      const lon = pos?.coords?.longitude ?? pos?.longitude;
+      if (lat == null || lon == null) throw new Error('Unable to retrieve GPS coordinates.');
+      const res = await apiVerifyArrival(selectedJob.id, lat, lon);
+      setSuccessMsg(res.message || 'Arrival verified! Work Start OTP generated for customer.');
+      setPreServiceState((prev) => ({ ...prev, geofence_passed: true }));
+      setSelectedJob((prev) => (prev ? { ...prev, status: 'arrived' } : prev));
+      await loadDashboard();
+    } catch (err) {
+      setError(err.message || 'Failed to verify arrival. Ensure you are within 300m of the job site.');
+    } finally {
+      setActionLoading(null);
+    }
   };
 
   // Modals
@@ -236,12 +340,33 @@ export function EmployeeDashboardPage() {
   const [proofModalJob, setProofModalJob] = useState(null);
   const [beforeFile, setBeforeFile] = useState(null);
   const [afterFile, setAfterFile] = useState(null);
+  const [beforePreviewUrl, setBeforePreviewUrl] = useState(null);
+  const [afterPreviewUrl, setAfterPreviewUrl] = useState(null);
   const [workNotes, setWorkNotes] = useState('');
   const [isUploadingProof, setIsUploadingProof] = useState(false);
 
-  const [cashModalJob, setCashModalJob] = useState(null);
-  const [cashAmount, setCashAmount] = useState('');
-  const [isCollectingCash, setIsCollectingCash] = useState(false);
+  // Live Camera Real-Time Capture State
+  const [cameraModalConfig, setCameraModalConfig] = useState({
+    isOpen: false,
+    title: 'Live Camera Photo Capture',
+    defaultFacingMode: 'environment',
+    fileNamePrefix: 'photo',
+    onCapture: null,
+  });
+
+  const openLiveCamera = (title, defaultFacingMode, fileNamePrefix, onCaptureCallback) => {
+    setCameraModalConfig({
+      isOpen: true,
+      title,
+      defaultFacingMode,
+      fileNamePrefix,
+      onCapture: onCaptureCallback,
+    });
+  };
+
+  const closeLiveCamera = () => {
+    setCameraModalConfig((prev) => ({ ...prev, isOpen: false, onCapture: null }));
+  };
 
   const [extensionModalJob, setExtensionModalJob] = useState(null);
   const [extTitle, setExtTitle] = useState('');
@@ -272,15 +397,37 @@ export function EmployeeDashboardPage() {
     try {
       setIsLoading(true);
       const [jobsData, timeData, profileData] = await Promise.all([
-        apiGetWorkforceJobs().catch(() => []),
+        apiGetWorkforceJobs('all').catch(() => []),
         apiGetTimeTracking().catch(() => null),
         apiGetOnboardingProfile().catch(() => null),
       ]);
-      setJobs(jobsData || []);
+      const safeJobs = jobsData || [];
+      setAllJobs(safeJobs);
+      setJobs(safeJobs);
       setProfile(profileData || employee);
       setTimeTracking(timeData);
-      if (jobsData && jobsData.length > 0 && !selectedJob) {
-        setSelectedJob(jobsData[0]);
+
+      const active = safeJobs.filter((j) => !['completed', 'cancelled'].includes((j.status || '').toLowerCase()));
+      const completed = safeJobs.filter((j) => (j.status || '').toLowerCase() === 'completed');
+
+      if (jobQueueTab === 'completed') {
+        if (completed.length > 0) {
+          setSelectedJob((prev) => (prev ? completed.find((j) => j.id === prev.id) || completed[0] : completed[0]));
+        } else {
+          setSelectedJob(null);
+        }
+      } else if (jobQueueTab === 'active') {
+        if (active.length > 0) {
+          setSelectedJob((prev) => (prev ? active.find((j) => j.id === prev.id) || active[0] : active[0]));
+        } else {
+          setSelectedJob(null);
+        }
+      } else {
+        if (safeJobs.length > 0) {
+          setSelectedJob((prev) => (prev ? safeJobs.find((j) => j.id === prev.id) || safeJobs[0] : safeJobs[0]));
+        } else {
+          setSelectedJob(null);
+        }
       }
     } catch (_) {
     } finally {
@@ -290,7 +437,16 @@ export function EmployeeDashboardPage() {
 
   useEffect(() => {
     loadDashboard();
-  }, []);
+  }, [jobQueueTab]);
+
+  // Keep refs in sync so GPS callback can read fresh values without recreating the callback
+  useEffect(() => {
+    selectedJobRef.current = selectedJob;
+  }, [selectedJob]);
+
+  useEffect(() => {
+    loadDashboardRef.current = loadDashboard;
+  });
 
   // Request browser notification permission when employee is online
   useEffect(() => {
@@ -299,22 +455,71 @@ export function EmployeeDashboardPage() {
     }
   }, [isOnline]);
 
-  // Silent background job queue polling when technician is ONLINE
+  // Listen for real-time location update events (from TopHeader or ClockInCard) to refresh job queue
+  useEffect(() => {
+    const handleLocationUpdate = () => {
+      loadDashboard();
+    };
+    window.addEventListener('workforce:location-updated', handleLocationUpdate);
+    return () => window.removeEventListener('workforce:location-updated', handleLocationUpdate);
+  }, []);
+
+  // Realtime Event Stream Integration (SSE): instantaneous job offer delivery
+  useEffect(() => {
+    if (!isOnline) return;
+    let eventSource = null;
+    try {
+      const token = localStorage.getItem('token') || localStorage.getItem('access_token') || sessionStorage.getItem('token') || '';
+      const streamUrl = token ? `/api/workforce/realtime/stream/?token=${encodeURIComponent(token)}` : '/api/workforce/realtime/stream/';
+      eventSource = new EventSource(streamUrl);
+      eventSource.addEventListener('workforce_event', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (['OFFER_CREATED', 'JOB_OFFER', 'JOB_ASSIGNED', 'ARRIVAL_DETECTED'].includes(data.event_type)) {
+            loadDashboard();
+          }
+        } catch (_) {}
+      });
+      eventSource.onerror = () => {
+        if (eventSource) eventSource.close();
+      };
+    } catch (_) {}
+
+    return () => {
+      if (eventSource) eventSource.close();
+    };
+  }, [isOnline, loadDashboard]);
+
+  // Silent background job queue safety-net polling when technician is ONLINE (12s interval)
   useEffect(() => {
     if (!isOnline) return;
     const interval = setInterval(async () => {
       try {
-        const jobsData = await apiGetWorkforceJobs().catch(() => null);
+        const jobsData = await apiGetWorkforceJobs('all').catch(() => null);
         if (jobsData) {
+          setAllJobs(jobsData);
           setJobs(jobsData);
+          const active = jobsData.filter(
+            (j) => !['completed', 'cancelled'].includes((j.status || '').toLowerCase()) && j.active_offer?.status !== 'OFFERED'
+          );
+          const completed = jobsData.filter((j) => (j.status || '').toLowerCase() === 'completed');
+
+          if (jobQueueTab === 'active') {
+            if (active.length === 0) setSelectedJob(null);
+            else setSelectedJob((prev) => (prev ? active.find((j) => j.id === prev.id) || active[0] : active[0]));
+          } else if (jobQueueTab === 'completed') {
+            if (completed.length === 0) setSelectedJob(null);
+            else setSelectedJob((prev) => (prev ? completed.find((j) => j.id === prev.id) || completed[0] : completed[0]));
+          }
+
           // If a new offer is available, auto-focus it in the workspace
-          const offeredJob = jobsData.find((j) => j.offer_status === 'OFFERED');
+          const offeredJob = jobsData.find((j) => j.active_offer?.status === 'OFFERED' || j.offer_status === 'OFFERED');
           if (offeredJob) {
-            setSelectedJob((prev) => (!prev || prev.offer_status !== 'OFFERED' ? offeredJob : prev));
+            setSelectedJob((prev) => (!prev || (prev.active_offer?.status !== 'OFFERED' && prev.offer_status !== 'OFFERED') ? offeredJob : prev));
             if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
               try {
-                new Notification('⚡ New Job Offer Available!', {
-                  body: `Job #${offeredJob.request_id || offeredJob.id}: ${offeredJob.issue_title || offeredJob.service_category}. Accept within 5 minutes.`,
+                new Notification('⚡ New Exclusive Job Offer!', {
+                  body: `Job #${offeredJob.request_id || offeredJob.id}: ${offeredJob.service_title || offeredJob.service_category}. Accept within 5 minutes.`,
                   icon: '/favicon.ico',
                 });
               } catch (_) {}
@@ -324,7 +529,7 @@ export function EmployeeDashboardPage() {
       } catch (_) {}
     }, 10000);
     return () => clearInterval(interval);
-  }, [isOnline]);
+  }, [isOnline, jobQueueTab]);
 
 
 
@@ -416,6 +621,10 @@ export function EmployeeDashboardPage() {
       setProofModalJob(null);
       setBeforeFile(null);
       setAfterFile(null);
+      if (beforePreviewUrl) URL.revokeObjectURL(beforePreviewUrl);
+      if (afterPreviewUrl) URL.revokeObjectURL(afterPreviewUrl);
+      setBeforePreviewUrl(null);
+      setAfterPreviewUrl(null);
       setWorkNotes('');
       setSuccessMsg('After-service proof submitted! Job is COMPLETED.');
       await loadDashboard();
@@ -428,21 +637,39 @@ export function EmployeeDashboardPage() {
   };
 
   const handleCashCollectSubmit = async (e) => {
-    e.preventDefault();
+    if (e) e.preventDefault();
     if (!cashModalJob) return;
 
     try {
       setIsCollectingCash(true);
-      await apiCollectJobCash(cashModalJob.id, parseFloat(cashAmount) || 0);
+      const res = await apiCollectJobCash(cashModalJob.id, parseFloat(cashAmountReceived) || 0);
       setCashModalJob(null);
-      setCashAmount('');
-      setSuccessMsg('Cash collection recorded & verified!');
+      setCashAmountReceived('');
+      setSuccessMsg(res.message || 'Cash collection recorded! Awaiting customer confirmation.');
       await loadDashboard();
       setTimeout(() => setSuccessMsg(''), 4000);
     } catch (err) {
       setError(err.message || 'Cash collection failed.');
     } finally {
       setIsCollectingCash(false);
+    }
+  };
+
+  const handleVerifyPaymentOtpSubmit = async (e) => {
+    if (e) e.preventDefault();
+    if (!selectedJob || !paymentOtpInput.trim()) return;
+
+    try {
+      setIsVerifyingPaymentOtp(true);
+      const res = await apiVerifyPaymentOTP(selectedJob.id, paymentOtpInput.trim());
+      setSuccessMsg(res.message || 'Payment successfully verified via Customer OTP!');
+      setPaymentOtpInput('');
+      await loadDashboard();
+      setTimeout(() => setSuccessMsg(''), 4000);
+    } catch (err) {
+      setError(err.message || 'Payment OTP verification failed.');
+    } finally {
+      setIsVerifyingPaymentOtp(false);
     }
   };
 
@@ -460,17 +687,32 @@ export function EmployeeDashboardPage() {
     }
   };
 
-  const handleRejectOffer = async (jobId) => {
+  const handleRejectOffer = (jobId) => {
+    const target = allJobs.find((j) => j.id === jobId) || selectedJob;
+    setDeclineModalJob(target || { id: jobId });
+    setSelectedDeclineReason('Too far');
+    setCustomDeclineReason('');
+  };
+
+  const handleConfirmDeclineOffer = async (e) => {
+    if (e) e.preventDefault();
+    if (!declineModalJob) return;
+    const finalReason = selectedDeclineReason === 'Other'
+      ? (customDeclineReason.trim() || 'Other reason')
+      : selectedDeclineReason;
+
     try {
-      const reason = prompt('Enter reason for declining job offer:') || 'Technician unavailable';
-      setActionLoading(jobId);
-      await apiRejectJobOffer(jobId, reason);
+      setIsDecliningOffer(true);
+      setActionLoading(declineModalJob.id);
+      await apiRejectJobOffer(declineModalJob.id, finalReason);
+      setDeclineModalJob(null);
       setSuccessMsg('Job offer declined.');
       await loadDashboard();
       setTimeout(() => setSuccessMsg(''), 4000);
     } catch (err) {
       setError(err.message || 'Failed to decline job offer.');
     } finally {
+      setIsDecliningOffer(false);
       setActionLoading(null);
     }
   };
@@ -657,7 +899,15 @@ export function EmployeeDashboardPage() {
           !pathname.includes('/documents') &&
           !pathname.includes('/services') &&
           !pathname.includes('/settings') && (
-            <ClockInCard onStatusChange={loadDashboard} />
+            <ClockInCard
+              onStatusChange={loadDashboard}
+              activeJob={jobs.find((j) => ['accepted', 'on_the_way', 'arrived', 'in_progress'].includes((j.status || '').toLowerCase()))}
+              hasActiveJob={jobs.some((j) => ['accepted', 'on_the_way', 'arrived', 'in_progress'].includes((j.status || '').toLowerCase()))}
+              isOnline={isOnline}
+              currentLocation={currentLocation}
+              onLocationUpdate={handleGPSPosition}
+              gpsError={gpsErrorState}
+            />
           )}
 
         {/* Notifications */}
@@ -1122,6 +1372,88 @@ export function EmployeeDashboardPage() {
           !pathname.includes('/services') &&
           !pathname.includes('/settings') && (
             <>
+              {/* ⚡ Dedicated Incoming Job Offers Section */}
+              {incomingOffers.length > 0 && (
+                <div className="space-y-2 bg-amber-50 border-2 border-amber-400 rounded p-4 shadow-md">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="relative flex h-3 w-3">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
+                      </span>
+                      <h2 className="text-xs font-bold text-amber-950 uppercase tracking-wider flex items-center gap-1.5">
+                        <Sparkles className="w-4 h-4 text-amber-600" />
+                        Exclusive Job Offer Available ({incomingOffers.length})
+                      </h2>
+                    </div>
+                    <span className="text-[11px] font-bold text-amber-900 bg-amber-200/80 px-2 py-0.5 rounded">
+                      Action Required
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                    {incomingOffers.map((offerJob) => {
+                      const offer = offerJob.active_offer;
+                      return (
+                        <div
+                          key={offerJob.id}
+                          className="bg-white border border-amber-300 rounded p-3.5 shadow-sm space-y-2.5"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                                {offerJob.request_id || `SR-${offerJob.id}`}
+                              </span>
+                              <h3 className="text-sm font-bold text-slate-900 mt-1">
+                                {offerJob.service_title || offerJob.service_category}
+                              </h3>
+                            </div>
+                            {offerJob.distance_km != null && (
+                              <span className="font-mono text-xs font-bold text-emerald-800 bg-emerald-50 px-2 py-1 rounded border border-emerald-200 shrink-0">
+                                📍 {offerJob.distance_km.toFixed(1)} km away
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="text-xs text-slate-600 bg-slate-50 p-2 rounded border border-slate-100 space-y-1">
+                            <p className="flex items-center gap-1.5 truncate">
+                              <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                              <span className="truncate">{offerJob.address || 'Customer site address provided upon acceptance'}</span>
+                            </p>
+                            {offer?.expires_at && (
+                              <p className="flex items-center gap-1.5 text-rose-700 font-semibold text-[11px]">
+                                <Clock className="w-3.5 h-3.5 shrink-0" />
+                                <span>Expires: {new Date(offer.expires_at).toLocaleTimeString()}</span>
+                              </p>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-2 pt-1">
+                            <button
+                              type="button"
+                              onClick={() => handleAcceptOffer(offerJob.id)}
+                              disabled={actionLoading === offerJob.id}
+                              className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                            >
+                              <CheckCircle2 className="w-4 h-4" />
+                              <span>{actionLoading === offerJob.id ? 'Accepting...' : 'ACCEPT JOB'}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRejectOffer(offerJob.id)}
+                              disabled={actionLoading === offerJob.id}
+                              className="px-3.5 py-2 bg-white hover:bg-rose-50 text-rose-700 border border-rose-300 font-bold rounded text-xs transition-colors cursor-pointer disabled:opacity-50"
+                            >
+                              DECLINE
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               {/* Authorized Services Strip */}
               <div className="bg-white border border-slate-200 rounded p-3 shadow-sm">
                 <div className="flex items-center justify-between mb-2">
@@ -1153,23 +1485,73 @@ export function EmployeeDashboardPage() {
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
                 {/* Left Column: Assigned Jobs List (5 cols) */}
                 <div className="lg:col-span-5 border border-slate-200 bg-white rounded overflow-hidden shadow-sm flex flex-col">
-                  <div className="bg-slate-50 px-3.5 py-2.5 border-b border-slate-200 flex items-center justify-between">
-                    <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
-                      <Clock className="w-3.5 h-3.5 text-blue-600" />
-                      Active Jobs Queue ({jobs.length})
-                    </h2>
-                    <button
-                      type="button"
-                      onClick={loadDashboard}
-                      className="text-[11px] font-semibold text-blue-600 hover:underline"
-                    >
-                      Refresh
-                    </button>
+                  <div className="bg-slate-50 px-3.5 py-2.5 border-b border-slate-200 flex flex-col gap-2">
+                    <div className="flex items-center justify-between">
+                      <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                        <Briefcase className="w-3.5 h-3.5 text-blue-600" />
+                        Jobs Queue ({displayedJobs.length})
+                      </h2>
+                      <button
+                        type="button"
+                        onClick={loadDashboard}
+                        className="text-[11px] font-semibold text-blue-600 hover:underline cursor-pointer"
+                      >
+                        Refresh
+                      </button>
+                    </div>
+
+                    {/* Filter Tabs: Active / Completed / All */}
+                    <div className="flex items-center gap-1 bg-slate-200/70 p-0.5 rounded text-[11px] font-bold">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setJobQueueTab('active');
+                          if (activeJobs.length > 0) setSelectedJob(activeJobs[0]);
+                          else setSelectedJob(null);
+                        }}
+                        className={`flex-1 py-1 px-2 rounded text-center transition-all cursor-pointer ${
+                          jobQueueTab === 'active'
+                            ? 'bg-white text-blue-700 shadow-2xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        Active ({activeJobs.length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setJobQueueTab('completed');
+                          if (completedJobs.length > 0) setSelectedJob(completedJobs[0]);
+                          else setSelectedJob(null);
+                        }}
+                        className={`flex-1 py-1 px-2 rounded text-center transition-all cursor-pointer ${
+                          jobQueueTab === 'completed'
+                            ? 'bg-white text-emerald-700 shadow-2xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        Completed ({completedJobs.length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setJobQueueTab('all');
+                          if (allJobs.length > 0) setSelectedJob(allJobs[0]);
+                        }}
+                        className={`py-1 px-2.5 rounded text-center transition-all cursor-pointer ${
+                          jobQueueTab === 'all'
+                            ? 'bg-white text-slate-900 shadow-2xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        All ({allJobs.length})
+                      </button>
+                    </div>
                   </div>
 
                   <div className="divide-y divide-slate-100 max-h-[550px] overflow-y-auto">
-                    {jobs.length > 0 ? (
-                      [...jobs].sort((a, b) => (b.id || 0) - (a.id || 0)).map((job) => {
+                    {displayedJobs.length > 0 ? (
+                      [...displayedJobs].sort((a, b) => (b.id || 0) - (a.id || 0)).map((job) => {
                         const isSelected = selectedJob?.id === job.id;
                         return (
                           <div
@@ -1188,25 +1570,38 @@ export function EmployeeDashboardPage() {
                             <h3 className="text-xs font-bold text-slate-900 truncate">
                               {job.service_title || job.service_category}
                             </h3>
-                            <p className="text-[11px] text-slate-500 truncate mt-0.5 flex items-center gap-1">
-                              <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
-                              <span>{job.address}</span>
-                            </p>
+                            <div className="flex items-center justify-between text-[11px] text-slate-500 mt-0.5 gap-2">
+                              <span className="truncate flex items-center gap-1">
+                                <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
+                                <span className="truncate">{job.address || 'Address provided on acceptance'}</span>
+                              </span>
+                              {job.distance_km != null && (
+                                <span className="shrink-0 font-mono text-[10px] font-bold text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200">
+                                  {job.distance_km.toFixed(1)} km away
+                                </span>
+                              )}
+                            </div>
                             <div className="flex items-center justify-between mt-2 pt-1 border-t border-slate-100 text-[10px] text-slate-500">
                               <span>Date: <strong className="text-slate-800">{job.preferred_date || '—'}</strong></span>
                               <span>{job.preferred_time || ''}</span>
                             </div>
 
                             {(job.active_offer?.status === 'OFFERED' || job.status === 'job_offered') && (
-                              <div className="mt-2.5 p-2.5 rounded bg-amber-50 border border-amber-200 text-amber-900 space-y-1.5">
+                              <div className="mt-2.5 p-2.5 rounded bg-amber-50 border border-amber-200 text-amber-900 space-y-2">
                                 <div className="flex items-center justify-between">
                                   <span className="font-bold text-[10px] text-amber-800 uppercase tracking-wider flex items-center gap-1">
                                     <Sparkles className="w-3 h-3 text-amber-600" />
-                                    <span>JOB OFFER</span>
+                                    <span>EXCLUSIVE JOB OFFER</span>
                                   </span>
-                                  <span className="text-[10px] font-mono text-amber-700">
-                                    {job.preferred_time || '5m Expiry'}
-                                  </span>
+                                  {job.distance_km != null ? (
+                                    <span className="text-[10px] font-mono font-bold text-amber-900 bg-amber-100 px-1.5 py-0.5 rounded border border-amber-300">
+                                      {job.distance_km.toFixed(1)} km away
+                                    </span>
+                                  ) : (
+                                    <span className="text-[10px] font-mono text-amber-700">
+                                      {job.preferred_time || '5m Expiry'}
+                                    </span>
+                                  )}
                                 </div>
                                 <div className="flex items-center gap-1.5 pt-1">
                                   <button
@@ -1232,10 +1627,18 @@ export function EmployeeDashboardPage() {
                         );
                       })
                     ) : (
-                      <div className="p-12 text-center text-xs text-slate-500">
-                        <p className="font-semibold text-slate-700">No assigned jobs in queue.</p>
-                        <p className="mt-1">
-                          {isOnline ? 'Keep status ONLINE to receive automatic job assignments.' : 'Turn status ONLINE to receive bookings.'}
+                      <div className="p-10 text-center text-xs text-slate-500 space-y-1">
+                        <p className="font-semibold text-slate-700">
+                          {jobQueueTab === 'completed' ? 'No completed jobs yet.' : 'No active jobs in queue.'}
+                        </p>
+                        <p className="text-[11px] text-slate-400">
+                          {jobQueueTab === 'completed'
+                            ? 'Jobs you finish and submit proof for will appear here.'
+                            : (incomingOffers.length > 0
+                                ? 'You have incoming job offer(s) above waiting for acceptance.'
+                                : (isOnline
+                                    ? (currentLocation ? '🟢 Online & Eligible. Standby for customer bookings in your area.' : 'Centralized GPS active. Ensure location permission is allowed.')
+                                    : 'Technician is OFFLINE. Switch status to GO ONLINE to receive bookings.'))}
                         </p>
                       </div>
                     )}
@@ -1377,7 +1780,15 @@ export function EmployeeDashboardPage() {
 
 
                           {(selectedJob.status === 'accepted' || selectedJob.status === 'on_the_way' || selectedJob.status === 'arrived') && (
-                            <div className="w-full space-y-3.5 border border-slate-200 rounded-lg p-3.5 bg-slate-50/50 mt-1">
+                            <div id="arrival-verification-checklist" className="w-full space-y-3.5 border border-slate-200 rounded-lg p-3.5 bg-slate-50/50 mt-1 scroll-mt-6">
+                              {/* Interactive Live Customer Location & Navigation Tracking Map */}
+                              <JobTrackingMap
+                                job={selectedJob}
+                                technicianLocation={currentLocation || user?.last_known_location || employee?.user?.last_known_location}
+                                preServiceState={preServiceState}
+                                geofenceRadius={300}
+                              />
+
                               <div className="flex items-center justify-between border-b border-slate-200 pb-2">
                                 <span className="text-[11px] font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
                                   <ShieldCheck className="w-4 h-4 text-blue-600" />
@@ -1388,38 +1799,43 @@ export function EmployeeDashboardPage() {
                                 </span>
                               </div>
 
-                              {/* Step 1: Location Verification */}
-                              <div className="p-3 bg-white border border-slate-200 rounded flex items-center justify-between">
+                              {/* Step 1: Automatic Location Geofence Verification (Zero-Manual-Arrival) */}
+                              <div className="p-3 bg-white border border-slate-200 rounded flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                                 <div>
                                   <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
                                     <MapPin className="w-3.5 h-3.5 text-blue-600" />
-                                    1. Location Verification
+                                    1. Location Verification (Geofence &le;300m)
                                   </h4>
                                   <p className="text-[10px] text-slate-500 mt-0.5">
                                     {preServiceState.geofence_passed
-                                      ? 'Location verified! You are at the authorized service location.'
-                                      : 'Verify your location at the job address.'}
+                                      ? 'Arrival verified automatically! You are inside the authorized 300m customer site geofence.'
+                                      : 'Travel toward customer destination. Backend verifies arrival automatically once inside the 300m geofence with valid consecutive GPS fixes.'}
                                   </p>
                                 </div>
                                 {preServiceState.geofence_passed ? (
-                                  <span className="px-2.5 py-1 bg-emerald-50 text-emerald-700 font-bold rounded text-xs border border-emerald-200 flex items-center gap-1">
+                                  <span className="px-2.5 py-1 bg-emerald-50 text-emerald-700 font-bold rounded text-xs border border-emerald-200 flex items-center gap-1 shrink-0">
                                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                                    LOCATION VERIFIED
+                                    ARRIVAL VERIFIED ✓
                                   </span>
                                 ) : (
-                                  <button
-                                    type="button"
-                                    onClick={handleArriveAtLocation}
-                                    disabled={actionLoading === selectedJob.id}
-                                    className="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs shadow-sm transition-colors"
-                                  >
-                                    {actionLoading === selectedJob.id ? 'Verifying Location...' : 'ARRIVE AT LOCATION'}
-                                  </button>
+                                  <div className="flex flex-col items-end gap-1.5 shrink-0">
+                                    <div className="flex items-center gap-2 px-2.5 py-1 bg-blue-50 text-blue-700 rounded text-xs font-medium border border-blue-200">
+                                      <Compass className="w-3.5 h-3.5 text-blue-600 animate-spin" />
+                                      <span>Auto-Detecting Arrival...</span>
+                                    </div>
+                                    <button
+                                      onClick={handleManualVerifyArrival}
+                                      disabled={actionLoading === selectedJob?.id}
+                                      className="px-2.5 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded text-xs font-bold border border-amber-600 disabled:opacity-50 transition-colors"
+                                    >
+                                      {actionLoading === selectedJob?.id ? 'Verifying...' : '⚡ Verify Arrival Now'}
+                                    </button>
+                                  </div>
                                 )}
                               </div>
 
                               {/* Step 2: Verification Requirements */}
-                              {preServiceState.geofence_passed && (
+                              {preServiceState.geofence_passed ? (
                                 <div className="p-3 bg-white border border-slate-200 rounded space-y-2.5">
                                   <h4 className="text-xs font-bold text-slate-800 border-b border-slate-100 pb-1.5 flex items-center gap-1">
                                     <Camera className="w-3.5 h-3.5 text-blue-600" />
@@ -1433,25 +1849,37 @@ export function EmployeeDashboardPage() {
                                       <p className="text-[10px] text-slate-500">Ask customer for the 6-digit verification code received on arrival</p>
                                     </div>
                                     {preServiceState.otp_verified ? (
-                                      <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 font-bold rounded text-[10px] border border-emerald-200">
+                                      <span className="px-2.5 py-1 bg-emerald-50 text-emerald-700 font-bold rounded text-xs border border-emerald-200 flex items-center gap-1">
+                                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
                                         Verified ✓
                                       </span>
                                     ) : (
-                                      <div className="flex items-center gap-1">
+                                      <div className="flex items-center gap-1.5 flex-wrap">
                                         <input
                                           type="text"
                                           maxLength={6}
                                           placeholder="6-digit OTP"
                                           value={otpInput}
                                           onChange={(e) => setOtpInput(e.target.value)}
-                                          className="w-24 px-1.5 py-0.5 border border-slate-300 rounded font-mono text-center text-xs placeholder:text-slate-400"
+                                          onKeyDown={(e) => e.key === 'Enter' && handleVerifyOtpSubmit()}
+                                          className="w-24 px-2 py-1 border border-slate-300 rounded font-mono text-center text-xs font-bold tracking-widest placeholder:tracking-normal placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
                                         />
                                         <button
                                           type="button"
                                           onClick={handleVerifyOtpSubmit}
-                                          className="px-2 py-0.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs"
+                                          disabled={actionLoading === selectedJob.id || !otpInput.trim()}
+                                          className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs transition-colors disabled:opacity-50 active:scale-95"
                                         >
-                                          Verify OTP
+                                          {actionLoading === selectedJob.id ? 'Verifying...' : 'Verify OTP'}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={handleResendOtp}
+                                          disabled={actionLoading === selectedJob.id}
+                                          className="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-semibold rounded border border-slate-300 transition-colors"
+                                          title="Generate and send a fresh OTP to the customer"
+                                        >
+                                          Resend OTP
                                         </button>
                                       </div>
                                     )}
@@ -1461,22 +1889,21 @@ export function EmployeeDashboardPage() {
                                   <div className="flex items-center justify-between text-xs pt-2 border-t border-slate-100">
                                     <div>
                                       <span className="font-semibold text-slate-800">Identity/Presence Photo</span>
-                                      <p className="text-[10px] text-slate-500">Selfie at job location showing identity</p>
+                                      <p className="text-[10px] text-slate-500">Live selfie at job location showing identity</p>
                                     </div>
                                     {preServiceState.presence_photo ? (
                                       <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 font-bold rounded text-[10px] border border-emerald-200">
                                         Uploaded ✓
                                       </span>
                                     ) : (
-                                      <label className="cursor-pointer px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded text-xs border border-slate-300">
-                                        Upload Selfie
-                                        <input
-                                          type="file"
-                                          accept="image/*"
-                                          className="hidden"
-                                          onChange={(e) => e.target.files[0] && handlePhotoUploadSubmit('presence', e.target.files[0])}
-                                        />
-                                      </label>
+                                      <button
+                                        type="button"
+                                        onClick={() => openLiveCamera('Capture Presence Selfie', 'user', 'presence_selfie', (file) => handlePhotoUploadSubmit('presence', file))}
+                                        className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs transition-colors flex items-center gap-1.5 shadow-sm active:scale-95 cursor-pointer"
+                                      >
+                                        <Camera className="w-3.5 h-3.5" />
+                                        <span>📸 Take Live Selfie</span>
+                                      </button>
                                     )}
                                   </div>
 
@@ -1484,22 +1911,21 @@ export function EmployeeDashboardPage() {
                                   <div className="flex items-center justify-between text-xs pt-2 border-t border-slate-100">
                                     <div>
                                       <span className="font-semibold text-slate-800">Before Appliance Photo</span>
-                                      <p className="text-[10px] text-slate-500">Appliance condition before work</p>
+                                      <p className="text-[10px] text-slate-500">Live photo of appliance condition before work</p>
                                     </div>
                                     {preServiceState.appliance_photo ? (
                                       <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 font-bold rounded text-[10px] border border-emerald-200">
                                         Uploaded ✓
                                       </span>
                                     ) : (
-                                      <label className="cursor-pointer px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded text-xs border border-slate-300">
-                                        Upload Photo
-                                        <input
-                                          type="file"
-                                          accept="image/*"
-                                          className="hidden"
-                                          onChange={(e) => e.target.files[0] && handlePhotoUploadSubmit('appliance', e.target.files[0])}
-                                        />
-                                      </label>
+                                      <button
+                                        type="button"
+                                        onClick={() => openLiveCamera('Capture Before Appliance Photo', 'environment', 'pre_appliance', (file) => handlePhotoUploadSubmit('appliance', file))}
+                                        className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs transition-colors flex items-center gap-1.5 shadow-sm active:scale-95 cursor-pointer"
+                                      >
+                                        <Camera className="w-3.5 h-3.5" />
+                                        <span>📸 Take Live Photo</span>
+                                      </button>
                                     )}
                                   </div>
 
@@ -1507,24 +1933,38 @@ export function EmployeeDashboardPage() {
                                   <div className="flex items-center justify-between text-xs pt-2 border-t border-slate-100">
                                     <div>
                                       <span className="font-semibold text-slate-800">Before Work-Area Photo</span>
-                                      <p className="text-[10px] text-slate-500">Work area condition before work</p>
+                                      <p className="text-[10px] text-slate-500">Live photo of work area condition before work</p>
                                     </div>
                                     {preServiceState.work_area_photo ? (
                                       <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 font-bold rounded text-[10px] border border-emerald-200">
                                         Uploaded ✓
                                       </span>
                                     ) : (
-                                      <label className="cursor-pointer px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded text-xs border border-slate-300">
-                                        Upload Photo
-                                        <input
-                                          type="file"
-                                          accept="image/*"
-                                          className="hidden"
-                                          onChange={(e) => e.target.files[0] && handlePhotoUploadSubmit('work_area', e.target.files[0])}
-                                        />
-                                      </label>
+                                      <button
+                                        type="button"
+                                        onClick={() => openLiveCamera('Capture Before Work-Area Photo', 'environment', 'pre_work_area', (file) => handlePhotoUploadSubmit('work_area', file))}
+                                        className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs transition-colors flex items-center gap-1.5 shadow-sm active:scale-95 cursor-pointer"
+                                      >
+                                        <Camera className="w-3.5 h-3.5" />
+                                        <span>📸 Take Live Photo</span>
+                                      </button>
                                     )}
                                   </div>
+                                </div>
+                              ) : (
+                                <div className="p-3 bg-slate-100/70 border border-slate-200 rounded space-y-2 text-slate-500">
+                                  <div className="flex items-center justify-between">
+                                    <h4 className="text-xs font-bold text-slate-600 flex items-center gap-1.5">
+                                      <Camera className="w-3.5 h-3.5 text-slate-400" />
+                                      2. Required Pre-Service Evidence (OTP & Photos)
+                                    </h4>
+                                    <span className="text-[10px] font-bold px-2 py-0.5 bg-slate-200 text-slate-600 rounded">
+                                      🔒 UNLOCKS ON ARRIVAL
+                                    </span>
+                                  </div>
+                                  <p className="text-[10px] text-slate-500">
+                                    Customer OTP input and 3 photo upload buttons will unlock immediately once Step 1 Arrival is verified.
+                                  </p>
                                 </div>
                               )}
 
@@ -1679,37 +2119,181 @@ export function EmployeeDashboardPage() {
                           )}
 
                           {selectedJob.status === 'in_progress' && (
-                            <div className="flex flex-wrap items-center gap-2 pt-2">
-                              <button
-                                type="button"
-                                onClick={() => setProofModalJob(selectedJob)}
-                                className="px-4 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm transition-colors inline-flex items-center gap-1.5"
-                              >
-                                <Camera className="w-3.5 h-3.5" />
-                                <span>Complete & Upload Proof</span>
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setExtensionModalJob(selectedJob)}
-                                className="px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs shadow-sm transition-colors inline-flex items-center gap-1.5"
-                              >
-                                <PlusCircle className="w-3.5 h-3.5" />
-                                <span>Request Work Extension</span>
-                              </button>
+                            <div className="w-full p-4 bg-emerald-50/80 border border-emerald-200 rounded-lg space-y-3 mt-1">
+                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-emerald-200/70 pb-2.5">
+                                <div className="flex items-center gap-2">
+                                  <span className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse shrink-0"></span>
+                                  <div>
+                                    <h4 className="text-xs font-bold text-emerald-900 flex items-center gap-1.5">
+                                      <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+                                      Active Work Session — Job In Progress
+                                    </h4>
+                                    <p className="text-[11px] text-emerald-700">
+                                      Clocked in on site. When repairs & service are finished, upload completion photos below to complete the service.
+                                    </p>
+                                  </div>
+                                </div>
+                                <span className="px-2.5 py-1 bg-emerald-600 text-white font-bold text-xs rounded shadow-xs self-start sm:self-auto shrink-0">
+                                  IN PROGRESS
+                                </span>
+                              </div>
+
+                              <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                                <button
+                                  type="button"
+                                  onClick={() => setProofModalJob(selectedJob)}
+                                  className="px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow transition-colors inline-flex items-center gap-2 active:scale-95 cursor-pointer"
+                                >
+                                  <Camera className="w-4 h-4" />
+                                  <span>Submit Completion Proof</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setExtensionModalJob(selectedJob)}
+                                  className="px-3.5 py-2 rounded bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 font-bold text-xs shadow-xs transition-colors inline-flex items-center gap-1.5 active:scale-95 cursor-pointer"
+                                >
+                                  <PlusCircle className="w-3.5 h-3.5 text-indigo-600" />
+                                  <span>Request Scope Extension</span>
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
+                          {selectedJob.status === 'proof_submitted' && (
+                            <div className="w-full p-4 bg-blue-50/90 border border-blue-200 rounded-lg space-y-2.5 mt-1">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2.5">
+                                  <div className="w-8 h-8 rounded-full bg-blue-100 border border-blue-300 flex items-center justify-center text-blue-700 shrink-0">
+                                    <CheckCircle2 className="w-5 h-5" />
+                                  </div>
+                                  <div>
+                                    <h4 className="text-xs font-bold text-blue-950">Service Completed — Proof Submitted</h4>
+                                    <p className="text-[11px] text-blue-700">
+                                      After-service proof verified. Please settle and confirm payment below to close and complete this job.
+                                    </p>
+                                  </div>
+                                </div>
+                                <span className="px-2.5 py-1 bg-blue-700 text-white font-bold text-xs rounded shadow-xs shrink-0">
+                                  PROOF SUBMITTED
+                                </span>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Payment State Machine & Cash Collection Section */}
+                          {['in_progress', 'proof_submitted', 'completed'].includes(selectedJob.status) && (
+                            <div className="w-full mt-2 space-y-2">
+                              {((selectedJob.payment?.payment_method || selectedJob.payment_method || '').toUpperCase() === 'ONLINE' || (selectedJob.payment?.payment_method || selectedJob.payment_method || '').toUpperCase() === 'PREPAID') ? (
+                                <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between">
+                                  <div className="flex items-center gap-2">
+                                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                                    <div>
+                                      <span className="text-xs font-bold text-slate-800">Payment: ONLINE (Prepaid)</span>
+                                      <p className="text-[11px] text-slate-600">
+                                        Amount: <strong className="font-mono">₹{selectedJob.payment?.amount_due || selectedJob.total_amount}</strong> • No cash collection required.
+                                      </p>
+                                    </div>
+                                  </div>
+                                  <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 text-[10px] font-bold rounded">
+                                    {selectedJob.payment?.payment_status === 'PAID' || selectedJob.payment_status === 'paid' ? 'PAID ONLINE ✓' : 'GATEWAY PENDING'}
+                                  </span>
+                                </div>
+                              ) : (
+                                (selectedJob.payment?.payment_status === 'PAID' || selectedJob.payment_status === 'paid' || selectedJob.payment_status === 'collected') ? (
+                                  <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center justify-between">
+                                    <div className="flex items-center gap-2">
+                                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                                      <div>
+                                        <span className="text-xs font-bold text-emerald-900">Cash Payment Confirmed & Collected</span>
+                                        <p className="text-[11px] text-emerald-700">
+                                          Amount: <strong className="font-mono">₹{selectedJob.payment?.amount_paid || selectedJob.payment?.amount_due || selectedJob.total_amount}</strong> • Received by Technician
+                                        </p>
+                                      </div>
+                                    </div>
+                                    <span className="px-2 py-0.5 bg-emerald-700 text-white text-[10px] font-bold rounded">
+                                      PAID ✓
+                                    </span>
+                                  </div>
+                                ) : (
+                                  <div className="p-3.5 bg-amber-50/90 border border-amber-300 rounded-lg space-y-2">
+                                    <div className="flex items-center justify-between">
+                                      <div className="flex items-center gap-2">
+                                        <DollarSign className="w-4 h-4 text-amber-700" />
+                                        <span className="text-xs font-bold text-amber-950">Payment Collection (Cash on Service)</span>
+                                      </div>
+                                      <span className="text-xs font-bold text-amber-900 font-mono">
+                                        ₹{selectedJob.payment?.amount_due || selectedJob.total_amount} DUE
+                                      </span>
+                                    </div>
+                                    <p className="text-[11px] text-amber-800">
+                                      Collect cash payment from the customer upon completing work. (No OTP required)
+                                    </p>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setCashModalJob(selectedJob);
+                                        setCashAmountReceived(String(selectedJob.payment?.amount_due || selectedJob.total_amount || ''));
+                                      }}
+                                      className="w-full py-2 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded text-xs shadow-sm flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                                    >
+                                      <DollarSign className="w-4 h-4" />
+                                      <span>COLLECT ₹{selectedJob.payment?.amount_due || selectedJob.total_amount} CASH</span>
+                                    </button>
+                                  </div>
+                                )
+                              )}
                             </div>
                           )}
 
                           {selectedJob.status === 'completed' && (
-                            <span className="text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1 rounded border border-emerald-200">
-                              Job Successfully Completed
-                            </span>
+                            <div className="w-full p-4 bg-emerald-50/90 border border-emerald-200 rounded-lg space-y-3 mt-1">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2.5">
+                                  <div className="w-8 h-8 rounded-full bg-emerald-100 border border-emerald-300 flex items-center justify-center text-emerald-700 shrink-0">
+                                    <CheckCircle2 className="w-5 h-5" />
+                                  </div>
+                                  <div>
+                                    <h4 className="text-xs font-bold text-emerald-900">Job Successfully Completed</h4>
+                                    <p className="text-[11px] text-emerald-700">
+                                      All service tasks finished, completion proof submitted, and payment verified.
+                                    </p>
+                                  </div>
+                                </div>
+                                <span className="px-2.5 py-1 bg-emerald-700 text-white font-bold text-xs rounded shadow-xs shrink-0">
+                                  COMPLETED ✓
+                                </span>
+                              </div>
+
+                              <div className="pt-2.5 border-t border-emerald-200/80 grid grid-cols-2 gap-2 text-xs">
+                                <div className="bg-white/80 p-2 rounded border border-emerald-200/60">
+                                  <span className="text-[10px] text-slate-500 block font-semibold">Payment Collection</span>
+                                  <span className="font-bold text-slate-800">{selectedJob.payment_method || 'CASH'} ({selectedJob.payment_status || 'verified'})</span>
+                                </div>
+                                <div className="bg-white/80 p-2 rounded border border-emerald-200/60">
+                                  <span className="text-[10px] text-slate-500 block font-semibold">Service Value</span>
+                                  <span className="font-bold text-emerald-800 font-mono">₹{selectedJob.total_amount || '—'}</span>
+                                </div>
+                              </div>
+                            </div>
                           )}
                         </div>
                       </div>
                     </div>
                   ) : (
-                    <div className="p-16 text-center text-xs text-slate-500">
-                      Select a job order from the queue to view task details.
+                    <div className="p-16 text-center text-xs text-slate-500 space-y-3">
+                      <div className="w-12 h-12 mx-auto rounded-full bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-600 shadow-2xs">
+                        <CheckCircle2 className="w-6 h-6" />
+                      </div>
+                      <div>
+                        <p className="font-bold text-slate-800 text-sm">
+                          {isOnline ? 'Standby — Ready for Assignments' : 'No Active Job Selected'}
+                        </p>
+                        <p className="text-[11px] text-slate-500 max-w-sm mx-auto mt-1">
+                          {isOnline
+                            ? 'All assigned jobs completed. Keep status ONLINE to receive incoming automated dispatch job offers.'
+                            : 'Select a job from the active queue or toggle ONLINE to receive dispatch bookings.'}
+                        </p>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -1791,50 +2375,184 @@ export function EmployeeDashboardPage() {
         {/* Modal: Proof of Work */}
         <Modal
           isOpen={Boolean(proofModalJob)}
-          onClose={() => setProofModalJob(null)}
+          onClose={() => {
+            setProofModalJob(null);
+            setBeforeFile(null);
+            setAfterFile(null);
+            if (beforePreviewUrl) URL.revokeObjectURL(beforePreviewUrl);
+            if (afterPreviewUrl) URL.revokeObjectURL(afterPreviewUrl);
+            setBeforePreviewUrl(null);
+            setAfterPreviewUrl(null);
+          }}
           title={`Proof of Work Completion — Job #${proofModalJob?.id}`}
         >
           <form onSubmit={handleProofSubmit} className="space-y-4 text-xs">
+            {/* Live Camera Real-Time Photo 1: Before Work Area Photo */}
             <div>
-              <label className="block text-slate-700 font-semibold mb-1">Before Photo</label>
-              <input
-                type="file"
-                accept="image/*"
-                onChange={(e) => setBeforeFile(e.target.files[0])}
-                className="w-full border border-slate-300 rounded px-3 py-1.5"
-              />
+              <label className="block text-slate-700 font-semibold mb-1">
+                Before Photo (Pre-Work Condition)
+              </label>
+              {beforeFile ? (
+                <div className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
+                  <div className="flex items-center gap-2.5">
+                    {beforePreviewUrl ? (
+                      <img
+                        src={beforePreviewUrl}
+                        alt="Before"
+                        className="w-12 h-12 object-cover rounded-lg border border-slate-300 shadow-sm"
+                      />
+                    ) : (
+                      <div className="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center text-blue-600">
+                        <Camera className="w-6 h-6" />
+                      </div>
+                    )}
+                    <div>
+                      <span className="font-bold text-xs text-slate-800 block truncate max-w-[180px]">
+                        {beforeFile.name || 'Before Photo Captured'}
+                      </span>
+                      <span className="text-[10px] text-emerald-600 font-semibold flex items-center gap-1">
+                        <CheckCircle2 className="w-3 h-3" /> Live snapshot attached
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      openLiveCamera(
+                        'Capture Before Photo',
+                        'environment',
+                        'before_work',
+                        (file, previewUrl) => {
+                          setBeforeFile(file);
+                          setBeforePreviewUrl(previewUrl);
+                        }
+                      )
+                    }
+                    className="px-2.5 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3 h-3" /> Retake
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() =>
+                    openLiveCamera(
+                      'Capture Before Photo',
+                      'environment',
+                      'before_work',
+                      (file, previewUrl) => {
+                        setBeforeFile(file);
+                        setBeforePreviewUrl(previewUrl);
+                      }
+                    )
+                  }
+                  className="w-full py-3 px-4 border-2 border-dashed border-blue-300 hover:border-blue-500 bg-blue-50/50 hover:bg-blue-50 text-blue-700 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-[0.99] shadow-sm cursor-pointer"
+                >
+                  <Camera className="w-4 h-4 text-blue-600" />
+                  <span>📸 Take Live Photo (Before Work)</span>
+                </button>
+              )}
             </div>
+
+            {/* Live Camera Real-Time Photo 2: After Appliance / Work Photo */}
             <div>
-              <label className="block text-slate-700 font-semibold mb-1">After Photo</label>
-              <input
-                type="file"
-                accept="image/*"
-                onChange={(e) => setAfterFile(e.target.files[0])}
-                className="w-full border border-slate-300 rounded px-3 py-1.5"
-              />
+              <label className="block text-slate-700 font-semibold mb-1">
+                After Photo (Completed Work Result)
+              </label>
+              {afterFile ? (
+                <div className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
+                  <div className="flex items-center gap-2.5">
+                    {afterPreviewUrl ? (
+                      <img
+                        src={afterPreviewUrl}
+                        alt="After"
+                        className="w-12 h-12 object-cover rounded-lg border border-slate-300 shadow-sm"
+                      />
+                    ) : (
+                      <div className="w-12 h-12 bg-emerald-100 rounded-lg flex items-center justify-center text-emerald-600">
+                        <Camera className="w-6 h-6" />
+                      </div>
+                    )}
+                    <div>
+                      <span className="font-bold text-xs text-slate-800 block truncate max-w-[180px]">
+                        {afterFile.name || 'After Photo Captured'}
+                      </span>
+                      <span className="text-[10px] text-emerald-600 font-semibold flex items-center gap-1">
+                        <CheckCircle2 className="w-3 h-3" /> Live snapshot attached
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      openLiveCamera(
+                        'Capture After Photo',
+                        'environment',
+                        'after_work',
+                        (file, previewUrl) => {
+                          setAfterFile(file);
+                          setAfterPreviewUrl(previewUrl);
+                        }
+                      )
+                    }
+                    className="px-2.5 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3 h-3" /> Retake
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() =>
+                    openLiveCamera(
+                      'Capture After Photo',
+                      'environment',
+                      'after_work',
+                      (file, previewUrl) => {
+                        setAfterFile(file);
+                        setAfterPreviewUrl(previewUrl);
+                      }
+                    )
+                  }
+                  className="w-full py-3 px-4 border-2 border-dashed border-emerald-300 hover:border-emerald-500 bg-emerald-50/50 hover:bg-emerald-50 text-emerald-700 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-[0.99] shadow-sm cursor-pointer"
+                >
+                  <Camera className="w-4 h-4 text-emerald-600" />
+                  <span>📸 Take Live Photo (After Work)</span>
+                </button>
+              )}
             </div>
+
             <div>
               <label className="block text-slate-700 font-semibold mb-1">Completion Notes</label>
               <textarea
                 rows={3}
                 value={workNotes}
                 onChange={(e) => setWorkNotes(e.target.value)}
-                placeholder="Details of service provided..."
+                placeholder="Details of service provided, parts replaced, or tests performed..."
                 className="w-full border border-slate-300 rounded px-3 py-2"
               />
             </div>
             <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
               <button
                 type="button"
-                onClick={() => setProofModalJob(null)}
+                onClick={() => {
+                  setProofModalJob(null);
+                  setBeforeFile(null);
+                  setAfterFile(null);
+                  if (beforePreviewUrl) URL.revokeObjectURL(beforePreviewUrl);
+                  if (afterPreviewUrl) URL.revokeObjectURL(afterPreviewUrl);
+                  setBeforePreviewUrl(null);
+                  setAfterPreviewUrl(null);
+                }}
                 className="px-3 py-1.5 rounded border border-slate-300 text-slate-700 font-semibold"
               >
                 Cancel
               </button>
               <button
                 type="submit"
-                disabled={isUploadingProof}
-                className="px-4 py-1.5 rounded bg-emerald-600 text-white font-bold hover:bg-emerald-700"
+                disabled={isUploadingProof || (!beforeFile && !afterFile)}
+                className="px-4 py-1.5 rounded bg-emerald-600 disabled:opacity-50 text-white font-bold hover:bg-emerald-700 shadow-sm cursor-pointer"
               >
                 {isUploadingProof ? 'Uploading...' : 'Complete Job'}
               </button>
@@ -1940,6 +2658,162 @@ export function EmployeeDashboardPage() {
             </div>
           </form>
         </Modal>
+
+        {/* Modal: Structured Decline Job Offer */}
+        <Modal
+          isOpen={Boolean(declineModalJob)}
+          onClose={() => setDeclineModalJob(null)}
+          title={`Decline Job Offer — Job #${declineModalJob?.id}`}
+        >
+          <form onSubmit={handleConfirmDeclineOffer} className="space-y-4 text-xs">
+            <p className="text-slate-600">
+              Please select a reason for declining this job offer. The system will immediately dispatch the job to the next available technician.
+            </p>
+
+            <div className="space-y-2.5 bg-slate-50 p-3 rounded border border-slate-200">
+              {[
+                'Too far',
+                'Busy / Heavy traffic',
+                'Vehicle issue',
+                'Service mismatch',
+                'Personal reason',
+                'Other',
+              ].map((reason) => (
+                <label key={reason} className="flex items-center gap-2.5 cursor-pointer text-slate-800 font-medium">
+                  <input
+                    type="radio"
+                    name="declineReason"
+                    value={reason}
+                    checked={selectedDeclineReason === reason}
+                    onChange={(e) => setSelectedDeclineReason(e.target.value)}
+                    className="text-rose-600 focus:ring-rose-500"
+                  />
+                  <span>{reason}</span>
+                </label>
+              ))}
+            </div>
+
+            {selectedDeclineReason === 'Other' && (
+              <div>
+                <label className="block text-slate-700 font-semibold mb-1">Custom Reason</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Specify reason..."
+                  value={customDeclineReason}
+                  onChange={(e) => setCustomDeclineReason(e.target.value)}
+                  className="w-full border border-slate-300 rounded px-3 py-2 text-slate-800"
+                />
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setDeclineModalJob(null)}
+                className="px-3 py-1.5 rounded border border-slate-300 text-slate-700 font-semibold hover:bg-slate-50"
+              >
+                Keep Offer
+              </button>
+              <button
+                type="submit"
+                disabled={isDecliningOffer}
+                className="px-4 py-1.5 rounded bg-rose-600 text-white font-bold hover:bg-rose-700 shadow-sm"
+              >
+                {isDecliningOffer ? 'Declining...' : 'Confirm Decline'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+
+        {/* Cash Collection Modal */}
+        <Modal
+          isOpen={Boolean(cashModalJob)}
+          onClose={() => setCashModalJob(null)}
+          title={`Collect Cash — Job #${cashModalJob?.id || ''}`}
+        >
+          {cashModalJob && (
+            <form onSubmit={handleCashCollectSubmit} className="space-y-4">
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-1">
+                <div className="flex justify-between items-center text-xs">
+                  <span className="text-amber-800 font-semibold">Service:</span>
+                  <span className="font-bold text-amber-950">{cashModalJob.service_title || cashModalJob.issue_title || 'Service'}</span>
+                </div>
+                <div className="flex justify-between items-center text-xs">
+                  <span className="text-amber-800 font-semibold">Authoritative Amount Due:</span>
+                  <span className="font-mono font-bold text-base text-amber-950">
+                    ₹{cashModalJob.payment?.amount_due || cashModalJob.total_amount}
+                  </span>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Cash Amount Received from Customer (₹)
+                </label>
+                <div className="relative">
+                  <span className="absolute left-3 top-2.5 text-slate-400 font-bold text-sm">₹</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min={parseFloat(cashModalJob.payment?.amount_due || cashModalJob.total_amount || 0)}
+                    required
+                    value={cashAmountReceived}
+                    onChange={(e) => setCashAmountReceived(e.target.value)}
+                    placeholder={String(cashModalJob.payment?.amount_due || cashModalJob.total_amount || '')}
+                    className="w-full pl-7 pr-3 py-2 border border-slate-300 rounded-lg text-sm font-mono font-bold text-slate-800 focus:ring-2 focus:ring-amber-500 focus:outline-none bg-white"
+                  />
+                </div>
+              </div>
+
+              {/* Calculated Change Returned */}
+              {parseFloat(cashAmountReceived || 0) > parseFloat(cashModalJob.payment?.amount_due || cashModalJob.total_amount || 0) && (
+                <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 flex justify-between items-center">
+                  <span className="text-xs font-semibold text-emerald-800">Change to Return Customer:</span>
+                  <span className="font-mono font-bold text-sm text-emerald-950">
+                    ₹{(parseFloat(cashAmountReceived || 0) - parseFloat(cashModalJob.payment?.amount_due || cashModalJob.total_amount || 0)).toFixed(2)}
+                  </span>
+                </div>
+              )}
+
+              <p className="text-[11px] text-slate-500">
+                Submitting will generate a secure 6-digit confirmation code for the customer and notify them to confirm payment receipt.
+              </p>
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => setCashModalJob(null)}
+                  className="px-3.5 py-1.5 rounded border border-slate-300 text-slate-700 text-xs font-semibold hover:bg-slate-50 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isCollectingCash || !cashAmountReceived || parseFloat(cashAmountReceived) < parseFloat(cashModalJob.payment?.amount_due || cashModalJob.total_amount || 0)}
+                  className="px-4 py-2 rounded bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold text-xs shadow-sm flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <DollarSign className="w-4 h-4" />
+                  <span>{isCollectingCash ? 'Recording...' : 'Confirm Cash Received'}</span>
+                </button>
+              </div>
+            </form>
+          )}
+        </Modal>
+
+        {/* Real-Time Live Camera Viewfinder & Snapshot Modal */}
+        <LiveCameraCaptureModal
+          isOpen={cameraModalConfig.isOpen}
+          onClose={closeLiveCamera}
+          title={cameraModalConfig.title}
+          defaultFacingMode={cameraModalConfig.defaultFacingMode}
+          fileNamePrefix={cameraModalConfig.fileNamePrefix}
+          onCapture={(file, previewUrl) => {
+            if (cameraModalConfig.onCapture) {
+              cameraModalConfig.onCapture(file, previewUrl);
+            }
+          }}
+        />
       </div>
     </AppShell>
   );
