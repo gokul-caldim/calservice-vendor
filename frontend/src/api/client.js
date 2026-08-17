@@ -84,8 +84,12 @@ export async function apiRequest(path, options = {}) {
     if (response.status === 401) {
       sessionStorage.removeItem('wf_token');
       sessionStorage.removeItem('wf_refresh_token');
+      sessionStorage.removeItem('wf_tab_id');
       localStorage.removeItem('wf_token');
       localStorage.removeItem('wf_refresh_token');
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('workforce:auth-unauthorized'));
+      }
     }
   }
 

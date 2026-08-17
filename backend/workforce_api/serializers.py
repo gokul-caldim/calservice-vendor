@@ -386,6 +386,7 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     active_extension = serializers.SerializerMethodField()
     distance_km = serializers.SerializerMethodField()
     payment = serializers.SerializerMethodField()
+    cancellation_info = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceRequest
@@ -414,6 +415,7 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "payment",
             "customer_display_name",
             "active_offer",
+            "cancellation_info",
             "extensions",
             "active_extension",
             "created_at",
@@ -505,6 +507,43 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
                 "customer_confirmation_method": "",
             }
         return JobPaymentSerializer(pmt).data
+
+    def get_cancellation_info(self, obj):
+        request = self.context.get("request")
+        if not request or not getattr(request, "user", None):
+            return None
+        emp = getattr(request.user, "employee_profile", None)
+        if not emp or obj.assigned_employee != emp:
+            return None
+
+        from .models import WorkforceJobLifecycleEvent
+        from datetime import timedelta
+        from django.utils import timezone
+
+        accept_event = WorkforceJobLifecycleEvent.objects.filter(
+            job=obj,
+            employee=emp,
+            event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
+        ).order_by("-created_at").first()
+
+        now = timezone.now()
+        accepted_at = accept_event.accepted_at if accept_event else (obj.updated_at or obj.created_at)
+        deadline = (
+            accept_event.cancellation_deadline if (accept_event and accept_event.cancellation_deadline)
+            else (accepted_at + timedelta(minutes=5)) if accepted_at else None
+        )
+
+        remaining_s = max(0, int((deadline - now).total_seconds())) if deadline else 0
+        is_state_allowed = obj.status in ["accepted", "on_the_way"]
+        is_available = bool(is_state_allowed and deadline and now <= deadline)
+
+        return {
+            "accepted_at": accepted_at.isoformat() if accepted_at else None,
+            "cancellation_deadline": deadline.isoformat() if deadline else None,
+            "remaining_seconds": remaining_s,
+            "cancellation_available": is_available,
+            "is_state_allowed": is_state_allowed,
+        }
 
 
 class WorkforceEmployeeChangeRequestSerializer(serializers.ModelSerializer):

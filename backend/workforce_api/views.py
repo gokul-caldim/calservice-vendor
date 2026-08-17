@@ -4,6 +4,8 @@ Complete API views for Workforce Registration, Admin Approvals, Decoupled Availa
 """
 import uuid
 import os
+import json
+import time
 import logging
 from decimal import Decimal
 from django.conf import settings
@@ -20,6 +22,7 @@ from django.utils import timezone
 from rest_framework import permissions, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -379,39 +382,70 @@ class WorkforceCatalogListView(APIView):
     def get(self, request):
         """
         Returns the single source of truth database service catalog from PostgreSQL (shared with Customer app).
-        Strictly reads from database tables (CatalogCategory & Service) with zero hardcoding or mock fallbacks.
+        Strictly reads from database tables (CatalogCategory & Service, falling back to WorkforceServiceCatalog if unseeded).
         """
-        from service_requests.models import CatalogCategory, Service
+        try:
+            from service_requests.models import CatalogCategory, Service
 
-        categories = CatalogCategory.objects.filter(is_active=True).prefetch_related(
-            models.Prefetch("services", queryset=Service.objects.filter(is_active=True).order_by("sort_order", "id"))
-        ).order_by("sort_order", "id")
+            categories = CatalogCategory.objects.filter(is_active=True).prefetch_related(
+                models.Prefetch("services", queryset=Service.objects.filter(is_active=True).order_by("sort_order", "id"))
+            ).order_by("sort_order", "id")
 
-        catalog_data = []
-        for cat in categories:
-            cat_services = []
-            for svc in cat.services.all():
-                cat_services.append({
-                    "id": svc.id,
-                    "name": svc.name,
-                    "slug": svc.slug,
-                    "description": svc.description or "",
-                    "icon": svc.icon or cat.icon or "Wrench",
-                    "category_id": cat.id,
-                    "category_name": cat.name,
-                })
+            catalog_data = []
+            for cat in categories:
+                cat_services = []
+                for svc in cat.services.all():
+                    cat_services.append({
+                        "id": svc.id,
+                        "name": svc.name,
+                        "slug": svc.slug,
+                        "description": svc.description or "",
+                        "icon": svc.icon or cat.icon or "Wrench",
+                        "category_id": cat.id,
+                        "category_name": cat.name,
+                    })
 
-            if cat_services:
-                catalog_data.append({
-                    "id": cat.id,
-                    "name": cat.name,
-                    "slug": cat.slug,
-                    "description": cat.description or "",
-                    "icon": cat.icon or "Wrench",
-                    "services": cat_services,
-                })
+                if cat_services:
+                    catalog_data.append({
+                        "id": cat.id,
+                        "name": cat.name,
+                        "slug": cat.slug,
+                        "description": cat.description or "",
+                        "icon": cat.icon or "Wrench",
+                        "services": cat_services,
+                    })
 
-        return Response(catalog_data, status=status.HTTP_200_OK)
+            if not catalog_data:
+                from workforce_api.models import WorkforceServiceCatalog
+                wf_services = WorkforceServiceCatalog.objects.filter(is_active=True).order_by("category", "name")
+                cat_map = {}
+                for s in wf_services:
+                    cat_name = s.category or "General Services"
+                    if cat_name not in cat_map:
+                        cat_map[cat_name] = []
+                    cat_map[cat_name].append({
+                        "id": s.id,
+                        "name": s.name,
+                        "slug": s.name.lower().replace(" ", "-"),
+                        "description": f"Standard {s.name} ({s.duration_minutes} mins)",
+                        "icon": "Wrench",
+                        "category_id": hash(cat_name) % 10000,
+                        "category_name": cat_name,
+                    })
+                for c_idx, (cat_name, svcs) in enumerate(cat_map.items(), start=1):
+                    catalog_data.append({
+                        "id": c_idx,
+                        "name": cat_name,
+                        "slug": cat_name.lower().replace(" ", "-"),
+                        "description": f"All {cat_name} services",
+                        "icon": "Wrench",
+                        "services": svcs,
+                    })
+
+            return Response(catalog_data, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error("Error in WorkforceCatalogListView: %s", str(e), exc_info=True)
+            return Response([], status=status.HTTP_200_OK)
 
 
 
@@ -576,56 +610,102 @@ class WorkforceEmployeeServiceRequestView(APIView):
         if not emp:
             return Response({"error": "Employee profile not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        service_id = request.data.get("service_id")
-        service_name = request.data.get("name", "").strip()
+        service_ids = request.data.get("service_ids")
+        if service_ids is not None:
+            if not isinstance(service_ids, list) or len(service_ids) == 0:
+                return Response({"error": "service_ids must be a non-empty list."}, status=status.HTTP_400_BAD_REQUEST)
+            raw_ids = [s for s in service_ids if s is not None]
+        else:
+            single_id = request.data.get("service_id")
+            if not single_id:
+                return Response({"error": "service_id or service_ids is required."}, status=status.HTTP_400_BAD_REQUEST)
+            raw_ids = [single_id]
 
-        if not service_id:
-            return Response({"error": "service_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Validate against database catalog
         from service_requests.models import Service
-        db_service = Service.objects.filter(pk=service_id, is_active=True).select_related("category").first()
-        if not db_service:
-            return Response({"error": f"Invalid service_id '{service_id}'. Not found in database catalog."}, status=status.HTTP_400_BAD_REQUEST)
+        from workforce_api.models import WorkforceServiceCatalog
 
-        final_name = db_service.name
-        cat_name = db_service.category.name if db_service.category else "General"
+        # Query services from DB
+        db_services = {s.id: s for s in Service.objects.filter(pk__in=raw_ids, is_active=True).select_related("category")}
+        wf_services = {s.id: s for s in WorkforceServiceCatalog.objects.filter(pk__in=raw_ids, is_active=True)}
 
         bank_details = emp.bank_details or {}
         onboarding = bank_details.get("onboarding", {})
         services = onboarding.get("services", [])
+        now_iso = timezone.now().isoformat()
 
-        existing = next((s for s in services if str(s.get("id")) == str(service_id)), None)
-        if existing:
-            if existing.get("status") == "approved" and existing.get("request_type") != "remove":
-                return Response({"error": f"Service '{final_name}' is already approved for dispatch."}, status=status.HTTP_400_BAD_REQUEST)
-            if existing.get("status") == "pending":
-                return Response({"error": f"Authorization request for '{final_name}' is already pending review."}, status=status.HTTP_400_BAD_REQUEST)
-            existing["status"] = "pending"
-            existing["request_type"] = "add"
-            existing["name"] = final_name
-            existing["category_name"] = cat_name
-            existing["requested_at"] = timezone.now().isoformat()
-            existing["rejection_reason"] = ""
-        else:
-            services.append({
-                "id": int(service_id),
-                "name": final_name,
-                "category_name": cat_name,
-                "status": "pending",
-                "request_type": "add",
-                "requested_at": timezone.now().isoformat(),
-                "rejection_reason": "",
-            })
+        requested_count = 0
+        last_name = ""
+
+        for sid in raw_ids:
+            try:
+                sid_int = int(sid)
+            except (ValueError, TypeError):
+                sid_int = sid
+
+            svc = db_services.get(sid_int)
+            if svc:
+                s_name = svc.name
+                c_name = svc.category.name if svc.category else "General"
+            elif sid_int in wf_services:
+                wf_s = wf_services[sid_int]
+                s_name = wf_s.name
+                c_name = wf_s.category or "General"
+            else:
+                s_name = request.data.get("name", "").strip() or f"Service #{sid}"
+                c_name = "General"
+
+            existing = next((s for s in services if str(s.get("id")) == str(sid)), None)
+            if existing:
+                if existing.get("status") == "approved" and existing.get("request_type") != "remove":
+                    if len(raw_ids) == 1:
+                        return Response({"error": f"Service '{s_name}' is already approved for dispatch."}, status=status.HTTP_400_BAD_REQUEST)
+                    continue
+                if existing.get("status") == "pending":
+                    if len(raw_ids) == 1:
+                        return Response({"error": f"Authorization request for '{s_name}' is already pending review."}, status=status.HTTP_400_BAD_REQUEST)
+                    continue
+                existing["status"] = "pending"
+                existing["request_type"] = "add"
+                existing["name"] = s_name
+                existing["category_name"] = c_name
+                existing["requested_at"] = now_iso
+                existing["rejection_reason"] = ""
+                requested_count += 1
+                last_name = s_name
+            else:
+                services.append({
+                    "id": sid_int if isinstance(sid_int, int) else sid,
+                    "name": s_name,
+                    "category_name": c_name,
+                    "status": "pending",
+                    "request_type": "add",
+                    "requested_at": now_iso,
+                    "rejection_reason": "",
+                })
+                requested_count += 1
+                last_name = s_name
+
+        if requested_count == 0 and len(raw_ids) > 1:
+            return Response({
+                "message": "All selected services are already requested or approved.",
+                "requested_count": 0,
+                "services": services,
+            }, status=status.HTTP_200_OK)
 
         onboarding["services"] = services
         bank_details["onboarding"] = onboarding
         emp.bank_details = bank_details
         emp.save()
 
+        msg = (
+            f"Service authorization request for '{last_name}' submitted to Admin for review."
+            if len(raw_ids) == 1
+            else f"Submitted authorization requests for {requested_count} service(s) to Admin for review."
+        )
 
         return Response({
-            "message": f"Service authorization request for '{final_name}' submitted to Admin for review.",
+            "message": msg,
+            "requested_count": requested_count,
             "services": services,
         }, status=status.HTTP_201_CREATED)
 
@@ -1070,7 +1150,7 @@ class WorkforceJobTransitionView(APIView):
         if not job:
             return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        target_status = request.data.get("status")
+        target_status = request.data.get("status") or request.data.get("target_status")
         if not target_status:
             return Response({"error": "Target status required."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1727,16 +1807,19 @@ class WorkforceDispatchAssignView(APIView):
 
 # ─── Automatic Dispatch Engine ────────────────────────────────────────────────
 
-def run_automatic_dispatch(job):
+def run_automatic_dispatch(job, excluded_employee_ids=None):
     """
     Delegates to authoritative automatic dispatch service:
     workforce_api.services.automatic_dispatch.dispatch_job
     """
     from workforce_api.services.automatic_dispatch import dispatch_job
-    return dispatch_job(job)
+    return dispatch_job(job, excluded_employee_ids=excluded_employee_ids)
 
 
-
+ACTIVE_WORKLOAD_STATUSES = [
+    "accepted", "on_the_way", "arrived", "in_progress",
+    "service_completed", "proof_submitted", "payment_pending"
+]
 
 
 class WorkforceJobAcceptOfferView(APIView):
@@ -1745,23 +1828,27 @@ class WorkforceJobAcceptOfferView(APIView):
     def post(self, request, pk):
         job = ServiceRequest.objects.filter(pk=pk).first()
         if not job:
-            return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
         emp = getattr(request.user, "employee_profile", None)
         if not emp:
-            return Response({"error": "Employee profile not found."}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Employee profile not found.", "code": "PROFILE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
         # Cross-company tenant isolation check
         if emp.company_id and job.company_id and emp.company_id != job.company_id:
-            return Response({"error": "Unauthorized access to job belonging to another company."}, status=status.HTTP_403_FORBIDDEN)
+            return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         with transaction.atomic():
             job_obj = ServiceRequest.objects.select_for_update().filter(pk=pk).first()
             if not job_obj:
-                return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+                return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
-            # Prevent duplicate acceptance by the same employee
-            if job_obj.assigned_employee == emp and job_obj.status in ["accepted", "on_the_way", "arrived", "in_progress"]:
+            emp_obj = Employee.objects.select_for_update().filter(pk=emp.pk).first()
+            if not emp_obj:
+                return Response({"error": "Employee profile not found.", "code": "PROFILE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+            # Prevent duplicate acceptance by the same employee on the same job (Idempotent success)
+            if job_obj.assigned_employee == emp_obj and job_obj.status in ACTIVE_WORKLOAD_STATUSES:
                 return Response({
                     "message": f"Job #{job_obj.id} is already accepted by you.",
                     "job_id": job_obj.id,
@@ -1769,91 +1856,174 @@ class WorkforceJobAcceptOfferView(APIView):
                 }, status=status.HTTP_200_OK)
 
             # Reject acceptance if assigned to another employee
-            if job_obj.assigned_employee and job_obj.assigned_employee != emp and job_obj.status in ["accepted", "on_the_way", "arrived", "in_progress", "completed"]:
+            if job_obj.assigned_employee and job_obj.assigned_employee != emp_obj and job_obj.status in ACTIVE_WORKLOAD_STATUSES + ["completed"]:
                 return Response({
-                    "error": "Cannot accept job: Job has already been assigned and accepted by another technician.",
-                    "code": "ALREADY_ACCEPTED_BY_ANOTHER"
-                }, status=status.HTTP_403_FORBIDDEN)
+                    "error": "This job has already been accepted by another professional.",
+                    "code": "JOB_ALREADY_ACCEPTED",
+                    "message": "This job has already been accepted by another professional."
+                }, status=status.HTTP_409_CONFLICT)
+
+            # RULE 1: Server-side Single Active Job Enforcement (Race-Safe)
+            conflicting = ServiceRequest.objects.select_for_update().filter(
+                assigned_employee=emp_obj,
+                status__in=ACTIVE_WORKLOAD_STATUSES
+            ).exclude(pk=job_obj.pk).first()
+
+            if conflicting:
+                return Response({
+                    "error": f"Cannot accept job: You already have an active job (Job #{conflicting.id}).",
+                    "code": "EMPLOYEE_ALREADY_BUSY",
+                    "message": "You already have an active job.",
+                    "active_job_id": conflicting.id,
+                }, status=status.HTTP_409_CONFLICT)
 
             from service_requests.models import EmployeeJob
+            from workforce_api.models import WorkforceJobOffer, WorkforceJobLifecycleEvent, JobTrackingSession, WorkforceEventLog
 
             offer = WorkforceJobOffer.objects.select_for_update().filter(
                 job=job_obj,
-                employee=emp,
-                status="OFFERED"
-            ).first()
+                employee=emp_obj,
+            ).order_by("-offered_at").first()
 
-            has_employee_job = EmployeeJob.objects.filter(service_request=job_obj, employee=emp).exists()
-            is_direct_assigned = (job_obj.assigned_employee == emp)
+            if offer and offer.status == WorkforceJobOffer.Status.SUPERSEDED_BY_ACCEPTANCE:
+                return Response({
+                    "error": "This job has already been accepted by another professional.",
+                    "code": "JOB_ALREADY_ACCEPTED",
+                    "message": "This job has already been accepted by another professional."
+                }, status=status.HTTP_409_CONFLICT)
 
-            if not offer and not has_employee_job and not is_direct_assigned:
+            has_employee_job = EmployeeJob.objects.filter(service_request=job_obj, employee=emp_obj).exists()
+            is_direct_assigned = (job_obj.assigned_employee == emp_obj)
+
+            if (not offer or offer.status != WorkforceJobOffer.Status.OFFERED) and not has_employee_job and not is_direct_assigned:
                 return Response({
                     "error": "No active job offer or assignment found for this technician.",
                     "code": "NO_ACTIVE_OFFER"
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            if offer:
-                if offer.expires_at < timezone.now():
-                    offer.status = "EXPIRED"
-                    offer.save()
-                    run_automatic_dispatch(job_obj)
-                    return Response({"error": "Job offer has expired."}, status=status.HTTP_400_BAD_REQUEST)
-                offer.status = "ACCEPTED"
-                offer.save()
+            now = timezone.now()
+            cancellation_deadline = now + timedelta(minutes=5)
 
-            # Check if employee has a conflicting active job
-            conflicting = ServiceRequest.objects.filter(
-                assigned_employee=emp,
-                status__in=["accepted", "on_the_way", "in_progress"]
-            ).exclude(pk=job_obj.pk).first()
-            if conflicting:
-                return Response({"error": f"Cannot accept job: Technician already has an active assigned Job #{conflicting.id}."}, status=status.HTTP_400_BAD_REQUEST)
+            if offer and offer.status == WorkforceJobOffer.Status.OFFERED:
+                if offer.expires_at < now:
+                    offer.status = WorkforceJobOffer.Status.EXPIRED
+                    offer.save()
+                    run_automatic_dispatch(job_obj, excluded_employee_ids=[emp_obj.id])
+                    return Response({"error": "Job offer has expired.", "code": "OFFER_EXPIRED"}, status=status.HTTP_400_BAD_REQUEST)
+                offer.status = WorkforceJobOffer.Status.ACCEPTED
+                offer.save()
 
             # Verify technician eligibility if accepting without an existing vetted offer
             if not offer:
-                is_eligible, reason = check_technician_eligibility(emp, job_obj.service_category)
+                is_eligible, reason, _ = check_technician_eligibility(emp_obj, job_obj.service_category)
                 if not is_eligible and job_obj.issue_title:
-                    is_eligible, reason = check_technician_eligibility(emp, job_obj.issue_title)
+                    is_eligible, reason, _ = check_technician_eligibility(emp_obj, job_obj.issue_title)
                 if not is_eligible:
-                    return Response({"error": f"Cannot accept offer: {reason}"}, status=status.HTTP_400_BAD_REQUEST)
+                    return Response({"error": f"Cannot accept offer: {reason}", "code": "INELIGIBLE_TECHNICIAN"}, status=status.HTTP_400_BAD_REQUEST)
 
-
-            job_obj.assigned_employee = emp
-            job_obj.status = "on_the_way"
+            job_obj.assigned_employee = emp_obj
+            job_obj.status = "accepted"
             job_obj.save(update_fields=["assigned_employee", "status"])
+
+            # Atomically mark employee availability as BUSY
+            emp_obj.current_availability = "busy"
+            emp_obj.save(update_fields=["current_availability"])
+
+            # Mark all competing OFFERED records for the same job as SUPERSEDED_BY_ACCEPTANCE
+            competing_offers = WorkforceJobOffer.objects.select_for_update().filter(
+                job=job_obj,
+                status=WorkforceJobOffer.Status.OFFERED
+            ).exclude(employee=emp_obj)
+
+            for c_off in competing_offers:
+                c_off.status = WorkforceJobOffer.Status.SUPERSEDED_BY_ACCEPTANCE
+                c_off.rejection_reason = f"Job #{job_obj.id} was accepted by another technician."
+                c_off.save(update_fields=["status", "rejection_reason"])
+                if c_off.employee and c_off.employee.user:
+                    WorkforceEventLog.objects.create(
+                        user=c_off.employee.user,
+                        event_type="JOB_OFFER_CLOSED",
+                        payload={
+                            "job_id": job_obj.id,
+                            "offer_id": c_off.id,
+                            "reason": "ALREADY_ACCEPTED",
+                            "accepted_by_other": True,
+                            "message": "Another professional accepted this request. Offer closed automatically."
+                        }
+                    )
+
+            # Expire all other pending OFFERED jobs for this winning employee
+            other_offers = WorkforceJobOffer.objects.select_for_update().filter(
+                employee=emp_obj,
+                status=WorkforceJobOffer.Status.OFFERED
+            ).exclude(pk=offer.pk if offer else 0)
+
+            for o_off in other_offers:
+                o_off.status = WorkforceJobOffer.Status.SUPERSEDED
+                o_off.rejection_reason = "SUPERSEDED_BY_ANOTHER_ACCEPTANCE"
+                o_off.save(update_fields=["status", "rejection_reason"])
+
+            # Unset any prior primary EmployeeJob for this service request
+            EmployeeJob.objects.filter(service_request=job_obj, is_primary=True).exclude(employee=emp_obj).update(is_primary=False)
 
             EmployeeJob.objects.update_or_create(
                 service_request=job_obj,
-                employee=emp,
+                employee=emp_obj,
                 defaults={
-                    "status": "ON_THE_WAY",
+                    "status": "ACCEPTED",
                     "is_primary": True,
-                    "accepted_date": timezone.now(),
+                    "accepted_date": now,
                 }
             )
 
             # Activate JobTrackingSession
-            from workforce_api.models import JobTrackingSession, WorkforceEventLog
-            JobTrackingSession.objects.get_or_create(
+            JobTrackingSession.objects.update_or_create(
                 job=job_obj,
-                employee=emp,
+                employee=emp_obj,
                 company=job_obj.company,
-                status=JobTrackingSession.SessionStatus.ACTIVE,
+                defaults={
+                    "status": JobTrackingSession.SessionStatus.ACTIVE,
+                    "ended_at": None,
+                }
+            )
+
+            # Log immutable lifecycle audit event
+            WorkforceJobLifecycleEvent.objects.create(
+                job=job_obj,
+                employee=emp_obj,
+                company=job_obj.company,
+                actor_user=request.user,
+                event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
+                previous_status=offer.status if offer else "OFFERED",
+                new_status="accepted",
+                accepted_at=now,
+                cancellation_deadline=cancellation_deadline,
+                metadata={"offer_id": offer.id if offer else None}
             )
 
             WorkforceEventLog.objects.create(
-                user=emp.user,
-                event_type="OFFER_ACCEPTED",
-                payload={"job_id": job_obj.id, "employee_id": emp.id}
+                user=emp_obj.user,
+                event_type="EMPLOYEE_JOB_ACCEPTED",
+                payload={
+                    "job_id": job_obj.id,
+                    "employee_id": emp_obj.id,
+                    "accepted_at": now.isoformat(),
+                    "cancellation_deadline": cancellation_deadline.isoformat(),
+                }
             )
             WorkforceEventLog.objects.create(
-                user=emp.user,
-                event_type="TRACKING_STARTED",
-                payload={"job_id": job_obj.id, "employee_id": emp.id}
+                user=job_obj.customer if hasattr(job_obj, "customer") else None,
+                event_type="NEW_EMPLOYEE_ASSIGNED",
+                payload={
+                    "job_id": job_obj.id,
+                    "employee_id": emp_obj.id,
+                    "employee_name": emp_obj.user.get_full_name() or emp_obj.user.username,
+                    "status": "ACCEPTED",
+                }
             )
 
             create_notification(
-                recipient=emp.user,
+                recipient=emp_obj.user,
                 title="Job Offer Accepted",
                 message=f"You have accepted Job #{job_obj.id}. Proceed to customer location at {job_obj.address or 'scheduled site'}.",
                 notification_type="JOB_ASSIGNMENT",
@@ -1865,6 +2035,207 @@ class WorkforceJobAcceptOfferView(APIView):
                 "message": f"Job #{job_obj.id} accepted successfully.",
                 "job_id": job_obj.id,
                 "status": job_obj.status,
+                "accepted_at": now.isoformat(),
+                "cancellation_deadline": cancellation_deadline.isoformat(),
+            }, status=status.HTTP_200_OK)
+
+
+class WorkforceJobCancelAssignmentView(APIView):
+    """
+    5-Minute Backend-Authoritative Employee Job Assignment Cancellation.
+    Only the assigned technician can cancel within 5 minutes of acceptance,
+    and only while in 'accepted' or 'on_the_way' states.
+    Automatically releases technician to AVAILABLE, terminates tracking session,
+    records immutable lifecycle audit event, and triggers 9-gate automatic redispatch.
+    """
+    permission_classes = [IsApprovedTechnician]
+
+    def post(self, request, pk):
+        job = ServiceRequest.objects.filter(pk=pk).first()
+        if not job:
+            return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+        emp = getattr(request.user, "employee_profile", None)
+        if not emp:
+            return Response({"error": "Employee profile not found.", "code": "PROFILE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Cross-company tenant isolation check
+        if emp.company_id and job.company_id and emp.company_id != job.company_id:
+            return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+
+        # Authorization: must be the currently assigned technician
+        if job.assigned_employee != emp:
+            return Response({"error": "Unauthorized: You are not assigned to this job.", "code": "UNAUTHORIZED_CANCELLATION"}, status=status.HTTP_403_FORBIDDEN)
+
+        # Structured reason validation
+        ALLOWED_REASONS = [
+            "VEHICLE_ISSUE",
+            "TRAFFIC_ROUTE_ISSUE",
+            "TOO_FAR",
+            "SERVICE_MISMATCH",
+            "CUSTOMER_LOCATION_ISSUE",
+            "SAFETY_CONCERN",
+            "PERSONAL_EMERGENCY",
+            "OTHER",
+        ]
+        reason_code = str(request.data.get("reason_code") or "").strip().upper()
+        reason_text = str(request.data.get("reason_text") or "").strip()
+
+        if not reason_code or reason_code not in ALLOWED_REASONS:
+            return Response({
+                "error": f"Invalid or missing reason_code. Must be one of: {', '.join(ALLOWED_REASONS)}",
+                "code": "INVALID_REASON_CODE",
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if reason_code == "OTHER" and len(reason_text) < 5:
+            return Response({
+                "error": "reason_text is mandatory and must be at least 5 characters for reason 'OTHER'.",
+                "code": "REASON_TEXT_REQUIRED",
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            job_obj = ServiceRequest.objects.select_for_update().filter(pk=pk).first()
+            emp_obj = Employee.objects.select_for_update().filter(pk=emp.pk).first()
+
+            # Idempotency check: If already cancelled / redispatching and unassigned from this employee
+            if job_obj.status in ["redispatching", "unassigned", "cancelled"] and job_obj.assigned_employee != emp_obj:
+                return Response({
+                    "message": "Job assignment is already cancelled.",
+                    "job_id": job_obj.id,
+                    "status": job_obj.status,
+                }, status=status.HTTP_200_OK)
+
+            if job_obj.assigned_employee != emp_obj:
+                return Response({
+                    "error": "Unauthorized: You are no longer assigned to this job.",
+                    "code": "UNAUTHORIZED_CANCELLATION",
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            # State check: Allowed only from 'accepted' or 'on_the_way'
+            if job_obj.status not in ["accepted", "on_the_way"]:
+                return Response({
+                    "error": f"Cannot cancel job in status '{job_obj.status}'. Cancellation is only allowed while 'accepted' or 'on_the_way'.",
+                    "code": "CANCELLATION_NOT_ALLOWED_IN_CURRENT_STATE",
+                }, status=status.HTTP_409_CONFLICT)
+
+            # 5-minute cancellation window check
+            from service_requests.models import EmployeeJob
+            from workforce_api.models import WorkforceJobLifecycleEvent, JobTrackingSession, WorkforceEventLog
+
+            accept_event = WorkforceJobLifecycleEvent.objects.filter(
+                job=job_obj,
+                employee=emp_obj,
+                event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
+            ).order_by("-created_at").first()
+
+            emp_job = EmployeeJob.objects.filter(service_request=job_obj, employee=emp_obj).first()
+            accepted_at = (
+                accept_event.accepted_at if accept_event
+                else (emp_job.accepted_date if emp_job and emp_job.accepted_date else job_obj.updated_at)
+            )
+
+            now = timezone.now()
+            cancellation_deadline = (
+                accept_event.cancellation_deadline if accept_event and accept_event.cancellation_deadline
+                else (accepted_at + timedelta(minutes=5))
+            )
+
+            if now > cancellation_deadline:
+                return Response({
+                    "error": "The 5-minute cancellation window for this job has expired. Please contact dispatch support.",
+                    "code": "CANCELLATION_WINDOW_EXPIRED",
+                    "cancellation_deadline": cancellation_deadline.isoformat(),
+                }, status=status.HTTP_409_CONFLICT)
+
+            prev_status = job_obj.status
+
+            # Transition ServiceRequest to 'redispatching' and remove assignment
+            job_obj.assigned_employee = None
+            job_obj.status = "redispatching"
+            job_obj.save(update_fields=["assigned_employee", "status"])
+
+            # Transition EmployeeJob to EMPLOYEE_CANCELLED and unset primary
+            if emp_job:
+                emp_job.status = "EMPLOYEE_CANCELLED"
+                emp_job.is_primary = False
+                emp_job.uncompletion_reason = f"[{reason_code}] {reason_text}".strip()
+                emp_job.save(update_fields=["status", "is_primary", "uncompletion_reason"])
+
+            # Terminate existing JobTrackingSession
+            JobTrackingSession.objects.filter(
+                job=job_obj,
+                employee=emp_obj,
+                status=JobTrackingSession.SessionStatus.ACTIVE,
+            ).update(
+                status=JobTrackingSession.SessionStatus.CANCELLED,
+                ended_at=now,
+            )
+
+            # Invalidate offer
+            WorkforceJobOffer.objects.filter(
+                job=job_obj,
+                employee=emp_obj,
+                status="ACCEPTED",
+            ).update(
+                status="CANCELLED",
+                rejection_reason=f"[{reason_code}] {reason_text}".strip(),
+            )
+
+            # Release Employee Availability: check if employee has any other active jobs
+            has_other_active = ServiceRequest.objects.filter(
+                assigned_employee=emp_obj,
+                status__in=ACTIVE_WORKLOAD_STATUSES,
+            ).exists()
+
+            if not has_other_active:
+                emp_obj.current_availability = "available"
+                emp_obj.save(update_fields=["current_availability"])
+
+            window_seconds = max(0, int((now - accepted_at).total_seconds())) if accepted_at else None
+
+            # Create immutable audit log
+            WorkforceJobLifecycleEvent.objects.create(
+                job=job_obj,
+                employee=emp_obj,
+                company=job_obj.company,
+                actor_user=request.user,
+                event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_CANCELLED,
+                previous_status=prev_status,
+                new_status="redispatching",
+                accepted_at=accepted_at,
+                cancelled_at=now,
+                cancellation_deadline=cancellation_deadline,
+                reason_code=reason_code,
+                reason_text=reason_text,
+                cancellation_window_seconds=window_seconds,
+                metadata={"cancellation_window_seconds": window_seconds}
+            )
+
+            # Broadcast realtime events
+            WorkforceEventLog.objects.create(
+                user=emp_obj.user,
+                event_type="EMPLOYEE_JOB_CANCELLED",
+                payload={"job_id": job_obj.id, "employee_id": emp_obj.id, "reason_code": reason_code}
+            )
+            WorkforceEventLog.objects.create(
+                user=job_obj.customer if hasattr(job_obj, "customer") else None,
+                event_type="EMPLOYEE_CANCELLED",
+                payload={
+                    "job_id": job_obj.id,
+                    "status": "FINDING_NEW_PROFESSIONAL",
+                    "message": "Your professional cancelled. We're finding another professional nearby.",
+                    "reason": reason_code,
+                }
+            )
+
+            # Trigger automatic redispatch excluding the cancelling technician
+            success, msg = run_automatic_dispatch(job_obj, excluded_employee_ids=[emp_obj.id])
+
+            return Response({
+                "message": f"Job #{job_obj.id} assignment cancelled successfully. Redispatch status: {msg}",
+                "job_id": job_obj.id,
+                "status": job_obj.status,
+                "redispatch_message": msg,
             }, status=status.HTTP_200_OK)
 
 
@@ -3454,7 +3825,7 @@ class WorkforceLocationUpdateView(APIView):
                             with transaction.atomic():
                                 locked_job = ServiceRequest.objects.select_for_update().get(id=job.id)
                                 if locked_job.status in ["accepted", "on_the_way", "en_route"]:
-                                    verification, _ = PreServiceVerification.objects.get_or_create(
+                                    verification, _ = PreServiceVerification.objects.select_for_update().get_or_create(
                                         job=locked_job,
                                         defaults={"employee": emp}
                                     )
@@ -3599,26 +3970,21 @@ class WorkforceJobLiveTrackingView(APIView):
         cust_lat = float(job.latitude) if job.latitude else None
         cust_lon = float(job.longitude) if job.longitude else None
 
-        # Privacy Guard: If job is completed/cancelled/closed, stop exposing live coordinates
-        if job.status in ["completed", "cancelled", "closed"]:
+        # Privacy Guard: If job is completed/cancelled/closed/redispatching, or has no assigned technician
+        if job.status in ["completed", "cancelled", "closed", "redispatching"] or not job.assigned_employee:
             return Response({
                 "job_id": job.id,
                 "request_id": job.request_id,
-                "status": job.status.upper(),
+                "status": "FINDING_NEW_PROFESSIONAL" if job.status == "redispatching" else job.status.upper(),
                 "customer_location": {
                     "latitude": cust_lat,
                     "longitude": cust_lon,
                     "address": job.address or "",
                 },
-                "assigned_technician": {
-                    "id": job.assigned_employee_id,
-                    "name": (job.assigned_employee.user.get_full_name() or job.assigned_employee.user.username) if job.assigned_employee else None,
-                    "phone": job.assigned_employee.phone if job.assigned_employee else "",
-                    "location": None,
-                } if job.assigned_employee else None,
+                "assigned_technician": None,
                 "distance_m": None,
                 "geofence_passed": True if job.status == "completed" else False,
-                "freshness_state": "LOCATION_LOST",
+                "freshness_state": "FINDING_NEW_PROFESSIONAL" if job.status == "redispatching" else "LOCATION_LOST",
                 "age_seconds": None,
                 "updated_at": now.isoformat(),
             }, status=status.HTTP_200_OK)
@@ -4126,20 +4492,34 @@ class WorkforceEmployeeComplianceView(APIView):
 
 # ─── 25. Workforce Realtime Stream (SSE) ──────────────────────────────────────
 
+class ServerSentEventRenderer(BaseRenderer):
+    media_type = "text/event-stream"
+    format = "txt"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        return data
+
+
 class WorkforceRealtimeStreamView(APIView):
     permission_classes = [permissions.AllowAny]
+    renderer_classes = [ServerSentEventRenderer, JSONRenderer]
 
     def get(self, request):
         user = request.user
         token_str = request.query_params.get("token")
-        if not user.is_authenticated and token_str:
+        if (not user or not user.is_authenticated) and token_str:
             try:
                 from rest_framework_simplejwt.tokens import AccessToken
                 access_token = AccessToken(token_str)
                 user_id = access_token.get("user_id")
-                User = get_user_model()
-                user = User.objects.filter(id=user_id).first()
-            except Exception:
+                if user_id is not None:
+                    User = get_user_model()
+                    try:
+                        user = User.objects.filter(id=int(user_id)).first()
+                    except (ValueError, TypeError):
+                        user = User.objects.filter(id=user_id).first()
+            except Exception as e:
+                logger.warning("WorkforceRealtimeStream token validation error: %s", str(e))
                 user = None
 
         if not user or not user.is_authenticated:
@@ -4857,7 +5237,10 @@ class WorkforceJobPreServiceStatusView(APIView):
 
         emp = getattr(request.user, "employee_profile", None)
         if not emp or job.assigned_employee != emp:
-            return Response({"error": "Unauthorized: Job is not assigned to you."}, status=status.HTTP_403_FORBIDDEN)
+            return Response({
+                "error": "Unauthorized: Job is not assigned to you.",
+                "code": "PRE_SERVICE_ACCESS_DENIED",
+            }, status=status.HTTP_403_FORBIDDEN)
 
         verification = PreServiceVerification.objects.filter(job=job).first()
         if not verification:
@@ -5863,6 +6246,167 @@ class WorkforceAdminLocationAssignEmployeeView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
         return Response({"message": "Employee removed from location."}, status=status.HTTP_200_OK)
+
+
+class WorkforceJobTimelineView(APIView):
+    """
+    Authoritative Observable Timeline for a single Workforce Job.
+    Correlates events across lifecycle, dispatch, offers, tracking, arrival, OTP, proof, and payments.
+    Accessible by Admin, Assigned Employee, and Customer Owner.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        user = request.user
+        job = ServiceRequest.objects.filter(pk=pk).first()
+        if not job:
+            return Response({"error": "Job not found.", "code": "NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Authorization: Admin (same company), Assigned Employee, or Customer Owner
+        is_admin = getattr(user, "role", None) == "admin" or user.is_staff
+        is_owner_cust = job.customer_id == user.id
+        emp_profile = getattr(user, "employee_profile", None)
+        is_assigned_emp = emp_profile and job.assigned_employee_id == emp_profile.id
+
+        if not (is_admin or is_owner_cust or is_assigned_emp):
+            return Response({"error": "Access denied.", "code": "UNAUTHORIZED"}, status=status.HTTP_403_FORBIDDEN)
+
+        def _sanitize_metadata(meta):
+            if not isinstance(meta, dict):
+                return {}
+            # Redact/exclude any sensitive keys: OTP plaintext, hashes, tokens, passwords
+            clean = {}
+            for k, v in meta.items():
+                if any(bad in k.lower() for bad in ["otp", "token", "password", "secret", "hash", "key"]):
+                    continue
+                clean[k] = v
+            return clean
+
+        timeline = []
+
+        # 1. Booking Creation
+        if job.created_at:
+            timeline.append({
+                "timestamp": job.created_at.isoformat(),
+                "event_type": "BOOKING_CREATED",
+                "title": "Booking Created",
+                "description": f"Customer {job.customer_name or 'Customer'} created booking #{job.request_id or job.id} for {job.issue_title or job.service_category}.",
+                "actor": job.customer_name or "Customer",
+                "metadata": {"total_amount": float(job.total_amount) if job.total_amount else 0, "payment_method": job.payment_method},
+            })
+
+        # 2. Offers
+        offers = WorkforceJobOffer.objects.filter(job=job).select_related("employee__user").order_by("offered_at")
+        for off in offers:
+            tech_name = off.employee.user.get_full_name() if off.employee and off.employee.user else f"Employee #{off.employee_id}"
+            timeline.append({
+                "timestamp": off.offered_at.isoformat(),
+                "event_type": "JOB_OFFER_DELIVERED",
+                "title": f"Offer Delivered ({off.status})",
+                "description": f"Exclusive offer #{off.id} delivered to {tech_name} (Rank score: {off.rank_score:.1f}).",
+                "actor": "Auto-Dispatch Engine",
+                "metadata": {"offer_id": off.id, "status": off.status, "employee_id": off.employee_id},
+            })
+
+        # 3. Lifecycle Events (Acceptance, Cancellation, Redispatch)
+        lc_events = WorkforceJobLifecycleEvent.objects.filter(job=job).select_related("employee__user", "actor_user").order_by("created_at")
+        for ev in lc_events:
+            actor_label = ev.actor_user.get_full_name() if ev.actor_user else "System"
+            timeline.append({
+                "timestamp": ev.created_at.isoformat(),
+                "event_type": ev.event_type,
+                "title": ev.get_event_type_display() if hasattr(ev, "get_event_type_display") else ev.event_type,
+                "description": f"Status transitioned to '{ev.new_status}'. Reason: {ev.reason_text or ev.reason_code or 'Standard Workflow'}",
+                "actor": actor_label,
+                "metadata": _sanitize_metadata(ev.metadata),
+            })
+
+        # 4. Tracking Sessions
+        sessions = JobTrackingSession.objects.filter(job=job).order_by("started_at")
+        for s in sessions:
+            timeline.append({
+                "timestamp": s.started_at.isoformat(),
+                "event_type": "TRACKING_STARTED",
+                "title": "Live GPS Tracking Started",
+                "description": f"Tracking session #{s.id} activated (Status: {s.status}).",
+                "actor": "GPS Subsystem",
+                "metadata": {"session_id": s.id, "status": s.status},
+            })
+            if s.ended_at:
+                timeline.append({
+                    "timestamp": s.ended_at.isoformat(),
+                    "event_type": "TRACKING_ENDED",
+                    "title": f"Tracking Session {s.status}",
+                    "description": f"Tracking session #{s.id} concluded as {s.status}.",
+                    "actor": "GPS Subsystem",
+                    "metadata": {"session_id": s.id, "status": s.status},
+                })
+
+        # 5. Pre-Service Verification (Arrival & OTP)
+        psv = PreServiceVerification.objects.filter(job=job).first()
+        if psv:
+            if psv.arrived_at:
+                timeline.append({
+                    "timestamp": psv.arrived_at.isoformat(),
+                    "event_type": "ARRIVAL_DETECTED",
+                    "title": "On-Site Arrival Confirmed",
+                    "description": "Technician crossed 300m arrival geofence with valid GPS telemetry.",
+                    "actor": "Geofence Engine",
+                    "metadata": {"arrival_lat": psv.arrival_lat, "arrival_lon": psv.arrival_lon},
+                })
+            if psv.otp_verified and psv.otp_verified_at:
+                timeline.append({
+                    "timestamp": psv.otp_verified_at.isoformat(),
+                    "event_type": "WORK_START_OTP_VERIFIED",
+                    "title": "Work Start OTP Verified",
+                    "description": "Customer shared 6-digit OTP code. Work scope authorized.",
+                    "actor": "Customer / Assigned Tech",
+                    "metadata": {"otp_verified": True},
+                })
+
+        # 6. Post-Service Proof
+        psp = PostServiceProof.objects.filter(job=job).first()
+        if psp and psp.is_submitted and psp.submitted_at:
+            timeline.append({
+                "timestamp": psp.submitted_at.isoformat(),
+                "event_type": "PROOF_SUBMITTED",
+                "title": "Post-Service Evidence Submitted",
+                "description": f"After-service appliance and work area photos submitted. Notes: {psp.completion_notes[:80]}...",
+                "actor": "Assigned Technician",
+                "metadata": {"is_submitted": True},
+            })
+
+        # 7. Payment Events
+        pmt_events = PaymentCollectionEvent.objects.filter(job_payment__job=job).order_by("created_at")
+        for pe in pmt_events:
+            actor_name = pe.actor_user.get_full_name() if pe.actor_user else "Payment Gateway"
+            timeline.append({
+                "timestamp": pe.created_at.isoformat(),
+                "event_type": pe.event_type,
+                "title": f"Payment: {pe.event_type}",
+                "description": f"₹{pe.amount} processed for Job #{job.id}.",
+                "actor": actor_name,
+                "metadata": _sanitize_metadata(pe.metadata),
+            })
+
+        # Sort timeline strictly chronological
+        timeline.sort(key=lambda x: x["timestamp"])
+
+        return Response({
+            "job_id": job.id,
+            "request_id": job.request_id,
+            "customer_name": job.customer_name,
+            "current_status": job.status,
+            "payment_status": job.payment_status,
+            "assigned_employee": {
+                "id": job.assigned_employee.id,
+                "name": job.assigned_employee.user.get_full_name() if job.assigned_employee and job.assigned_employee.user else None,
+                "employee_id": job.assigned_employee.employee_id if job.assigned_employee else None,
+            } if job.assigned_employee else None,
+            "event_count": len(timeline),
+            "timeline": timeline,
+        }, status=status.HTTP_200_OK)
+
 
 
 

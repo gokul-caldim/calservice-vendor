@@ -69,6 +69,7 @@ from .views import (
     WorkforceAdminPayrollProcessView,
     WorkforceMyPayslipsView,
     WorkforceJobAcceptOfferView,
+    WorkforceJobCancelAssignmentView,
     WorkforceJobRejectOfferView,
     WorkforceAutoDispatchTriggerView,
     WorkforceJobArriveView,
@@ -78,6 +79,7 @@ from .views import (
     WorkforceJobPreServicePhotoView,
     WorkforceJobPreServiceStatusView,
     WorkforceJobLiveTrackingView,
+    WorkforceJobTimelineView,
     WorkforceReportsView,
     WorkforceLatencyAuditView,
     WorkforceVerificationSuiteView,
@@ -151,6 +153,7 @@ urlpatterns = [
     path("dispatch/assign/", WorkforceDispatchAssignView.as_view(), name="workforce-dispatch-assign"),
     path("dispatch/auto-dispatch/<int:pk>/", WorkforceAutoDispatchTriggerView.as_view(), name="workforce-auto-dispatch-trigger"),
     path("jobs/<int:pk>/accept-offer/", WorkforceJobAcceptOfferView.as_view(), name="workforce-job-accept-offer"),
+    path("jobs/<int:pk>/cancel-assignment/", WorkforceJobCancelAssignmentView.as_view(), name="workforce-job-cancel-assignment"),
     path("jobs/<int:pk>/reject-offer/", WorkforceJobRejectOfferView.as_view(), name="workforce-job-reject-offer"),
     path("jobs/<int:pk>/arrive/", WorkforceJobArriveView.as_view(), name="workforce-job-arrive"),
     path("jobs/<int:pk>/verify-otp/", WorkforceJobVerifyOTPView.as_view(), name="workforce-job-verify-otp"),
@@ -159,6 +162,7 @@ urlpatterns = [
     path("jobs/<int:pk>/pre-service-photo/", WorkforceJobPreServicePhotoView.as_view(), name="workforce-job-pre-service-photo"),
     path("jobs/<int:pk>/pre-service-status/", WorkforceJobPreServiceStatusView.as_view(), name="workforce-job-pre-service-status"),
     path("jobs/<int:pk>/live-tracking/", WorkforceJobLiveTrackingView.as_view(), name="workforce-job-live-tracking"),
+    path("jobs/<int:pk>/timeline/", WorkforceJobTimelineView.as_view(), name="workforce-job-timeline"),
     path("customer/jobs/<int:pk>/tracking/", WorkforceJobLiveTrackingView.as_view(), name="workforce-customer-job-tracking"),
 
     # Work Extensions & Scope Approvals

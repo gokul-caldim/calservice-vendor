@@ -122,6 +122,13 @@ export async function apiAcceptJobOffer(jobId) {
   });
 }
 
+export async function apiCancelJobAssignment(jobId, reasonCode, reasonText = '') {
+  return await apiRequest(`/workforce/jobs/${jobId}/cancel-assignment/`, {
+    method: 'POST',
+    json: { reason_code: reasonCode, reason_text: reasonText },
+  });
+}
+
 export async function apiRejectJobOffer(jobId, reason = '') {
   return await apiRequest(`/workforce/jobs/${jobId}/reject-offer/`, {
     method: 'POST',
@@ -314,6 +321,13 @@ export async function apiRequestService(serviceId, name = '') {
   return await apiRequest('/workforce/services/request/', {
     method: 'POST',
     json: { service_id: serviceId, name },
+  });
+}
+
+export async function apiBulkRequestServices(serviceIds) {
+  return await apiRequest('/workforce/services/request/', {
+    method: 'POST',
+    json: { service_ids: serviceIds },
   });
 }
 
@@ -762,6 +776,13 @@ export async function apiRemoveEmployeeFromLocation(locationId, employeeId) {
     json: { employee_id: employeeId },
   });
 }
+
+// ── Job Lifecycle Timeline Observability (Phase 2) ───────────────────────────
+
+export async function apiGetJobTimeline(jobId) {
+  return await apiRequest(`/workforce/jobs/${jobId}/timeline/`);
+}
+
 
 
 

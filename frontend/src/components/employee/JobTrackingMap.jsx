@@ -58,6 +58,10 @@ function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
   return Math.round(R * c);
 }
 
+export const ROUTE_MIN_MOVEMENT_METERS = 50;
+export const ROUTE_MIN_REFRESH_SECONDS = 30;
+export const ROUTE_REQUEST_TIMEOUT_MS = 8000;
+
 export function JobTrackingMap({
   job,
   technicianLocation,
@@ -76,6 +80,7 @@ export function JobTrackingMap({
   const infoWindowRef = useRef(null);
   const lastDirectionsTimeRef = useRef(0);
   const lastRoutedCoordsRef = useRef({ lat: null, lng: null });
+  const lastDestCoordsRef = useRef({ lat: null, lng: null });
 
   const [apiLoaded, setApiLoaded] = useState(false);
   const [apiError, setApiError] = useState(null);
@@ -191,28 +196,41 @@ export function JobTrackingMap({
     animFrameRef.current = requestAnimationFrame(step);
   }, []);
 
-  // Request road directions and ETA via Google Maps Directions API
+  // Request road directions and ETA via Google Maps Directions API with strict cost controls
   const updateRoadRoute = useCallback((originLat, originLng, destLat, destLng, force = false) => {
     if (!window.google?.maps || !directionsServiceRef.current || !directionsRendererRef.current) return;
 
-    const now = Date.now();
-    // Debounce & throttle directions requests: at most once every 4 seconds or >30m movement
-    if (!force && now - lastDirectionsTimeRef.current < 4000) return;
+    // Active-job-only routing: do not route if job is completed or cancelled
+    if (job?.status && ['completed', 'cancelled'].includes(job.status.toLowerCase())) {
+      return;
+    }
 
-    if (!force && lastRoutedCoordsRef.current.lat != null && lastRoutedCoordsRef.current.lng != null) {
+    const now = Date.now();
+    const destChanged =
+      lastDestCoordsRef.current.lat !== destLat ||
+      lastDestCoordsRef.current.lng !== destLng;
+
+    // Debounce & throttle directions requests:
+    // Only call Google Directions if forced, destination changed, or technician moved >= 50m and >= 30s elapsed
+    if (!force && !destChanged && lastRoutedCoordsRef.current.lat != null && lastRoutedCoordsRef.current.lng != null) {
       const movedDist = calculateDistanceMeters(
         originLat,
         originLng,
         lastRoutedCoordsRef.current.lat,
         lastRoutedCoordsRef.current.lng
       );
-      if (movedDist != null && movedDist < 30 && now - lastDirectionsTimeRef.current < 30000) {
-        return;
+      if (
+        movedDist != null &&
+        movedDist < ROUTE_MIN_MOVEMENT_METERS &&
+        now - lastDirectionsTimeRef.current < ROUTE_MIN_REFRESH_SECONDS * 1000
+      ) {
+        return; // Reuse previous road route
       }
     }
 
     lastDirectionsTimeRef.current = now;
     lastRoutedCoordsRef.current = { lat: originLat, lng: originLng };
+    lastDestCoordsRef.current = { lat: destLat, lng: destLng };
 
     const origin = new window.google.maps.LatLng(originLat, originLng);
     const dest = new window.google.maps.LatLng(destLat, destLng);
@@ -247,7 +265,7 @@ export function JobTrackingMap({
         }
       }
     );
-  }, []);
+  }, [job?.status]);
 
   // Listen to live GPS location updates from single global watcher
   useEffect(() => {
@@ -325,7 +343,7 @@ export function JobTrackingMap({
   // Initialize interactive Google Map with custom high-visibility SVG pins
   useEffect(() => {
     if (!apiLoaded || !mapContainerRef.current) return;
-    if (!window.google?.maps?.Map || typeof window.google.maps.Map !== 'function') return;
+    if (!window.google?.maps?.Map || typeof window.google.maps.Map !== 'function' || !window.google?.maps?.ControlPosition) return;
 
     try {
       const google = window.google;

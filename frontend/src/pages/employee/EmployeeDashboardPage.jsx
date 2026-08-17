@@ -22,6 +22,7 @@ import {
   apiGetComplianceRecords,
   apiGetMySkills,
   apiAcceptJobOffer,
+  apiCancelJobAssignment,
   apiRejectJobOffer,
   apiVerifyOTP,
   apiResendOTP,
@@ -29,6 +30,7 @@ import {
   apiGetPreServiceStatus,
   apiGetCatalog,
   apiRequestService,
+  apiBulkRequestServices,
   apiRemoveService,
   apiVerifyArrival,
 } from '../../api/workforceService.js';
@@ -38,9 +40,9 @@ import { JobTrackingMap } from '../../components/employee/JobTrackingMap.jsx';
 
 import { AppShell } from '../../components/common/AppShell.jsx';
 import { StatusBadge } from '../../components/enterprise/StatusBadge.jsx';
-import { Modal } from '../../components/enterprise/Modal.jsx';
 import { ErrorState } from '../../components/enterprise/ErrorState.jsx';
 import { LiveCameraCaptureModal } from '../../components/common/LiveCameraCaptureModal.jsx';
+import { classifyApiError } from '../../utils/apiErrorHandler.js';
 import { useLocationTracker, getGPSPosition } from '../../hooks/useGPSPosition.js';
 import { apiUpdateLocationFull } from '../../api/workforceService.js';
 import {
@@ -90,12 +92,17 @@ export function EmployeeDashboardPage() {
   const [payslips, setPayslips] = useState([]);
   const [complianceRecords, setComplianceRecords] = useState([]);
   const [skills, setSkills] = useState([]);
+  const [selectedServiceIds, setSelectedServiceIds] = useState([]);
 
   // Decline Offer Modal State
   const [declineModalJob, setDeclineModalJob] = useState(null);
   const [selectedDeclineReason, setSelectedDeclineReason] = useState('Too far');
   const [customDeclineReason, setCustomDeclineReason] = useState('');
   const [isDecliningOffer, setIsDecliningOffer] = useState(false);
+
+  // Lost Offer / Race-Condition Modal State
+  const [lostOfferInfo, setLostOfferInfo] = useState(null); // { jobId, message }
+  const [realtimeStatus, setRealtimeStatus] = useState('DISCONNECTED'); // 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED'
 
   const incomingOffers = allJobs.filter(
     (j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired
@@ -109,6 +116,9 @@ export function EmployeeDashboardPage() {
   const isOnline = Boolean(user?.isOnline || employee?.is_online);
   const isClockedIn = Boolean(timeTracking?.is_clocked_in);
   const isBreak = timeTracking?.shift_status === 'on_break';
+
+  const allRequestedServices = profile?.all_requested_services || (profile?.bank_details?.onboarding?.services) || [];
+  const approvedServices = allRequestedServices.filter((s) => s.status === 'approved');
 
   const [currentLocation, setCurrentLocation] = useState(
     user?.last_known_location || employee?.user?.last_known_location || null
@@ -205,14 +215,103 @@ export function EmployeeDashboardPage() {
   const [paymentOtpInput, setPaymentOtpInput] = useState('');
   const [isVerifyingPaymentOtp, setIsVerifyingPaymentOtp] = useState(false);
 
+  // 5-Minute Cancellation State
+  const [cancellationModalJob, setCancellationModalJob] = useState(null);
+  const [selectedCancelReason, setSelectedCancelReason] = useState('VEHICLE_ISSUE');
+  const [cancelReasonText, setCancelReasonText] = useState('');
+  const [isCancellingJob, setIsCancellingJob] = useState(false);
+  const [currentTimeTick, setCurrentTimeTick] = useState(Date.now());
+
+  // 1-second interval to update remaining cancellation countdown live
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTimeTick(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const getRemainingCancellationTime = (job) => {
+    if (!job) return null;
+    const isStateAllowed = ['accepted', 'on_the_way'].includes((job.status || '').toLowerCase());
+    if (!isStateAllowed) return null;
+
+    const cancelInfo = job.cancellation_info;
+    const deadline = cancelInfo?.cancellation_deadline || (
+      cancelInfo?.accepted_at ? new Date(new Date(cancelInfo.accepted_at).getTime() + 5 * 60 * 1000).toISOString() : null
+    );
+
+    if (!deadline) return null;
+    const deadlineMs = new Date(deadline).getTime();
+    const remainingMs = deadlineMs - currentTimeTick;
+    if (remainingMs <= 0) {
+      return { expired: true, text: 'Cancellation window closed' };
+    }
+    const totalSec = Math.floor(remainingMs / 1000);
+    const mins = Math.floor(totalSec / 60).toString().padStart(2, '0');
+    const secs = (totalSec % 60).toString().padStart(2, '0');
+    return { expired: false, text: `${mins}:${secs}`, totalSec };
+  };
+
+  const handleOpenCancellationModal = (job) => {
+    const target = job || selectedJob;
+    if (!target) return;
+    setCancellationModalJob(target);
+    setSelectedCancelReason('VEHICLE_ISSUE');
+    setCancelReasonText('');
+  };
+
+  const handleConfirmCancelAssignment = async (e) => {
+    if (e) e.preventDefault();
+    if (!cancellationModalJob) return;
+
+    if (selectedCancelReason === 'OTHER' && cancelReasonText.trim().length < 5) {
+      setError('Please explain the reason (minimum 5 characters).');
+      return;
+    }
+
+    try {
+      setIsCancellingJob(true);
+      setActionLoading(cancellationModalJob.id);
+      const res = await apiCancelJobAssignment(
+        cancellationModalJob.id,
+        selectedCancelReason,
+        cancelReasonText.trim()
+      );
+      setCancellationModalJob(null);
+      setCancelReasonText('');
+      setSuccessMsg(res.message || 'Job cancelled. Finding another professional...');
+      await loadDashboard();
+      setTimeout(() => setSuccessMsg(''), 5000);
+    } catch (err) {
+      setError(err.message || 'Failed to cancel job assignment.');
+    } finally {
+      setIsCancellingJob(false);
+      setActionLoading(null);
+    }
+  };
+
+  // Track jobs that returned 403 or are forbidden to prevent looping console errors
+  const forbiddenPreServiceJobsRef = React.useRef(new Set());
+
   // Fetch pre-service status once on job selection
   useEffect(() => {
-    if (selectedJob?.id) {
-      apiGetPreServiceStatus(selectedJob.id)
-        .then((res) => setPreServiceState(res))
-        .catch(() => {});
+    if (!selectedJob?.id) return;
+    if (forbiddenPreServiceJobsRef.current.has(selectedJob.id)) return;
+
+    // Only fetch if employee is assigned or job is in an active workload state
+    const isAssigned = selectedJob.assigned_employee === user?.id || selectedJob.assigned_employee === employee?.id;
+    if (!isAssigned && !['accepted', 'on_the_way', 'arrived', 'in_progress'].includes((selectedJob.status || '').toLowerCase())) {
+      return;
     }
-  }, [selectedJob?.id]);
+
+    apiGetPreServiceStatus(selectedJob.id)
+      .then((res) => setPreServiceState(res))
+      .catch((err) => {
+        if (err?.status === 403 || err?.code === 'PRE_SERVICE_ACCESS_DENIED') {
+          forbiddenPreServiceJobsRef.current.add(selectedJob.id);
+        }
+      });
+  }, [selectedJob?.id, selectedJob?.assigned_employee, selectedJob?.status, user?.id, employee?.id]);
 
   // Poll pre-service status every 4s while job is active and arrival not yet confirmed
   useEffect(() => {
@@ -220,20 +319,30 @@ export function EmployeeDashboardPage() {
     if (
       !selectedJob?.id ||
       !activeStatuses.includes((selectedJob.status || '').toLowerCase()) ||
-      preServiceState.geofence_passed
+      preServiceState.geofence_passed ||
+      forbiddenPreServiceJobsRef.current.has(selectedJob.id)
     ) {
       return;
     }
+    let isCancelled = false;
     const interval = setInterval(async () => {
       try {
         const res = await apiGetPreServiceStatus(selectedJob.id);
-        if (res?.geofence_passed) {
+        if (!isCancelled && res?.geofence_passed) {
           setPreServiceState(res);
           setSelectedJob((prev) => (prev ? { ...prev, status: 'arrived' } : prev));
         }
-      } catch (_) {}
+      } catch (err) {
+        if (err?.status === 403 || err?.code === 'PRE_SERVICE_ACCESS_DENIED') {
+          forbiddenPreServiceJobsRef.current.add(selectedJob.id);
+          clearInterval(interval);
+        }
+      }
     }, 4000);
-    return () => clearInterval(interval);
+    return () => {
+      isCancelled = true;
+      clearInterval(interval);
+    };
   }, [selectedJob?.id, selectedJob?.status, preServiceState.geofence_passed]);
 
   const handleVerifyOtpSubmit = async () => {
@@ -464,31 +573,96 @@ export function EmployeeDashboardPage() {
     return () => window.removeEventListener('workforce:location-updated', handleLocationUpdate);
   }, []);
 
-  // Realtime Event Stream Integration (SSE): instantaneous job offer delivery
+  // Realtime Event Stream Integration (SSE) with resilient auto-reconnection and state reconciliation
   useEffect(() => {
-    if (!isOnline) return;
+    if (!isOnline) {
+      setRealtimeStatus('DISCONNECTED');
+      return;
+    }
+
     let eventSource = null;
-    try {
-      const token = localStorage.getItem('token') || localStorage.getItem('access_token') || sessionStorage.getItem('token') || '';
-      const streamUrl = token ? `/api/workforce/realtime/stream/?token=${encodeURIComponent(token)}` : '/api/workforce/realtime/stream/';
-      eventSource = new EventSource(streamUrl);
-      eventSource.addEventListener('workforce_event', (e) => {
-        try {
-          const data = JSON.parse(e.data);
-          if (['OFFER_CREATED', 'JOB_OFFER', 'JOB_ASSIGNED', 'ARRIVAL_DETECTED'].includes(data.event_type)) {
-            loadDashboard();
+    let reconnectTimeout = null;
+    let retryDelay = 2000; // start at 2s, back off up to 16s
+    let isSubscribed = true;
+
+    const connectSSE = () => {
+      if (!isSubscribed) return;
+      try {
+        const token = sessionStorage.getItem('wf_token') || localStorage.getItem('wf_token') || '';
+        if (!token) {
+          setRealtimeStatus('DISCONNECTED');
+          return;
+        }
+
+        const streamUrl = `/api/workforce/realtime/stream/?token=${encodeURIComponent(token)}`;
+        eventSource = new EventSource(streamUrl);
+
+        eventSource.onopen = () => {
+          if (!isSubscribed) return;
+          setRealtimeStatus('CONNECTED');
+          retryDelay = 2000; // reset delay on successful connection
+          // Reconcile latest authoritative REST state on fresh/re-established connection
+          loadDashboardRef.current?.();
+        };
+
+        eventSource.addEventListener('workforce_event', (e) => {
+          if (!isSubscribed) return;
+          try {
+            const data = JSON.parse(e.data);
+            if (data.event_type === 'JOB_OFFER_CLOSED') {
+              setLostOfferInfo({
+                jobId: data.payload?.job_id,
+                message: data.payload?.message || 'Another professional accepted this request. Offer closed automatically.',
+              });
+              loadDashboardRef.current?.();
+              return;
+            }
+            if ([
+              'OFFER_CREATED',
+              'JOB_OFFER',
+              'JOB_ASSIGNED',
+              'ARRIVAL_DETECTED',
+              'EMPLOYEE_JOB_ACCEPTED',
+              'EMPLOYEE_CANCELLED',
+              'EMPLOYEE_JOB_CANCELLED',
+              'NEW_EMPLOYEE_ASSIGNED',
+              'DISPATCH_STARTED',
+              'JOB_COMPLETED',
+              'PAYMENT_PAID',
+            ].includes(data.event_type)) {
+              loadDashboardRef.current?.();
+            }
+          } catch (_) {}
+        });
+
+        eventSource.onerror = () => {
+          if (!isSubscribed) return;
+          setRealtimeStatus('RECONNECTING');
+          if (eventSource) {
+            eventSource.close();
+            eventSource = null;
           }
-        } catch (_) {}
-      });
-      eventSource.onerror = () => {
-        if (eventSource) eventSource.close();
-      };
-    } catch (_) {}
+          // Schedule reconnect with exponential backoff
+          reconnectTimeout = setTimeout(() => {
+            retryDelay = Math.min(retryDelay * 1.5, 16000);
+            connectSSE();
+          }, retryDelay);
+        };
+      } catch (_) {
+        setRealtimeStatus('RECONNECTING');
+        reconnectTimeout = setTimeout(connectSSE, retryDelay);
+      }
+    };
+
+    connectSSE();
 
     return () => {
+      isSubscribed = false;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
       if (eventSource) eventSource.close();
+      setRealtimeStatus('DISCONNECTED');
     };
-  }, [isOnline, loadDashboard]);
+  }, [isOnline]);
 
   // Silent background job queue safety-net polling when technician is ONLINE (12s interval)
   useEffect(() => {
@@ -577,6 +751,61 @@ export function EmployeeDashboardPage() {
       setTimeout(() => setSuccessMsg(''), 4000);
     } catch (err) {
       setError(err.message || 'Failed to submit service removal request.');
+    } finally {
+      setServiceActionLoading(null);
+    }
+  };
+
+  const getRequestableServices = (servicesList = []) => {
+    return servicesList.filter((s) => {
+      const existing = (allRequestedServices || []).find((req) => String(req.id) === String(s.id));
+      return !existing || (existing.status !== 'approved' && existing.status !== 'pending');
+    });
+  };
+
+  const allRequestableServices = (catalogCategories || []).flatMap((cat) => getRequestableServices(cat.services || []));
+
+  const handleToggleSelectService = (serviceId) => {
+    setSelectedServiceIds((prev) =>
+      prev.includes(serviceId) ? prev.filter((id) => id !== serviceId) : [...prev, serviceId]
+    );
+  };
+
+  const handleToggleCategorySelect = (categoryServices = []) => {
+    const requestable = getRequestableServices(categoryServices).map((s) => s.id);
+    if (requestable.length === 0) return;
+    const allSelected = requestable.every((id) => selectedServiceIds.includes(id));
+    if (allSelected) {
+      setSelectedServiceIds((prev) => prev.filter((id) => !requestable.includes(id)));
+    } else {
+      setSelectedServiceIds((prev) => Array.from(new Set([...prev, ...requestable])));
+    }
+  };
+
+  const handleToggleAllServices = (allRequestable) => {
+    const allIds = allRequestable.map((s) => s.id);
+    if (allIds.length === 0) return;
+    const allSelected = allIds.length > 0 && allIds.every((id) => selectedServiceIds.includes(id));
+    if (allSelected) {
+      setSelectedServiceIds([]);
+    } else {
+      setSelectedServiceIds(allIds);
+    }
+  };
+
+  const handleBulkRequestServices = async () => {
+    if (selectedServiceIds.length === 0) return;
+    try {
+      setServiceActionLoading('bulk');
+      setError('');
+      const res = await apiBulkRequestServices(selectedServiceIds);
+      setSuccessMsg(res.message || `Submitted authorization requests for ${selectedServiceIds.length} service(s).`);
+      setSelectedServiceIds([]);
+      const updatedProfile = await apiGetOnboardingProfile().catch(() => null);
+      if (updatedProfile) setProfile(updatedProfile);
+      setTimeout(() => setSuccessMsg(''), 4000);
+    } catch (err) {
+      setError(err.message || 'Failed to submit bulk service authorization requests.');
     } finally {
       setServiceActionLoading(null);
     }
@@ -681,7 +910,16 @@ export function EmployeeDashboardPage() {
       await loadDashboard();
       setTimeout(() => setSuccessMsg(''), 4000);
     } catch (err) {
-      setError(err.message || 'Failed to accept job offer.');
+      const classified = classifyApiError(err);
+      if (classified.isOfferLost || err?.status === 409) {
+        setLostOfferInfo({
+          jobId,
+          message: classified.message,
+        });
+        await loadDashboard();
+      } else {
+        setError(classified.message);
+      }
     } finally {
       setActionLoading(null);
     }
@@ -829,9 +1067,6 @@ export function EmployeeDashboardPage() {
       setIsSubmittingLeave(false);
     }
   };
-
-  const allRequestedServices = profile?.all_requested_services || (profile?.bank_details?.onboarding?.services) || [];
-  const approvedServices = allRequestedServices.filter((s) => s.status === 'approved');
 
   return (
     <AppShell breadcrumbs={[{ label: 'Home' }, { label: 'Technician Hub' }]}>
@@ -1264,57 +1499,161 @@ export function EmployeeDashboardPage() {
 
             {/* 4. Available Service Catalog */}
             <div className="space-y-3 pt-2">
-              <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider border-b border-slate-100 pb-2">
-                Available Service Catalog
-              </h3>
-              <div className="space-y-4">
-                {catalogCategories.map((cat) => (
-                  <div key={cat.id || cat.name} className="border border-slate-200 rounded overflow-hidden">
-                    <div className="bg-slate-50 px-3.5 py-2 border-b border-slate-200 font-bold text-xs text-slate-800">
-                      {cat.name}
-                    </div>
-                    <div className="divide-y divide-slate-100">
-                      {(cat.services || []).map((s) => {
-                        const existing = allRequestedServices.find((req) => String(req.id) === String(s.id));
-                        const isApproved = existing?.status === 'approved';
-                        const isPending = existing?.status === 'pending';
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 pb-3">
+                <div>
+                  <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                    Available Service Catalog
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    Select the services you are qualified to deliver and request administrative authorization.
+                  </p>
+                </div>
 
-                        return (
-                          <div key={s.id} className="p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-slate-50/50">
-                            <div>
-                              <p className="font-semibold text-slate-900 text-xs">{s.name}</p>
-                              <p className="text-[10px] text-slate-500 font-mono">
-                                Approx. {s.duration || 60} mins
-                              </p>
-                            </div>
-                            <div>
-                              {isApproved ? (
-                                <span className="px-2.5 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded text-xs font-bold flex items-center gap-1">
-                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                                  Authorized
-                                </span>
-                              ) : isPending ? (
-                                <span className="px-2.5 py-1 bg-amber-50 text-amber-700 border border-amber-200 rounded text-xs font-bold flex items-center gap-1">
-                                  <Clock className="w-3.5 h-3.5 text-amber-600" />
-                                  Pending Review
-                                </span>
-                              ) : (
-                                <button
-                                  type="button"
-                                  onClick={() => handleRequestService(s.id, s.name)}
-                                  disabled={serviceActionLoading === s.id}
-                                  className="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded transition-colors shadow-sm disabled:opacity-50"
-                                >
-                                  {serviceActionLoading === s.id ? 'Submitting...' : 'Request Authorization'}
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
+                {/* Global Select All & Bulk Action Bar */}
+                {allRequestableServices.length > 0 && (
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <label className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded cursor-pointer transition-colors border border-slate-200 select-none">
+                      <input
+                        type="checkbox"
+                        checked={allRequestableServices.length > 0 && allRequestableServices.every((s) => selectedServiceIds.includes(s.id))}
+                        ref={(el) => {
+                          if (el) {
+                            const isAll = allRequestableServices.length > 0 && allRequestableServices.every((s) => selectedServiceIds.includes(s.id));
+                            const isSome = allRequestableServices.some((s) => selectedServiceIds.includes(s.id));
+                            el.indeterminate = isSome && !isAll;
+                          }
+                        }}
+                        onChange={() => handleToggleAllServices(allRequestableServices)}
+                        className="w-3.5 h-3.5 text-blue-600 rounded border-slate-300 focus:ring-blue-500 cursor-pointer"
+                      />
+                      <span>Select All Available ({allRequestableServices.length})</span>
+                    </label>
+
+                    {selectedServiceIds.length > 0 && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={handleBulkRequestServices}
+                          disabled={serviceActionLoading === 'bulk'}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded transition-colors shadow-sm disabled:opacity-50"
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          {serviceActionLoading === 'bulk'
+                            ? 'Submitting...'
+                            : `Request Authorization (${selectedServiceIds.length})`}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedServiceIds([])}
+                          className="px-2 py-1 text-slate-500 hover:text-slate-700 text-xs font-medium rounded hover:bg-slate-100 transition-colors"
+                        >
+                          Clear ({selectedServiceIds.length})
+                        </button>
+                      </>
+                    )}
                   </div>
-                ))}
+                )}
+              </div>
+
+              <div className="space-y-4">
+                {catalogCategories.map((cat) => {
+                  const catServices = cat.services || [];
+                  const catRequestable = getRequestableServices(catServices);
+                  const catRequestableIds = catRequestable.map((s) => s.id);
+                  const isCatAllSelected = catRequestableIds.length > 0 && catRequestableIds.every((id) => selectedServiceIds.includes(id));
+                  const isCatPartiallySelected = catRequestableIds.some((id) => selectedServiceIds.includes(id)) && !isCatAllSelected;
+
+                  return (
+                    <div key={cat.id || cat.name} className="border border-slate-200 rounded overflow-hidden shadow-xs">
+                      <div className="bg-slate-50 px-3.5 py-2.5 border-b border-slate-200 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-xs text-slate-800">{cat.name}</span>
+                          <span className="text-[10px] text-slate-500 font-medium bg-slate-200/60 px-1.5 py-0.5 rounded-full">
+                            {catServices.length} {catServices.length === 1 ? 'service' : 'services'}
+                          </span>
+                        </div>
+
+                        {catRequestable.length > 0 ? (
+                          <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 font-medium cursor-pointer select-none hover:text-slate-900">
+                            <input
+                              type="checkbox"
+                              checked={isCatAllSelected}
+                              ref={(el) => {
+                                if (el) el.indeterminate = isCatPartiallySelected;
+                              }}
+                              onChange={() => handleToggleCategorySelect(catServices)}
+                              className="w-3.5 h-3.5 text-blue-600 rounded border-slate-300 focus:ring-blue-500 cursor-pointer"
+                            />
+                            <span className="text-[11px] font-semibold">Select All in {cat.name} ({catRequestable.length})</span>
+                          </label>
+                        ) : (
+                          <span className="text-[10px] text-slate-400 font-medium italic">
+                            All services requested/authorized
+                          </span>
+                        )}
+                      </div>
+                      <div className="divide-y divide-slate-100">
+                        {catServices.map((s) => {
+                          const existing = allRequestedServices.find((req) => String(req.id) === String(s.id));
+                          const isApproved = existing?.status === 'approved';
+                          const isPending = existing?.status === 'pending';
+                          const isRequestable = !isApproved && !isPending;
+                          const isChecked = selectedServiceIds.includes(s.id);
+
+                          return (
+                            <div
+                              key={s.id}
+                              className={`p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 transition-colors ${
+                                isChecked ? 'bg-blue-50/40' : 'hover:bg-slate-50/50'
+                              }`}
+                            >
+                              <div className="flex items-center gap-3">
+                                {isRequestable ? (
+                                  <input
+                                    type="checkbox"
+                                    checked={isChecked}
+                                    onChange={() => handleToggleSelectService(s.id)}
+                                    className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500 cursor-pointer mt-0.5 sm:mt-0"
+                                  />
+                                ) : (
+                                  <div className="w-4" />
+                                )}
+                                <div>
+                                  <p className="font-semibold text-slate-900 text-xs">{s.name}</p>
+                                  <p className="text-[10px] text-slate-500 font-mono">
+                                    Approx. {s.duration || 60} mins
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                {isApproved ? (
+                                  <span className="px-2.5 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded text-xs font-bold flex items-center gap-1">
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                                    Authorized
+                                  </span>
+                                ) : isPending ? (
+                                  <span className="px-2.5 py-1 bg-amber-50 text-amber-700 border border-amber-200 rounded text-xs font-bold flex items-center gap-1">
+                                    <Clock className="w-3.5 h-3.5 text-amber-600" />
+                                    Pending Review
+                                  </span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRequestService(s.id, s.name)}
+                                    disabled={serviceActionLoading === s.id || serviceActionLoading === 'bulk'}
+                                    className="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded transition-colors shadow-sm disabled:opacity-50"
+                                  >
+                                    {serviceActionLoading === s.id ? 'Submitting...' : 'Request Authorization'}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
@@ -1778,6 +2117,41 @@ export function EmployeeDashboardPage() {
                             </div>
                           )}
 
+
+                          {/* 5-Minute Cancellation Status Banner */}
+                          {(selectedJob.status === 'accepted' || selectedJob.status === 'on_the_way') && (() => {
+                            const cancelTime = getRemainingCancellationTime(selectedJob);
+                            if (!cancelTime) return null;
+                            return (
+                              <div className={`w-full p-3 rounded-lg border flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 ${
+                                cancelTime.expired ? 'bg-slate-50 border-slate-200 text-slate-600' : 'bg-rose-50 border-rose-200 text-rose-900 shadow-2xs'
+                              }`}>
+                                <div className="flex items-center gap-2">
+                                  <Clock className={`w-4 h-4 shrink-0 ${cancelTime.expired ? 'text-slate-400' : 'text-rose-600 animate-pulse'}`} />
+                                  <div>
+                                    <span className="font-bold text-xs">
+                                      {cancelTime.expired ? 'Cancellation window closed' : `Cancellation available for: ${cancelTime.text}`}
+                                    </span>
+                                    <p className="text-[10px] text-slate-500">
+                                      {cancelTime.expired
+                                        ? 'Self-cancellation window has passed. Contact dispatch operations if you cannot proceed.'
+                                        : 'You may cancel within 5 minutes of acceptance. A qualified nearby professional will be redispatched automatically.'}
+                                    </p>
+                                  </div>
+                                </div>
+                                {!cancelTime.expired && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenCancellationModal(selectedJob)}
+                                    disabled={actionLoading === selectedJob.id || isCancellingJob}
+                                    className="shrink-0 px-3 py-1.5 rounded bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs transition-colors flex items-center justify-center gap-1 cursor-pointer disabled:opacity-50"
+                                  >
+                                    <span>Cancel Job</span>
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })()}
 
                           {(selectedJob.status === 'accepted' || selectedJob.status === 'on_the_way' || selectedJob.status === 'arrived') && (
                             <div id="arrival-verification-checklist" className="w-full space-y-3.5 border border-slate-200 rounded-lg p-3.5 bg-slate-50/50 mt-1 scroll-mt-6">
@@ -2726,6 +3100,90 @@ export function EmployeeDashboardPage() {
           </form>
         </Modal>
 
+        {/* Modal: Structured 5-Minute Job Assignment Cancellation */}
+        <Modal
+          isOpen={Boolean(cancellationModalJob)}
+          onClose={() => !isCancellingJob && setCancellationModalJob(null)}
+          title={`Cancel Job? — Job #${cancellationModalJob?.id || ''}`}
+        >
+          <form onSubmit={handleConfirmCancelAssignment} className="space-y-4 text-xs">
+            <div className="bg-rose-50 border border-rose-200 rounded p-3 text-rose-900 space-y-1">
+              <p className="font-bold text-xs flex items-center gap-1.5">
+                <Clock className="w-3.5 h-3.5 text-rose-600" />
+                You can cancel this job only within 5 minutes of acceptance.
+              </p>
+              <p className="text-[11px] text-rose-800">
+                Cancelling will release your availability to AVAILABLE and automatically redispatch this job to the next nearest eligible professional. The customer's booking will NOT be cancelled.
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-slate-700 font-bold mb-2">
+                Please select a reason for cancellation:
+              </label>
+              <div className="space-y-2 bg-slate-50 p-3 rounded border border-slate-200">
+                {[
+                  { code: 'VEHICLE_ISSUE', label: 'Vehicle problem' },
+                  { code: 'TRAFFIC_ROUTE_ISSUE', label: 'Traffic / route issue' },
+                  { code: 'TOO_FAR', label: 'Too far' },
+                  { code: 'SERVICE_MISMATCH', label: 'Service mismatch' },
+                  { code: 'CUSTOMER_LOCATION_ISSUE', label: 'Customer location issue' },
+                  { code: 'SAFETY_CONCERN', label: 'Safety concern' },
+                  { code: 'PERSONAL_EMERGENCY', label: 'Personal emergency' },
+                  { code: 'OTHER', label: 'Other' },
+                ].map((item) => (
+                  <label key={item.code} className="flex items-center gap-2.5 cursor-pointer text-slate-800 font-medium">
+                    <input
+                      type="radio"
+                      name="cancelAssignmentReason"
+                      value={item.code}
+                      checked={selectedCancelReason === item.code}
+                      onChange={(e) => setSelectedCancelReason(e.target.value)}
+                      className="text-rose-600 focus:ring-rose-500"
+                    />
+                    <span>{item.label}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {selectedCancelReason === 'OTHER' && (
+              <div>
+                <label className="block text-slate-700 font-bold mb-1">
+                  Please explain the reason (minimum 5 characters) <span className="text-rose-600">*</span>
+                </label>
+                <textarea
+                  required
+                  rows={3}
+                  minLength={5}
+                  placeholder="Explain the reason for cancellation..."
+                  value={cancelReasonText}
+                  onChange={(e) => setCancelReasonText(e.target.value)}
+                  className="w-full border border-slate-300 rounded px-3 py-2 text-slate-800 text-xs focus:ring-2 focus:ring-rose-500 focus:outline-none bg-white"
+                />
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+              <button
+                type="button"
+                disabled={isCancellingJob}
+                onClick={() => setCancellationModalJob(null)}
+                className="px-3.5 py-1.5 rounded border border-slate-300 text-slate-700 font-semibold hover:bg-slate-50 cursor-pointer disabled:opacity-50"
+              >
+                Keep Job
+              </button>
+              <button
+                type="submit"
+                disabled={isCancellingJob || (selectedCancelReason === 'OTHER' && cancelReasonText.trim().length < 5)}
+                className="px-4 py-1.5 rounded bg-rose-600 text-white font-bold hover:bg-rose-700 shadow-sm transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
+              >
+                {isCancellingJob ? 'Cancelling & Redispatching...' : 'Cancel Job'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+
         {/* Cash Collection Modal */}
         <Modal
           isOpen={Boolean(cashModalJob)}
@@ -2799,6 +3257,34 @@ export function EmployeeDashboardPage() {
               </div>
             </form>
           )}
+        </Modal>
+
+        {/* Modal: Job No Longer Available / Race Condition Notification */}
+        <Modal
+          isOpen={Boolean(lostOfferInfo)}
+          onClose={() => setLostOfferInfo(null)}
+          title="Job No Longer Available"
+        >
+          <div className="p-6 text-center space-y-4">
+            <div className="w-12 h-12 rounded-full bg-amber-100 text-amber-600 flex items-center justify-center mx-auto shadow-sm">
+              <AlertTriangle className="w-6 h-6" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-slate-800">Job No Longer Available</h3>
+              <p className="text-xs text-slate-600 mt-1">
+                {lostOfferInfo?.message || 'Another professional has accepted this request. Offer closed automatically.'}
+              </p>
+            </div>
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={() => setLostOfferInfo(null)}
+                className="w-full py-2 px-4 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded-lg text-xs transition shadow-sm cursor-pointer"
+              >
+                OK
+              </button>
+            </div>
+          </div>
         </Modal>
 
         {/* Real-Time Live Camera Viewfinder & Snapshot Modal */}

@@ -191,6 +191,18 @@ export function AuthProvider({ children }) {
     };
   }, []);
 
+  // Handle unauthenticated event triggered from client.js on 401
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      setUser(null);
+      setEmployee(null);
+    };
+    window.addEventListener('workforce:auth-unauthorized', handleUnauthorized);
+    return () => {
+      window.removeEventListener('workforce:auth-unauthorized', handleUnauthorized);
+    };
+  }, []);
+
   useEffect(() => {
     const timer = setTimeout(() => setIsReady(true), 4000);
     refreshProfile()

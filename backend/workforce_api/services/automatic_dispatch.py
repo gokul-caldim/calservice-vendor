@@ -38,7 +38,7 @@ MAX_DISPATCH_RADIUS_KM = 50.0
 DEFAULT_OFFER_DURATION_MINUTES = 5
 
 # Dispatchable database statuses
-DISPATCHABLE_STATUSES = ["draft", "new_request", "confirmed", "unassigned", "assigned"]
+DISPATCHABLE_STATUSES = ["draft", "new_request", "confirmed", "unassigned", "assigned", "redispatching"]
 
 # Canonical service synonyms and explicit alias dictionary
 EXPLICIT_SERVICE_ALIASES = {
@@ -234,7 +234,7 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
     else:
         active_job = ServiceRequest.objects.filter(
             assigned_employee=emp,
-            status__in=["accepted", "on_the_way", "arrived", "in_progress"],
+            status__in=["accepted", "on_the_way", "arrived", "in_progress", "service_completed", "proof_submitted", "payment_pending"],
         ).first()
         if active_job:
             gate_results["G9"] = False
@@ -244,7 +244,7 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
     return True, "All 9 Eligibility Gates Passed", gate_results
 
 
-def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) -> List[Dict[str, Any]]:
+def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, excluded_employee_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """
     Finds and ranks all eligible candidate employees for a given ServiceRequest.
     Uses database-level filtering and prefetching for optimal WAN performance.
@@ -271,7 +271,7 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
     today_dow = timezone.now().weekday()
     busy_subquery = ServiceRequest.objects.filter(
         assigned_employee_id=OuterRef("pk"),
-        status__in=["accepted", "on_the_way", "arrived", "in_progress"]
+        status__in=["accepted", "on_the_way", "arrived", "in_progress", "service_completed", "proof_submitted", "payment_pending"]
     )
 
     candidates_qs = (
@@ -307,10 +307,15 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
     if job_obj.company_id:
         candidates_qs = candidates_qs.filter(company_id=job_obj.company_id)
 
-    # Exclude candidates who have already received or rejected an offer for this job
+    # Exclude candidates who have already received or rejected/cancelled an offer for this job, or explicitly excluded
     previous_offers = set(
-        WorkforceJobOffer.objects.filter(job=job_obj).values_list("employee_id", flat=True)
+        WorkforceJobOffer.objects.filter(
+            job=job_obj,
+            status__in=["OFFERED", "REJECTED", "CANCELLED", "ACCEPTED"]
+        ).values_list("employee_id", flat=True)
     )
+    if excluded_employee_ids:
+        previous_offers.update(excluded_employee_ids)
 
     ranked_candidates = []
     now = timezone.now()
@@ -424,7 +429,7 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
     return ranked_candidates
 
 
-def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) -> Tuple[bool, str]:
+def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, excluded_employee_ids: Optional[List[int]] = None) -> Tuple[bool, str]:
     """
     Executes automatic dispatch for a single ServiceRequest:
     1. Locks ServiceRequest row with select_for_update inside transaction.atomic()
@@ -480,7 +485,11 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
         )
 
         # Find eligible candidate technicians
-        candidates = get_eligible_candidates(job_obj, max_gps_age_seconds=max_gps_age_seconds)
+        candidates = get_eligible_candidates(
+            job_obj,
+            max_gps_age_seconds=max_gps_age_seconds,
+            excluded_employee_ids=excluded_employee_ids,
+        )
 
         WorkforceEventLog.objects.create(
             event_type="CANDIDATES_EVALUATED",
@@ -488,7 +497,7 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
         )
 
         if not candidates:
-            if job_obj.status != "unassigned":
+            if job_obj.status not in ["unassigned", "redispatching"]:
                 job_obj.status = "unassigned"
                 job_obj.save(update_fields=["status"])
 

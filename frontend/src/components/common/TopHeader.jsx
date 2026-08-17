@@ -88,19 +88,32 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
 
   // 10s silent background notification polling
   useEffect(() => {
-    if (!user) return;
+    const token = typeof window !== 'undefined'
+      ? (sessionStorage.getItem('wf_token') || localStorage.getItem('wf_token'))
+      : null;
+    if (!user || !token) return;
+    let isCancelled = false;
+    let pollInterval = null;
+
     const fetchNotifs = async () => {
       try {
-        const res = await apiGetNotifications().catch(() => null);
-        if (res) {
+        const res = await apiGetNotifications();
+        if (!isCancelled && res) {
           setNotifications(res.notifications || []);
           setUnreadCount(res.unread_count || 0);
         }
-      } catch (_) {}
+      } catch (err) {
+        if (err?.status === 401 || err?.response?.status === 401) {
+          if (pollInterval) clearInterval(pollInterval);
+        }
+      }
     };
     fetchNotifs();
-    const interval = setInterval(fetchNotifs, 10000);
-    return () => clearInterval(interval);
+    pollInterval = setInterval(fetchNotifs, 10000);
+    return () => {
+      isCancelled = true;
+      if (pollInterval) clearInterval(pollInterval);
+    };
   }, [user]);
 
   const handleMarkAllRead = async () => {

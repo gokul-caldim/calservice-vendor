@@ -91,6 +91,7 @@ class ServiceRequest(models.Model):
         EN_ROUTE              = "en_route",              "En Route"
         ARRIVED               = "arrived",               "Arrived"
         IN_PROGRESS           = "in_progress",           "In Progress"
+        REDISPATCHING         = "redispatching",         "Redispatching"
         COMPLETED             = "completed",             "Completed"
         CANCELLED             = "cancelled",             "Cancelled"
         UNABLE_TO_COMPLETE    = "unable_to_complete",    "Unable To Complete"
@@ -168,6 +169,16 @@ class ServiceRequest(models.Model):
         null=True, blank=True,
         related_name="assigned_service_requests",
     )
+
+    workforce_job_id = models.CharField(max_length=100, blank=True, default="")
+    external_assignment_id = models.CharField(max_length=100, blank=True, default="")
+    technician_name = models.CharField(max_length=200, blank=True, default="")
+    technician_phone = models.CharField(max_length=50, blank=True, default="")
+    technician_photo = models.TextField(blank=True, default="")
+    technician_rating = models.FloatField(null=True, blank=True)
+    payment_collected_by_name = models.CharField(max_length=200, blank=True, default="")
+    collection_method = models.CharField(max_length=50, blank=True, default="")
+    collection_reference = models.CharField(max_length=100, blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -5,6 +5,9 @@ State machine logic for Service Request status transitions.
 from rest_framework.exceptions import ValidationError
 
 ALLOWED_TRANSITIONS = {
+    "unassigned": ["offering", "assigned", "accepted", "redispatching", "cancelled"],
+    "offering": ["accepted", "unassigned", "redispatching", "cancelled"],
+    "redispatching": ["offering", "unassigned", "accepted", "cancelled"],
     "new_request": ["confirmed", "cancelled"],
     "confirmed": ["assigned", "cancelled"],
     "assigned": ["received", "accepted", "reassigned", "cancelled"],
@@ -12,7 +15,7 @@ ALLOWED_TRANSITIONS = {
     "accepted": ["on_the_way", "en_route", "arrived", "cancelled", "unable_to_complete"],
     "on_the_way": ["arrived", "cancelled", "unable_to_complete"],
     "en_route": ["arrived", "cancelled", "unable_to_complete"],
-    "arrived": ["service_started", "cancelled", "unable_to_complete"],
+    "arrived": ["service_started", "in_progress", "cancelled", "unable_to_complete"],
     "service_started": ["in_progress", "cancelled", "unable_to_complete"],
     "in_progress": ["proof_submitted", "cancelled", "unable_to_complete", "follow_up_required"],
     "proof_submitted": ["completed", "cancelled", "unable_to_complete", "follow_up_required"],
@@ -79,7 +82,7 @@ def apply_transition(service_request, target_status: str, actor=None) -> str:
 
     # Sync EmployeeJob status and timestamps
     try:
-        from service_requests.models import EmployeeJob
+        from service_requests.models import EmployeeJob, ServiceRequest as SR
         from django.utils import timezone
         emp_job_updates = {"status": target.upper()}
         if target == "completed":
@@ -87,8 +90,36 @@ def apply_transition(service_request, target_status: str, actor=None) -> str:
         elif target == "in_progress":
             emp_job_updates["started_date"] = timezone.now()
         EmployeeJob.objects.filter(service_request=service_request).update(**emp_job_updates)
-    except Exception:
-        pass
+
+        if target in ["completed", "cancelled"]:
+            from workforce_api.models import JobTrackingSession
+            closing_status = (
+                JobTrackingSession.SessionStatus.COMPLETED
+                if target == "completed"
+                else JobTrackingSession.SessionStatus.CANCELLED
+            )
+            JobTrackingSession.objects.filter(
+                job=service_request,
+                status=JobTrackingSession.SessionStatus.ACTIVE,
+            ).update(
+                status=closing_status,
+                ended_at=timezone.now(),
+            )
+            if service_request.assigned_employee:
+                # Reset employee to available if they have no other active jobs
+                has_other_active = SR.objects.filter(
+                    assigned_employee=service_request.assigned_employee,
+                    status__in=["accepted", "on_the_way", "en_route", "arrived", "in_progress", "proof_submitted", "payment_pending"],
+                ).exclude(pk=service_request.pk).exists()
+                if not has_other_active:
+                    service_request.assigned_employee.current_availability = "available"
+                    service_request.assigned_employee.save(update_fields=["current_availability"])
+    except Exception as _sm_err:
+        import logging as _logging
+        _logging.getLogger("workforce.state_machine").exception(
+            "Non-fatal error in post-transition side-effects for %s -> %s: %s",
+            service_request.pk, target, _sm_err
+        )
 
     return target
 

@@ -25,6 +25,7 @@ import {
   apiGetAdminPendingExtensions,
   apiAdminDecideExtension,
   apiToggleLocationActive,
+  apiGetJobTimeline,
 } from '../../api/workforceService.js';
 import { apiGetLocations, apiCreateLocation } from '../../api/clockInApi.js';
 import { apiRequest } from '../../api/client.js';
@@ -60,6 +61,8 @@ import {
   Save,
   Loader,
   Radio,
+  History,
+  Eye,
 } from 'lucide-react';
 
 // ─── Delete location helper ───────────────────────────────────────────────────
@@ -101,14 +104,19 @@ function FleetMapVisual({ fleetData }) {
     if (!apiLoaded || !mapContainerRef.current) return;
     if (mapRef.current) return; // already initialized
     const google = window.google;
-    mapRef.current = new google.maps.Map(mapContainerRef.current, {
-      center: { lat: 20.5937, lng: 78.9629 },
-      zoom: 5,
-      mapTypeControl: false,
-      streetViewControl: false,
-      fullscreenControl: false,
-    });
-    infoWindowRef.current = new google.maps.InfoWindow();
+    if (!google?.maps?.Map || !google?.maps?.ControlPosition) return;
+    try {
+      mapRef.current = new google.maps.Map(mapContainerRef.current, {
+        center: { lat: 20.5937, lng: 78.9629 },
+        zoom: 5,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false,
+      });
+      infoWindowRef.current = new google.maps.InfoWindow();
+    } catch (err) {
+      console.error('Error initializing AdminOperationsPage map:', err);
+    }
   }, [apiLoaded]);
 
   // Update markers whenever fleet data changes
@@ -421,6 +429,9 @@ export function AdminOperationsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [dispatchLoading, setDispatchLoading] = useState(false);
   const [statusMsg, setStatusMsg] = useState({ type: '', text: '' });
+  const [timelineJob, setTimelineJob] = useState(null);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineData, setTimelineData] = useState(null);
 
   const loadData = async () => {
     try {
@@ -494,6 +505,21 @@ export function AdminOperationsPage() {
       setStatusMsg({ type: 'error', text: err.message || 'Auto dispatch failed.' });
     } finally {
       setDispatchLoading(false);
+    }
+  };
+
+  const handleOpenTimeline = async (job) => {
+    if (!job) return;
+    setTimelineJob(job);
+    setTimelineLoading(true);
+    setTimelineData(null);
+    try {
+      const data = await apiGetJobTimeline(job.id);
+      setTimelineData(data);
+    } catch (err) {
+      setTimelineData({ error: err.message || 'Failed to load timeline.' });
+    } finally {
+      setTimelineLoading(false);
     }
   };
 
@@ -756,15 +782,25 @@ export function AdminOperationsPage() {
                       </span>
                     </div>
                     {selectedJob && (
-                      <button
-                        type="button"
-                        onClick={handleTriggerAutoDispatch}
-                        disabled={dispatchLoading}
-                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs inline-flex items-center gap-1 shadow-sm transition-colors"
-                      >
-                        <Sparkles className="w-3.5 h-3.5" />
-                        {dispatchLoading ? 'Reconciling...' : 'Re-evaluate Auto-Dispatch'}
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleOpenTimeline(selectedJob)}
+                          className="px-2.5 py-1.5 bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 font-bold rounded text-xs inline-flex items-center gap-1.5 shadow-sm transition-colors"
+                        >
+                          <History className="w-3.5 h-3.5 text-blue-600" />
+                          View Timeline
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleTriggerAutoDispatch}
+                          disabled={dispatchLoading}
+                          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs inline-flex items-center gap-1 shadow-sm transition-colors"
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          {dispatchLoading ? 'Reconciling...' : 'Re-evaluate Auto-Dispatch'}
+                        </button>
+                      </div>
                     )}
                   </div>
 
@@ -1365,6 +1401,93 @@ export function AdminOperationsPage() {
                 className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-xs font-bold"
               >
                 Delete Location
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── JOB LIFECYCLE TIMELINE MODAL ── */}
+      {timelineJob && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4 overflow-y-auto">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden my-8">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200 bg-slate-50">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-blue-100 border border-blue-200 flex items-center justify-center text-blue-600">
+                  <History className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                    Job Lifecycle Timeline — #{timelineJob.request_id || `SR-${timelineJob.id}`}
+                    <StatusBadge status={timelineJob.status} size="xs" />
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    {timelineJob.service_title || timelineJob.service_category || timelineJob.issue_title} • Customer: {timelineJob.customer_name || 'Customer'}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => { setTimelineJob(null); setTimelineData(null); }}
+                className="p-1.5 rounded-lg hover:bg-slate-200 text-slate-500 transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-5 max-h-[60vh] overflow-y-auto">
+              {timelineLoading ? (
+                <div className="p-12 text-center flex flex-col items-center justify-center gap-2 text-slate-500">
+                  <Loader className="w-6 h-6 animate-spin text-blue-600" />
+                  <span className="text-xs font-semibold">Correlating lifecycle audit events...</span>
+                </div>
+              ) : timelineData?.error ? (
+                <div className="p-4 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-700">
+                  {timelineData.error}
+                </div>
+              ) : Array.isArray(timelineData?.timeline) && timelineData.timeline.length > 0 ? (
+                <div className="relative pl-6 space-y-6 before:absolute before:left-2.5 before:top-2 before:bottom-2 before:w-0.5 before:bg-slate-200">
+                  {timelineData.timeline.map((item, idx) => (
+                    <div key={idx} className="relative group">
+                      <div className="absolute -left-6 top-1 w-5 h-5 rounded-full bg-white border-2 border-blue-600 flex items-center justify-center text-[9px] font-bold text-blue-600">
+                        {idx + 1}
+                      </div>
+                      <div className="bg-slate-50 hover:bg-blue-50/50 border border-slate-200 rounded-lg p-3 transition-colors">
+                        <div className="flex items-center justify-between text-xs mb-1">
+                          <span className="font-bold text-slate-900">{item.title}</span>
+                          <span className="text-[10px] font-mono text-slate-500">
+                            {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-600 leading-relaxed">{item.description}</p>
+                        <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-200/60 text-[10px] text-slate-500">
+                          <span className="font-medium text-slate-700">Actor: {item.actor}</span>
+                          <span className="font-mono text-slate-400">{item.event_type}</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="p-8 text-center text-xs text-slate-500">
+                  No lifecycle events recorded for this job yet.
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex items-center justify-between">
+              <span className="text-[11px] text-slate-500">
+                Total Events: <strong>{timelineData?.event_count || 0}</strong>
+              </span>
+              <button
+                type="button"
+                onClick={() => { setTimelineJob(null); setTimelineData(null); }}
+                className="px-4 py-1.5 bg-slate-800 hover:bg-slate-900 text-white font-bold rounded-lg text-xs transition-colors"
+              >
+                Close Timeline
               </button>
             </div>
           </div>
