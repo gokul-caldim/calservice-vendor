@@ -106,14 +106,13 @@ def apply_transition(service_request, target_status: str, actor=None) -> str:
                 ended_at=timezone.now(),
             )
             if service_request.assigned_employee:
-                # Reset employee to available if they have no other active jobs
-                has_other_active = SR.objects.filter(
-                    assigned_employee=service_request.assigned_employee,
-                    status__in=["accepted", "on_the_way", "en_route", "arrived", "in_progress", "proof_submitted", "payment_pending"],
-                ).exclude(pk=service_request.pk).exists()
-                if not has_other_active:
-                    service_request.assigned_employee.current_availability = "available"
-                    service_request.assigned_employee.save(update_fields=["current_availability"])
+                from workforce_api.services.workload import reconcile_employee_availability
+                reconcile_employee_availability(service_request.assigned_employee)
+                import logging as _logging
+                _logging.getLogger("workforce.state_machine").info(
+                    f"[EMPLOYEE_RELEASED] employee={service_request.assigned_employee.id} "
+                    f"completed_job={service_request.id} state=AVAILABLE"
+                )
     except Exception as _sm_err:
         import logging as _logging
         _logging.getLogger("workforce.state_machine").exception(

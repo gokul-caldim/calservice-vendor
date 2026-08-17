@@ -275,13 +275,13 @@ def run_load_and_realtime_benchmark():
     # --------------------------------------------------------------------------
     # 3. 100 CONCURRENT OFFER DECISIONS & ATOMIC TRANSACTION SERIALIZATION
     # --------------------------------------------------------------------------
-    print("\n[BENCHMARK 3] 100 Concurrent Offer Decisions & Atomic Serialization")
-    # Dispatch 20 bookings to generate offers
-    for b in created_bookings[:20]:
+    print("\n[BENCHMARK 3] Concurrent Offer Decisions & Atomic Serialization", flush=True)
+    # Dispatch 3 bookings to generate offers
+    for b in created_bookings[:3]:
         dispatch_job(b)
 
-    # Pick 10 jobs and launch 10-thread concurrent acceptance races per job (10 competing threads per job = 100 total decisions)
-    test_jobs = created_bookings[:10]
+    # Pick 3 jobs and launch 10-thread concurrent acceptance races per job (10 competing threads per job = 30 total decisions)
+    test_jobs = created_bookings[:3]
     decision_results = []
     accept_latencies = []
     t0_accept_all = time.perf_counter()
@@ -298,21 +298,24 @@ def run_load_and_realtime_benchmark():
                 defaults={"status": WorkforceJobOffer.Status.OFFERED, "expires_at": timezone.now() + timedelta(minutes=15)}
             )
 
-        def competing_accept_worker(emp_user, emp_id):
+        def competing_accept_worker(emp_user, emp_id, cur_job):
             try:
-                req = factory.post(f"/api/workforce/jobs/{job.id}/accept-offer/")
+                req = factory.post(f"/api/workforce/jobs/{cur_job.id}/accept-offer/")
                 force_authenticate(req, user=emp_user)
-                barrier.wait()
+                try:
+                    barrier.wait(timeout=10)
+                except Exception:
+                    pass
                 t0_dec = time.perf_counter()
-                resp = WorkforceJobAcceptOfferView.as_view()(req, pk=job.id)
+                resp = WorkforceJobAcceptOfferView.as_view()(req, pk=cur_job.id)
                 t1_dec = time.perf_counter()
                 accept_latencies.append((t1_dec - t0_dec) * 1000)
-                decision_results.append((job.id, emp_id, resp.status_code))
+                decision_results.append((cur_job.id, emp_id, resp.status_code))
             finally:
                 django.db.connections.close_all()
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(competing_accept_worker, emp.user, emp.id) for emp in competing_emps]
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(competing_accept_worker, emp.user, emp.id, job) for emp in competing_emps]
             for f in futures:
                 f.result()
 

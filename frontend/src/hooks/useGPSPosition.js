@@ -21,9 +21,9 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 // Minimum distance (metres) that must be exceeded before a new position is reported
 const MOVEMENT_THRESHOLD_METRES = 10;
 // Maximum age of a cached position to accept (milliseconds)
-const MAX_POSITION_AGE_MS = 60_000; // 1 minute
-// Interval between forced position polls when watch is not firing (ms)
-const POLL_INTERVAL_MS = 5 * 60_000; // 5 minutes
+const MAX_POSITION_AGE_MS = 30_000; // 30 seconds
+// Interval between automatic periodic telemetry heartbeats (ms)
+const POLL_INTERVAL_MS = 25_000; // 25 seconds automatic background heartbeat
 
 /**
  * Haversine distance in metres between two lat/lng points.
@@ -216,6 +216,17 @@ export function useLocationTracker(active, onPositionChange, onError, adapter = 
   const lastReportedTimeRef = useRef(0);
   const watchIdRef = useRef(null);
   const intervalRef = useRef(null);
+  const offlineQueueRef = useRef([]);
+
+  const flushOfflineQueue = useCallback(() => {
+    if (offlineQueueRef.current.length === 0) return;
+    console.info(`[GPS_OFFLINE_RECOVERY] Flushing ${offlineQueueRef.current.length} queued telemetry fixes.`);
+    const queue = [...offlineQueueRef.current];
+    offlineQueueRef.current = [];
+    queue.forEach((payload) => {
+      onPositionChange(payload);
+    });
+  }, [onPositionChange]);
 
   const handlePosition = useCallback(
     (pos) => {
@@ -232,14 +243,24 @@ export function useLocationTracker(active, onPositionChange, onError, adapter = 
 
       lastPositionRef.current = { latitude, longitude };
       lastReportedTimeRef.current = now;
-      onPositionChange({
+
+      const payload = {
         latitude,
         longitude,
         accuracy: accuracy ?? null,
         speed: speed ?? null,
         heading: heading ?? null,
         captured_at: new Date(pos.timestamp || now).toISOString(),
-      });
+      };
+
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        // Enqueue if offline (capped at 50 points to prevent memory leak)
+        if (offlineQueueRef.current.length >= 50) offlineQueueRef.current.shift();
+        offlineQueueRef.current.push(payload);
+        return;
+      }
+
+      onPositionChange(payload);
     },
     [onPositionChange],
   );
@@ -270,6 +291,21 @@ export function useLocationTracker(active, onPositionChange, onError, adapter = 
       maximumAge: MAX_POSITION_AGE_MS,
     });
   }, [handlePosition, handleError, adapter]);
+
+  useEffect(() => {
+    const handleOnline = () => {
+      flushOfflineQueue();
+      forcePoll();
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', handleOnline);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', handleOnline);
+      }
+    };
+  }, [flushOfflineQueue, forcePoll]);
 
   useEffect(() => {
     if (!active) {

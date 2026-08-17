@@ -144,12 +144,22 @@ export function classifyApiError(err) {
       action = 'Refresh Job Status';
       isOfferLost = true;
     } else if (
+      rawCode === 'OFFER_EXPIRED' ||
+      rawMsg.toLowerCase().includes('offer has expired') ||
+      rawMsg.toLowerCase().includes('offer expired')
+    ) {
+      title = 'Offer Expired';
+      msg = 'This offer has expired.';
+      action = 'Refresh Job Status';
+      isOfferLost = true;
+    } else if (
       rawCode === 'EMPLOYEE_ALREADY_BUSY' ||
       rawMsg.toLowerCase().includes('already has an active job') ||
+      rawMsg.toLowerCase().includes('you already have an active job') ||
       rawMsg.toLowerCase().includes('busy')
     ) {
-      title = 'Active Job Already Assigned';
-      msg = 'You already have an active job and cannot accept another request.';
+      title = 'Active Job In Progress';
+      msg = 'You already have an active job. Complete it before accepting another job.';
       action = 'View Current Job';
     } else if (
       rawCode === 'CANCELLATION_WINDOW_EXPIRED' ||

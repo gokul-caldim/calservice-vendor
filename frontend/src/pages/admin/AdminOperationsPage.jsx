@@ -812,54 +812,94 @@ export function AdminOperationsPage() {
                     </div>
                   </div>
 
-                  <div className="divide-y divide-slate-100 max-h-[440px] overflow-y-auto">
+                  <div className="divide-y divide-slate-100 max-h-[460px] overflow-y-auto">
                     {eligibleFleet.length > 0 ? (
                       eligibleFleet.map((tech) => (
                         <div
                           key={tech.id}
-                          className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-slate-50 transition-colors"
+                          className={`p-3.5 space-y-2 hover:bg-slate-50 transition-colors ${
+                            tech.is_dispatch_ready ? 'bg-white' : 'bg-slate-50/60 opacity-80'
+                          }`}
                         >
-                          <div className="flex items-center gap-3">
-                            <div className="w-8 h-8 rounded bg-slate-100 border border-slate-200 flex items-center justify-center font-bold text-slate-800 text-xs shrink-0">
-                              {tech.name ? tech.name[0].toUpperCase() : 'T'}
-                            </div>
-                            <div>
-                              <div className="flex items-center gap-2">
-                                <p className="text-xs font-bold text-slate-900">{tech.name}</p>
-                                <StatusBadge
-                                  status={tech.is_online ? 'online' : 'offline'}
-                                  label={tech.is_online ? 'Online' : 'Offline'}
-                                  size="xs"
-                                />
-                                {tech.is_clocked_in && (
-                                  <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 text-[10px] font-bold border border-blue-200">
-                                    Shift Active (+10)
-                                  </span>
-                                )}
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                            <div className="flex items-center gap-3">
+                              <div className={`w-9 h-9 rounded-lg border flex items-center justify-center font-bold text-xs shrink-0 ${
+                                tech.is_dispatch_ready
+                                  ? 'bg-blue-50 border-blue-200 text-blue-700'
+                                  : 'bg-slate-100 border-slate-200 text-slate-500'
+                              }`}>
+                                {tech.name ? tech.name[0].toUpperCase() : 'T'}
                               </div>
-                              <p className="text-[11px] text-slate-500 font-mono">
-                                {tech.employee_id} • {tech.phone || 'No phone'}
-                              </p>
-                              <p className="text-[10px] text-slate-600 mt-0.5 truncate max-w-sm">
-                                Approved Skills: {tech.approved_services?.join(', ') || 'General Service'}
-                              </p>
+                              <div>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <p className="text-xs font-bold text-slate-900">{tech.name}</p>
+                                  <StatusBadge
+                                    status={tech.is_online ? 'online' : 'offline'}
+                                    label={tech.is_online ? 'Online' : 'Offline'}
+                                    size="xs"
+                                  />
+                                  {tech.gps_freshness && (
+                                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold ${
+                                      tech.gps_freshness === 'LIVE' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' :
+                                      tech.gps_freshness === 'UPDATING' ? 'bg-blue-50 text-blue-700 border border-blue-200' :
+                                      tech.gps_freshness === 'DELAYED' ? 'bg-amber-50 text-amber-700 border border-amber-200' :
+                                      'bg-slate-100 text-slate-600 border border-slate-200'
+                                    }`}>
+                                      GPS: {tech.gps_freshness} {tech.gps_age_seconds != null ? `(${tech.gps_age_seconds}s)` : ''}
+                                    </span>
+                                  )}
+                                  {tech.is_dispatch_ready && tech.score != null && (
+                                    <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-900 text-[10px] font-bold">
+                                      Match Score: {tech.score}
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-[11px] text-slate-500 font-mono mt-0.5">
+                                  {tech.employee_id} • {tech.phone || 'No phone'}
+                                </p>
+                              </div>
+                            </div>
+
+                            <div className="flex flex-col items-end gap-1 text-right shrink-0">
+                              {tech.distance_km != null ? (
+                                <span className="font-mono text-xs font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                                  {tech.distance_km.toFixed(1)} km away
+                                </span>
+                              ) : (
+                                <span className="text-[10px] text-slate-400 font-mono">
+                                  Proximity Pending GPS
+                                </span>
+                              )}
+                              <span className={`text-[10px] font-bold ${
+                                tech.is_dispatch_ready ? 'text-emerald-700' : 'text-rose-700'
+                              }`}>
+                                {tech.is_dispatch_ready ? '✓ Qualified Candidate' : tech.ineligibility_reason || 'Ineligible'}
+                              </span>
                             </div>
                           </div>
 
-                          <div className="flex flex-col items-end gap-1 text-right shrink-0">
-                            {tech.distance_km != null ? (
-                              <span className="font-mono text-xs font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
-                                {tech.distance_km.toFixed(1)} km away
+                          {/* 9-Gate Real Evaluation Audit Pills */}
+                          {tech.gate_audit && (
+                            <div className="pt-1.5 border-t border-slate-100 flex flex-wrap items-center gap-1 text-[10px]">
+                              <span className="font-bold text-slate-500 uppercase tracking-wider text-[9px] mr-1">
+                                9-Gate Evaluation:
                               </span>
-                            ) : (
-                              <span className="text-[10px] text-slate-400 font-mono">
-                                Proximity Pending GPS
-                              </span>
-                            )}
-                            <span className="text-[10px] text-emerald-700 font-semibold">
-                              Eligible Candidate
-                            </span>
-                          </div>
+                              {tech.gate_audit.map((g) => (
+                                <span
+                                  key={g.gate}
+                                  title={`${g.gate}: ${g.name} (${g.passed ? 'PASSED' : 'REJECTED'})`}
+                                  className={`px-1.5 py-0.5 rounded font-mono font-semibold flex items-center gap-0.5 ${
+                                    g.passed
+                                      ? 'bg-emerald-50 text-emerald-800 border border-emerald-200/80'
+                                      : 'bg-rose-50 text-rose-800 border border-rose-200/80'
+                                  }`}
+                                >
+                                  <span>{g.passed ? '✓' : '✗'}</span>
+                                  <span>{g.name}</span>
+                                </span>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       ))
                     ) : (

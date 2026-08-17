@@ -25,6 +25,7 @@ from workforce_api.models import (
     WorkforceEmployeeSchedule,
 )
 from time_tracking.geo import haversine_distance
+from workforce_api.services.workload import get_employee_active_job, ACTIVE_WORKLOAD_STATUSES
 
 logger = logging.getLogger("workforce.dispatch")
 
@@ -225,21 +226,15 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
                 logger.debug(f"[9GATE_REJECT_GATE8_LEAVE_ACTIVE] Employee #{emp.id} on approved leave ({start_date} to {end_date}).")
                 return False, f"Gate 8: Technician is on approved leave from {start_date} to {end_date}.", gate_results
 
-    # ── Gate 9: Workload Concurrency ──────────────────────────────────────────
-    if hasattr(emp, "is_busy_job"):
-        if emp.is_busy_job:
-            gate_results["G9"] = False
-            logger.debug(f"[9GATE_REJECT_GATE9_WORKLOAD_BUSY] Employee #{emp.id} has active busy job.")
-            return False, "Gate 9: Technician is busy on active job assignment.", gate_results
-    else:
-        active_job = ServiceRequest.objects.filter(
-            assigned_employee=emp,
-            status__in=["accepted", "on_the_way", "arrived", "in_progress", "service_completed", "proof_submitted", "payment_pending"],
-        ).first()
-        if active_job:
-            gate_results["G9"] = False
-            logger.debug(f"[9GATE_REJECT_GATE9_WORKLOAD_BUSY] Employee #{emp.id} is busy on active Job #{active_job.id}.")
-            return False, f"Gate 9: Technician is busy on active Job #{active_job.id} ({active_job.request_id}).", gate_results
+    # ── Gate 9: Workload Concurrency (Single-Active-Job Isolation) ──────────────
+    from workforce_api.services.workload import get_employee_active_job
+    active_job = get_employee_active_job(emp)
+    if active_job:
+        gate_results["G9"] = False
+        logger.info(
+            f"[DISPATCH_REJECT] employee={emp.id} reason=EMPLOYEE_ALREADY_BUSY active_job={active_job.id}"
+        )
+        return False, f"Gate 9: Technician is busy on active Job #{active_job.id} ({active_job.request_id}).", gate_results
 
     return True, "All 9 Eligibility Gates Passed", gate_results
 
@@ -269,9 +264,10 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
         return []
 
     today_dow = timezone.now().weekday()
+    from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES, get_employee_active_job
     busy_subquery = ServiceRequest.objects.filter(
         assigned_employee_id=OuterRef("pk"),
-        status__in=["accepted", "on_the_way", "arrived", "in_progress", "service_completed", "proof_submitted", "payment_pending"]
+        status__in=ACTIVE_WORKLOAD_STATUSES
     )
 
     candidates_qs = (
@@ -331,7 +327,7 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
         emp_lon = last_loc.get("longitude") if last_loc.get("longitude") is not None else (last_loc.get("lng") or last_loc.get("lon"))
 
         gps_age_s = None
-        updated_at_str = last_loc.get("updated_at")
+        updated_at_str = last_loc.get("updated_at") or last_loc.get("captured_at")
         if updated_at_str:
             try:
                 loc_dt = parse_datetime(str(updated_at_str))
@@ -521,6 +517,15 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
         top_dist_km = top_candidate["distance_km"]
         top_score = top_candidate["score"]
 
+        # Final workload concurrency verification boundary
+        busy_check = get_employee_active_job(top_emp)
+        if busy_check:
+            logger.warning(
+                f"[DISPATCH_REJECT] employee={top_emp.id} job={job_obj.id} "
+                f"reason=EMPLOYEE_ALREADY_BUSY active_job={busy_check.id}"
+            )
+            return False, f"Technician #{top_emp.id} is busy on active Job #{busy_check.id}. Cannot offer Job #{job_obj.id}."
+
         # Expire any previous offers for this job that might be dangling
         WorkforceJobOffer.objects.filter(job=job_obj, status=WorkforceJobOffer.Status.OFFERED).update(status=WorkforceJobOffer.Status.EXPIRED)
 
@@ -534,8 +539,9 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
             expires_at=expires_at,
         )
 
-        if job_obj.status in ["draft", "new_request", "confirmed", "unassigned"]:
-            job_obj.status = "assigned"
+        # Keep ServiceRequest unassigned until candidate accepts via backend atomic transaction
+        if job_obj.status in ["draft", "new_request"]:
+            job_obj.status = "unassigned"
             job_obj.save(update_fields=["status"])
 
         WorkforceEventLog.objects.create(
@@ -663,7 +669,7 @@ def reconsider_jobs_for_employee(employee_or_id) -> int:
     """
     emp_id = employee_or_id.pk if hasattr(employee_or_id, "pk") else employee_or_id
     emp = Employee.objects.filter(pk=emp_id).first()
-    if not emp or not emp.is_active or not emp.is_online or emp.current_availability != "available":
+    if not emp or not emp.is_active or not emp.is_online or emp.current_availability != "available" or get_employee_active_job(emp):
         return 0
 
     now = timezone.now()

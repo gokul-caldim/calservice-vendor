@@ -41,8 +41,10 @@ import { JobTrackingMap } from '../../components/employee/JobTrackingMap.jsx';
 import { AppShell } from '../../components/common/AppShell.jsx';
 import { StatusBadge } from '../../components/enterprise/StatusBadge.jsx';
 import { ErrorState } from '../../components/enterprise/ErrorState.jsx';
+import { Modal } from '../../components/enterprise/Modal.jsx';
 import { LiveCameraCaptureModal } from '../../components/common/LiveCameraCaptureModal.jsx';
 import { classifyApiError } from '../../utils/apiErrorHandler.js';
+import { getEmployeeJobPresentation } from '../../utils/jobPresentation.js';
 import { useLocationTracker, getGPSPosition } from '../../hooks/useGPSPosition.js';
 import { apiUpdateLocationFull } from '../../api/workforceService.js';
 import {
@@ -104,14 +106,25 @@ export function EmployeeDashboardPage() {
   const [lostOfferInfo, setLostOfferInfo] = useState(null); // { jobId, message }
   const [realtimeStatus, setRealtimeStatus] = useState('DISCONNECTED'); // 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED'
 
-  const incomingOffers = allJobs.filter(
-    (j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired
-  );
-  const activeJobs = allJobs.filter(
-    (j) => !['completed', 'cancelled'].includes((j.status || '').toLowerCase()) && j.active_offer?.status !== 'OFFERED'
-  );
-  const completedJobs = allJobs.filter((j) => (j.status || '').toLowerCase() === 'completed');
-  const displayedJobs = jobQueueTab === 'completed' ? completedJobs : (jobQueueTab === 'all' ? allJobs : activeJobs);
+  const activeJobs = allJobs.filter((j) => {
+    const p = getEmployeeJobPresentation(j);
+    return p && p.isAccepted && !['completed', 'cancelled'].includes((j.status || '').toLowerCase());
+  });
+  const hasActiveJob = activeJobs.length > 0;
+
+  const incomingOffers = hasActiveJob
+    ? []
+    : allJobs.filter((j) => {
+        const p = getEmployeeJobPresentation(j, hasActiveJob);
+        return p && p.isOffer && p.canAccept;
+      });
+  const completedJobs = allJobs.filter((j) => {
+    const p = getEmployeeJobPresentation(j, hasActiveJob);
+    return p && (p.state === 'COMPLETED' || (j.status || '').toLowerCase() === 'completed');
+  });
+  const displayedJobs = jobQueueTab === 'completed'
+    ? completedJobs
+    : (jobQueueTab === 'all' ? allJobs : activeJobs);
 
   const isOnline = Boolean(user?.isOnline || employee?.is_online);
   const isClockedIn = Boolean(timeTracking?.is_clocked_in);
@@ -206,6 +219,32 @@ export function EmployeeDashboardPage() {
   }, []);
 
   useLocationTracker(isOnline, handleGPSPosition, handleGPSError);
+
+  // Automatic initial location resolution on dashboard mount
+  useEffect(() => {
+    let isCancelled = false;
+    (async () => {
+      try {
+        const pos = await getGPSPosition(false);
+        if (!isCancelled && pos?.coords) {
+          const { latitude, longitude, accuracy, speed, heading } = pos.coords;
+          const captured_at = new Date(pos.timestamp || Date.now()).toISOString();
+          const initLoc = {
+            latitude,
+            longitude,
+            accuracy,
+            speed,
+            heading,
+            captured_at,
+            updated_at: new Date().toISOString(),
+          };
+          setCurrentLocation(initLoc);
+          apiUpdateLocationFull(latitude, longitude, accuracy, speed, heading, captured_at).catch(() => {});
+        }
+      } catch (_) {}
+    })();
+    return () => { isCancelled = true; };
+  }, []);
   // ────────────────────────────────────────────────────────────────────────────────
 
   // Payment & Cash Collection State
@@ -673,10 +712,14 @@ export function EmployeeDashboardPage() {
         if (jobsData) {
           setAllJobs(jobsData);
           setJobs(jobsData);
-          const active = jobsData.filter(
-            (j) => !['completed', 'cancelled'].includes((j.status || '').toLowerCase()) && j.active_offer?.status !== 'OFFERED'
-          );
-          const completed = jobsData.filter((j) => (j.status || '').toLowerCase() === 'completed');
+          const active = jobsData.filter((j) => {
+            const p = getEmployeeJobPresentation(j);
+            return p && p.isAccepted && !['completed', 'cancelled'].includes((j.status || '').toLowerCase());
+          });
+          const completed = jobsData.filter((j) => {
+            const p = getEmployeeJobPresentation(j);
+            return p && (p.state === 'COMPLETED' || (j.status || '').toLowerCase() === 'completed');
+          });
 
           if (jobQueueTab === 'active') {
             if (active.length === 0) setSelectedJob(null);
@@ -687,9 +730,15 @@ export function EmployeeDashboardPage() {
           }
 
           // If a new offer is available, auto-focus it in the workspace
-          const offeredJob = jobsData.find((j) => j.active_offer?.status === 'OFFERED' || j.offer_status === 'OFFERED');
+          const offeredJob = jobsData.find((j) => {
+            const p = getEmployeeJobPresentation(j);
+            return p && p.isOffer && p.canAccept;
+          });
           if (offeredJob) {
-            setSelectedJob((prev) => (!prev || (prev.active_offer?.status !== 'OFFERED' && prev.offer_status !== 'OFFERED') ? offeredJob : prev));
+            setSelectedJob((prev) => {
+              const prevP = getEmployeeJobPresentation(prev);
+              return (!prev || !prevP?.isOffer) ? offeredJob : prev;
+            });
             if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
               try {
                 new Notification('⚡ New Exclusive Job Offer!', {
@@ -1711,6 +1760,21 @@ export function EmployeeDashboardPage() {
           !pathname.includes('/services') &&
           !pathname.includes('/settings') && (
             <>
+              {/* ⚡ Active Assignment Workload Status Card */}
+              {hasActiveJob && (
+                <div className="bg-blue-50 border border-blue-200 rounded p-3 text-xs text-blue-900 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
+                  <div className="flex items-center gap-2.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse shrink-0" />
+                    <span>
+                      <strong>ACTIVE ASSIGNMENT IN PROGRESS:</strong> You are currently working on <strong>{activeJobs[0].request_id || `SR-${activeJobs[0].id}`}</strong> ({activeJobs[0].service_title || activeJobs[0].service_category}). Complete current service to receive new job dispatches.
+                    </span>
+                  </div>
+                  <span className="text-[10px] font-mono uppercase bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded border border-blue-300 shrink-0 self-start sm:self-auto">
+                    BUSY • SINGLE WORKLOAD
+                  </span>
+                </div>
+              )}
+
               {/* ⚡ Dedicated Incoming Job Offers Section */}
               {incomingOffers.length > 0 && (
                 <div className="space-y-2 bg-amber-50 border-2 border-amber-400 rounded p-4 shadow-md">
@@ -1732,7 +1796,7 @@ export function EmployeeDashboardPage() {
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
                     {incomingOffers.map((offerJob) => {
-                      const offer = offerJob.active_offer;
+                      const presentation = getEmployeeJobPresentation(offerJob);
                       return (
                         <div
                           key={offerJob.id}
@@ -1759,10 +1823,10 @@ export function EmployeeDashboardPage() {
                               <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0" />
                               <span className="truncate">{offerJob.address || 'Customer site address provided upon acceptance'}</span>
                             </p>
-                            {offer?.expires_at && (
+                            {presentation?.offerExpiresAt && (
                               <p className="flex items-center gap-1.5 text-rose-700 font-semibold text-[11px]">
-                                <Clock className="w-3.5 h-3.5 shrink-0" />
-                                <span>Expires: {new Date(offer.expires_at).toLocaleTimeString()}</span>
+                                <Clock className="w-3.5 h-3.5 shrink-0 animate-pulse" />
+                                <span>Expires: {new Date(presentation.offerExpiresAt).toLocaleTimeString()}</span>
                               </p>
                             )}
                           </div>
@@ -1892,6 +1956,7 @@ export function EmployeeDashboardPage() {
                     {displayedJobs.length > 0 ? (
                       [...displayedJobs].sort((a, b) => (b.id || 0) - (a.id || 0)).map((job) => {
                         const isSelected = selectedJob?.id === job.id;
+                        const presentation = getEmployeeJobPresentation(job);
                         return (
                           <div
                             key={job.id}
@@ -1904,7 +1969,7 @@ export function EmployeeDashboardPage() {
                               <span className="font-mono font-bold text-blue-600">
                                 {job.request_id || `SR-${job.id}`}
                               </span>
-                              <StatusBadge status={job.status} size="xs" />
+                              <StatusBadge status={presentation?.badgeStatus} label={presentation?.badgeLabel} size="xs" />
                             </div>
                             <h3 className="text-xs font-bold text-slate-900 truncate">
                               {job.service_title || job.service_category}
@@ -1925,16 +1990,16 @@ export function EmployeeDashboardPage() {
                               <span>{job.preferred_time || ''}</span>
                             </div>
 
-                            {(job.active_offer?.status === 'OFFERED' || job.status === 'job_offered') && (
+                            {presentation?.isOffer && presentation?.canAccept && (
                               <div className="mt-2.5 p-2.5 rounded bg-amber-50 border border-amber-200 text-amber-900 space-y-2">
                                 <div className="flex items-center justify-between">
                                   <span className="font-bold text-[10px] text-amber-800 uppercase tracking-wider flex items-center gap-1">
                                     <Sparkles className="w-3 h-3 text-amber-600" />
                                     <span>EXCLUSIVE JOB OFFER</span>
                                   </span>
-                                  {job.distance_km != null ? (
-                                    <span className="text-[10px] font-mono font-bold text-amber-900 bg-amber-100 px-1.5 py-0.5 rounded border border-amber-300">
-                                      {job.distance_km.toFixed(1)} km away
+                                  {presentation.offerExpiresAt ? (
+                                    <span className="text-[10px] font-mono font-semibold text-rose-700">
+                                      Expires {new Date(presentation.offerExpiresAt).toLocaleTimeString()}
                                     </span>
                                   ) : (
                                     <span className="text-[10px] font-mono text-amber-700">
@@ -1947,7 +2012,7 @@ export function EmployeeDashboardPage() {
                                     type="button"
                                     onClick={(e) => { e.stopPropagation(); handleAcceptOffer(job.id); }}
                                     disabled={actionLoading === job.id}
-                                    className="flex-1 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-[10px] shadow-sm transition-colors"
+                                    className="flex-1 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-[10px] shadow-sm transition-colors cursor-pointer disabled:opacity-50"
                                   >
                                     {actionLoading === job.id ? 'ACCEPTING...' : 'ACCEPT'}
                                   </button>
@@ -1955,7 +2020,7 @@ export function EmployeeDashboardPage() {
                                     type="button"
                                     onClick={(e) => { e.stopPropagation(); handleRejectOffer(job.id); }}
                                     disabled={actionLoading === job.id}
-                                    className="flex-1 py-1 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded text-[10px] shadow-sm transition-colors"
+                                    className="flex-1 py-1 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded text-[10px] shadow-sm transition-colors cursor-pointer disabled:opacity-50"
                                   >
                                     DECLINE
                                   </button>
@@ -1986,7 +2051,9 @@ export function EmployeeDashboardPage() {
 
                 {/* Right Column: Selected Job Workspace (7 cols) */}
                 <div className="lg:col-span-7 border border-slate-200 bg-white rounded overflow-hidden shadow-sm">
-                  {selectedJob ? (
+                  {selectedJob ? (() => {
+                    const selectedPresentation = getEmployeeJobPresentation(selectedJob);
+                    return (
                     <div className="p-4 sm:p-5 space-y-4">
                       {/* Job Header */}
                       <div className="flex items-start justify-between border-b border-slate-200 pb-3 gap-2">
@@ -1999,9 +2066,22 @@ export function EmployeeDashboardPage() {
                           </h2>
                         </div>
                         <div className="text-right">
-                          <StatusBadge status={selectedJob.status} />
+                          <StatusBadge status={selectedPresentation?.badgeStatus} label={selectedPresentation?.badgeLabel} />
                         </div>
                       </div>
+
+                      {/* Offer Expiry Banner (strictly when in pending offer state) */}
+                      {selectedPresentation?.isOffer && selectedPresentation?.showOfferCountdown && selectedPresentation?.offerExpiresAt && (
+                        <div className="p-3 bg-amber-50 border border-amber-200 rounded text-xs flex items-center justify-between text-amber-900">
+                          <span className="flex items-center gap-1.5 font-bold text-amber-800">
+                            <Clock className="w-4 h-4 text-amber-600 animate-pulse" />
+                            Offer Expiration: {new Date(selectedPresentation.offerExpiresAt).toLocaleTimeString()}
+                          </span>
+                          <span className="text-[11px] text-amber-700 font-medium">
+                            Accept or decline before offer expires
+                          </span>
+                        </div>
+                      )}
 
                       {/* Customer & Location Box */}
                       <div className="p-3 bg-slate-50 border border-slate-200 rounded space-y-1.5 text-xs">
@@ -2096,13 +2176,13 @@ export function EmployeeDashboardPage() {
                           Action Steps
                         </h3>
                         <div className="flex flex-wrap gap-2">
-                          {(selectedJob.status === 'assigned' || selectedJob.active_offer?.status === 'OFFERED' || selectedJob.status === 'job_offered') && (
+                          {selectedPresentation?.isOffer && selectedPresentation?.canAccept && (
                             <div className="flex items-center gap-2">
                               <button
                                 type="button"
                                 disabled={actionLoading === selectedJob.id}
                                 onClick={() => handleAcceptOffer(selectedJob.id)}
-                                className="px-4 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm transition-colors"
+                                className="px-4 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm transition-colors cursor-pointer disabled:opacity-50"
                               >
                                 {actionLoading === selectedJob.id ? 'Accepting...' : 'Accept Job Offer'}
                               </button>
@@ -2110,7 +2190,7 @@ export function EmployeeDashboardPage() {
                                 type="button"
                                 disabled={actionLoading === selectedJob.id}
                                 onClick={() => handleRejectOffer(selectedJob.id)}
-                                className="px-3 py-1.5 rounded border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold text-xs transition-colors"
+                                className="px-3 py-1.5 rounded border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold text-xs transition-colors cursor-pointer disabled:opacity-50"
                               >
                                 Decline
                               </button>
@@ -2119,7 +2199,7 @@ export function EmployeeDashboardPage() {
 
 
                           {/* 5-Minute Cancellation Status Banner */}
-                          {(selectedJob.status === 'accepted' || selectedJob.status === 'on_the_way') && (() => {
+                          {selectedPresentation?.isAccepted && (selectedPresentation?.state === 'ACCEPTED' || selectedPresentation?.state === 'ON_THE_WAY') && (() => {
                             const cancelTime = getRemainingCancellationTime(selectedJob);
                             if (!cancelTime) return null;
                             return (
@@ -2153,7 +2233,7 @@ export function EmployeeDashboardPage() {
                             );
                           })()}
 
-                          {(selectedJob.status === 'accepted' || selectedJob.status === 'on_the_way' || selectedJob.status === 'arrived') && (
+                          {selectedPresentation?.isAccepted && (selectedPresentation?.state === 'ACCEPTED' || selectedPresentation?.state === 'ON_THE_WAY' || selectedPresentation?.state === 'ARRIVED') && (
                             <div id="arrival-verification-checklist" className="w-full space-y-3.5 border border-slate-200 rounded-lg p-3.5 bg-slate-50/50 mt-1 scroll-mt-6">
                               {/* Interactive Live Customer Location & Navigation Tracking Map */}
                               <JobTrackingMap
@@ -2588,6 +2668,56 @@ export function EmployeeDashboardPage() {
                                       PAID ✓
                                     </span>
                                   </div>
+                                ) : (selectedJob.payment?.payment_status === 'CASH_PENDING' || selectedJob.payment_status === 'cash_pending') ? (
+                                  <div className="p-3.5 bg-amber-50/90 border border-amber-300 rounded-lg space-y-2.5">
+                                    <div className="flex items-center justify-between">
+                                      <div className="flex items-center gap-2">
+                                        <DollarSign className="w-4 h-4 text-amber-700" />
+                                        <span className="text-xs font-bold text-amber-950">Cash Collection Reported — Awaiting Confirmation</span>
+                                      </div>
+                                      <span className="px-2 py-0.5 bg-amber-200 text-amber-900 text-[10px] font-bold rounded">
+                                        CASH PENDING
+                                      </span>
+                                    </div>
+                                    <p className="text-[11px] text-amber-800">
+                                      Amount Received: <strong className="font-mono">₹{selectedJob.payment?.amount_received || selectedJob.payment?.amount_due || selectedJob.total_amount}</strong>
+                                      {parseFloat(selectedJob.payment?.change_returned || 0) > 0 && (
+                                        <span> • Change: <strong className="font-mono">₹{selectedJob.payment?.change_returned}</strong></span>
+                                      )}
+                                    </p>
+                                    <p className="text-[11px] text-amber-800">
+                                      Customer can confirm in their dashboard, or share the 6-digit payment confirmation OTP with you:
+                                    </p>
+                                    <form onSubmit={handleVerifyPaymentOtpSubmit} className="flex gap-2">
+                                      <input
+                                        type="text"
+                                        maxLength={6}
+                                        placeholder="Enter Customer OTP"
+                                        value={paymentOtpInput}
+                                        onChange={(e) => setPaymentOtpInput(e.target.value.replace(/\D/g, ''))}
+                                        className="flex-1 px-3 py-1.5 border border-amber-300 rounded text-xs font-mono font-bold tracking-wider bg-white focus:outline-none focus:ring-2 focus:ring-amber-500"
+                                      />
+                                      <button
+                                        type="submit"
+                                        disabled={isVerifyingPaymentOtp || paymentOtpInput.length !== 6}
+                                        className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold rounded text-xs shadow-sm flex items-center gap-1 transition-colors cursor-pointer"
+                                      >
+                                        {isVerifyingPaymentOtp ? 'Verifying...' : 'Verify OTP'}
+                                      </button>
+                                    </form>
+                                    <div className="pt-1 flex justify-end">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setCashModalJob(selectedJob);
+                                          setCashAmountReceived(String(selectedJob.payment?.amount_due || selectedJob.total_amount || ''));
+                                        }}
+                                        className="text-[11px] text-amber-800 hover:text-amber-950 underline font-medium cursor-pointer"
+                                      >
+                                        Re-record cash collection
+                                      </button>
+                                    </div>
+                                  </div>
                                 ) : (
                                   <div className="p-3.5 bg-amber-50/90 border border-amber-300 rounded-lg space-y-2">
                                     <div className="flex items-center justify-between">
@@ -2653,7 +2783,7 @@ export function EmployeeDashboardPage() {
                         </div>
                       </div>
                     </div>
-                  ) : (
+                  ); })() : (
                     <div className="p-16 text-center text-xs text-slate-500 space-y-3">
                       <div className="w-12 h-12 mx-auto rounded-full bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-600 shadow-2xs">
                         <CheckCircle2 className="w-6 h-6" />

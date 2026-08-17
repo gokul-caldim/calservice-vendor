@@ -57,6 +57,7 @@ from .views import (
     WorkforceLocationUpdateView,
     WorkforceNotificationListView,
     WorkforceNotificationMarkReadView,
+    WorkforceNotificationClearView,
     WorkforceScheduleManageView,
     WorkforceMyScheduleView,
     WorkforceSkillManageView,
@@ -210,6 +211,8 @@ urlpatterns = [
     path("notifications/", WorkforceNotificationListView.as_view(), name="workforce-notifications"),
     path("notifications/mark-read/", WorkforceNotificationMarkReadView.as_view(), name="workforce-notifications-mark-read-all"),
     path("notifications/<int:pk>/mark-read/", WorkforceNotificationMarkReadView.as_view(), name="workforce-notifications-mark-read"),
+    path("notifications/clear/", WorkforceNotificationClearView.as_view(), name="workforce-notifications-clear-all"),
+    path("notifications/<int:pk>/clear/", WorkforceNotificationClearView.as_view(), name="workforce-notifications-clear"),
 
     # Workforce Scheduling (Phase 22)
     path("schedules/manage/", WorkforceScheduleManageView.as_view(), name="workforce-schedules-manage-all"),

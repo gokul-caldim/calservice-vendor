@@ -55,6 +55,35 @@ export function ClockInCard({
     }
   }, [currentLocation]);
 
+  // Automatic location acquisition on mount if not already present
+  useEffect(() => {
+    let isCancelled = false;
+    if (!liveLocation) {
+      (async () => {
+        try {
+          const pos = await getGPSPosition(false);
+          if (!isCancelled && pos?.coords) {
+            const { latitude, longitude, accuracy, speed, heading } = pos.coords;
+            const captured_at = new Date(pos.timestamp || Date.now()).toISOString();
+            const newLoc = {
+              latitude,
+              longitude,
+              accuracy,
+              speed,
+              heading,
+              captured_at,
+              updated_at: new Date().toISOString(),
+            };
+            setLiveLocation(newLoc);
+            if (onLocationUpdate) onLocationUpdate(newLoc);
+            apiUpdateLocationFull(latitude, longitude, accuracy, speed, heading, captured_at).catch(() => {});
+          }
+        } catch (_) {}
+      })();
+    }
+    return () => { isCancelled = true; };
+  }, [liveLocation, onLocationUpdate]);
+
   // Fetch current authoritative server state
   const loadServerState = useCallback(async () => {
     try {
@@ -391,47 +420,67 @@ export function ClockInCard({
               )}
             </div>
 
-            <button
-              type="button"
-              onClick={handleManualLocationRefresh}
-              disabled={locScanning}
-              title="Perform a single high-accuracy GPS scan to refresh telemetry"
-              className="px-2.5 py-1 bg-white hover:bg-slate-100 border border-slate-300 rounded text-[11px] font-bold text-slate-700 transition-colors inline-flex items-center gap-1.5 shadow-xs self-start sm:self-auto disabled:opacity-50 cursor-pointer"
-            >
-              {locScanning ? (
-                <>
-                  <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
-                  <span>Scanning GPS...</span>
-                </>
-              ) : (
-                <>
-                  <RotateCw className="w-3.5 h-3.5 text-blue-600" />
-                  <span>Current Location</span>
-                </>
-              )}
-            </button>
+            <div className="flex items-center gap-1.5 self-start sm:self-auto">
+              <div
+                title="Continuous real-time browser GPS telemetry active"
+                className="px-2.5 py-1 bg-emerald-50 text-emerald-800 border border-emerald-300 rounded text-[11px] font-bold shadow-xs inline-flex items-center gap-1.5 select-none"
+              >
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                <span>Auto-GPS Active</span>
+              </div>
+              <button
+                type="button"
+                onClick={handleManualLocationRefresh}
+                disabled={locScanning}
+                title="Perform instant GPS telemetry re-sync"
+                className="p-1 bg-white hover:bg-slate-100 border border-slate-300 rounded text-slate-600 transition-colors shadow-xs cursor-pointer disabled:opacity-50"
+              >
+                <RotateCw className={`w-3.5 h-3.5 ${locScanning ? 'animate-spin text-blue-600' : 'text-slate-500'}`} />
+              </button>
+            </div>
           </div>
 
           {liveLocation ? (
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-600 font-mono pt-1 border-t border-slate-200/60">
-              <span>
-                Coordinates: <strong className="text-slate-900">{Number(liveLocation.latitude).toFixed(5)}, {Number(liveLocation.longitude).toFixed(5)}</strong>
-              </span>
-              {liveLocation.accuracy != null && (
+            <div className="space-y-1.5 pt-1 border-t border-slate-200/60">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-600 font-mono">
                 <span>
-                  Accuracy: <strong className="text-slate-900">± {Math.round(liveLocation.accuracy)} m</strong>
+                  Coordinates: <strong className="text-slate-900">{Number(liveLocation.latitude).toFixed(5)}, {Number(liveLocation.longitude).toFixed(5)}</strong>
                 </span>
-              )}
-              {liveLocation.updated_at && (
-                <span>
-                  Updated: <strong className="text-slate-900">{new Date(liveLocation.updated_at).toLocaleTimeString()}</strong>
-                </span>
+                {liveLocation.accuracy != null && (
+                  <span>
+                    Accuracy: <strong className="text-slate-900">± {Math.round(liveLocation.accuracy)} m</strong>
+                  </span>
+                )}
+                {liveLocation.updated_at && (
+                  <span>
+                    Updated: <strong className="text-slate-900">{new Date(liveLocation.updated_at).toLocaleTimeString()}</strong>
+                  </span>
+                )}
+              </div>
+
+              {/* Dev-Only Diagnostic Telemetry */}
+              {import.meta.env.DEV && (
+                <div className="text-[10px] font-mono text-slate-500 bg-slate-100/80 px-2 py-0.5 rounded flex items-center gap-3 border border-slate-200">
+                  <span>Watcher: <strong className="text-slate-700">{isOnline ? 'YES' : 'NO'}</strong></span>
+                  <span>Last Update: <strong className="text-slate-700">{locAgeSeconds !== null ? `${locAgeSeconds}s` : '—'}</strong></span>
+                  <span>Accuracy: <strong className="text-slate-700">{liveLocation?.accuracy != null ? `±${Math.round(liveLocation.accuracy)}m` : '—'}</strong></span>
+                  <span>Network: <strong className={typeof navigator !== 'undefined' && navigator.onLine ? 'text-emerald-700' : 'text-rose-700'}>{typeof navigator !== 'undefined' && navigator.onLine ? 'ONLINE' : 'OFFLINE'}</strong></span>
+                </div>
               )}
             </div>
           ) : (
-            <p className="text-[11px] text-slate-500 pt-1 border-t border-slate-200/60">
-              {gpsError?.message || 'Centralized GPS is active. Allow browser location permission or click "Current Location" to refresh.'}
-            </p>
+            <div className="space-y-1.5 pt-1 border-t border-slate-200/60">
+              <p className="text-[11px] text-slate-500">
+                {gpsError?.message || 'Centralized GPS is active. Allow browser location permission or click "Current Location" to refresh.'}
+              </p>
+              {import.meta.env.DEV && (
+                <div className="text-[10px] font-mono text-slate-500 bg-slate-100/80 px-2 py-0.5 rounded flex items-center gap-3 border border-slate-200">
+                  <span>Watcher: <strong className="text-slate-700">{isOnline ? 'YES' : 'NO'}</strong></span>
+                  <span>Last Update: <strong className="text-slate-700">—</strong></span>
+                  <span>Network: <strong className={typeof navigator !== 'undefined' && navigator.onLine ? 'text-emerald-700' : 'text-rose-700'}>{typeof navigator !== 'undefined' && navigator.onLine ? 'ONLINE' : 'OFFLINE'}</strong></span>
+                </div>
+              )}
+            </div>
           )}
         </div>
 

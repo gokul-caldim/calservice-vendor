@@ -80,6 +80,9 @@ from .models import (
     WorkforceNotification,
     JobPayment,
     PaymentCollectionEvent,
+    WorkforceJobLifecycleEvent,
+    JobTrackingSession,
+    JobLocationPoint,
 )
 from time_tracking.models import TimeLog, Break
 from time_tracking.serializers import TimeLogSerializer
@@ -1060,8 +1063,10 @@ class WorkforcePresenceToggleView(APIView):
         else:
             emp.is_online = not emp.is_online
 
-        emp.current_availability = "available" if emp.is_online else "offline"
-        emp.save()
+        emp.save(update_fields=["is_online"])
+        from workforce_api.services.workload import reconcile_employee_availability
+        reconcile_employee_availability(emp)
+        emp.refresh_from_db(fields=["current_availability"])
 
         try:
             PresenceLog.objects.create(
@@ -1110,19 +1115,39 @@ class WorkforceJobListView(APIView):
             else:
                 jobs = ServiceRequest.objects.all().order_by("-created_at")[:50]
         elif emp:
-            offered_job_ids = WorkforceJobOffer.objects.filter(
-                employee=emp,
-                status="OFFERED"
-            ).values_list("job_id", flat=True)
+            now = timezone.now()
+            from workforce_api.services.workload import (
+                ACTIVE_WORKLOAD_STATUSES,
+                get_employee_active_job,
+            )
+
+            active_job = get_employee_active_job(emp)
+
+            # Strict Single-Active-Job Isolation: When employee is busy, actionable offers are suppressed
+            if active_job:
+                offered_job_ids = []
+            else:
+                offered_job_ids = list(
+                    WorkforceJobOffer.objects.filter(
+                        employee=emp,
+                        status="OFFERED",
+                        expires_at__gt=now,
+                    ).values_list("job_id", flat=True)
+                )
 
             try:
                 from service_requests.models import EmployeeJob
-                emp_job_sr_ids = EmployeeJob.objects.filter(employee=emp).values_list("service_request_id", flat=True)
+                emp_job_sr_ids = EmployeeJob.objects.filter(
+                    employee=emp,
+                    status__in=["ACCEPTED", "IN_PROGRESS", "COMPLETED"]
+                ).values_list("service_request_id", flat=True)
             except Exception:
                 emp_job_sr_ids = []
 
             qs = ServiceRequest.objects.filter(
-                Q(assigned_employee=emp) | Q(id__in=offered_job_ids) | Q(id__in=emp_job_sr_ids)
+                Q(assigned_employee=emp, status__in=ACTIVE_WORKLOAD_STATUSES + ["completed", "cancelled"]) |
+                Q(id__in=offered_job_ids) |
+                Q(id__in=emp_job_sr_ids)
             )
             if emp.company:
                 qs = qs.filter(company=emp.company)
@@ -1368,62 +1393,49 @@ class WorkforceJobCashCollectView(APIView):
             change_returned = amt_received - pmt.amount_due
             now = timezone.now()
 
-            # Directly mark payment as PAID (Zero end-OTP requirement)
+            # Authoritative State Transition: Transition to CASH_PENDING (never directly PAID)
             pmt.amount_received = amt_received
             pmt.change_returned = change_returned
             pmt.cash_collected_at = now
             pmt.cash_collected_by = emp
-            pmt.amount_paid = pmt.amount_due
-            pmt.paid_at = now
-            pmt.payment_status = JobPayment.PaymentStatus.PAID
-            pmt.payment_confirmation_otp_hash = None
-            pmt.otp_expires_at = None
-            pmt.otp_used_at = now
+            pmt.amount_paid = Decimal("0.00")
+
+            # Generate cryptographically secure 6-digit confirmation OTP
+            otp_raw = f"{secrets.randbelow(900000) + 100000}"
+            pmt.payment_confirmation_otp_hash = make_password(otp_raw)
+            pmt.otp_expires_at = now + timedelta(minutes=15)
+            pmt.otp_attempts = 0
+            pmt.otp_used_at = None
+            pmt.payment_status = JobPayment.PaymentStatus.CASH_PENDING
             pmt.save()
 
-            # Record immutable audit events
+            # Record immutable audit event
             PaymentCollectionEvent.objects.create(
                 job_payment=pmt,
                 employee=emp,
                 actor_user=request.user,
-                event_type="CASH_COLLECTED",
+                event_type="CASH_REPORTED",
                 amount=pmt.amount_due,
                 metadata={"amount_received": float(amt_received), "change_returned": float(change_returned)},
             )
-            PaymentCollectionEvent.objects.create(
-                job_payment=pmt,
-                employee=emp,
-                actor_user=request.user,
-                event_type="PAYMENT_CONFIRMED",
-                amount=pmt.amount_due,
-            )
 
             # Sync ServiceRequest payment status
-            job.payment_status = "paid"
+            job.payment_status = "cash_pending"
             job.save(update_fields=["payment_status"])
-
-            # If post-service proof is already submitted, complete the job automatically
-            if job.status in ["proof_submitted", "in_progress"]:
-                proof = PostServiceProof.objects.filter(job=job).first()
-                if proof and proof.is_submitted:
-                    try:
-                        apply_transition(job, "completed", actor=request.user)
-                    except Exception:
-                        pass
 
             if job.customer:
                 create_notification(
                     recipient=job.customer,
-                    title="Payment Confirmed",
-                    message=f"Cash payment of ₹{pmt.amount_due} for Job #{job.id} has been confirmed.",
-                    notification_type="PAYMENT_CONFIRMATION",
+                    title="Payment Confirmation Required",
+                    message=f"Technician reported cash collection of ₹{pmt.amount_due} for Job #{job.id}. Share OTP {otp_raw} with technician or confirm in your dashboard.",
+                    notification_type="PAYMENT_CONFIRMATION_OTP",
                     company=job.company,
                     related_object_id=str(job.id),
                 )
 
             return Response({
-                "message": f"Cash payment of ₹{pmt.amount_due} collected and confirmed successfully (Received: ₹{amt_received}, Change: ₹{change_returned}).",
-                "payment_status": "PAID",
+                "message": f"Cash collection of ₹{pmt.amount_due} recorded. Confirmation OTP generated for customer (Received: ₹{amt_received}, Change: ₹{change_returned}).",
+                "payment_status": "CASH_PENDING",
                 "amount_due": str(pmt.amount_due),
                 "amount_received": str(amt_received),
                 "change_returned": str(change_returned),
@@ -1532,15 +1544,18 @@ class WorkforceJobPaymentVerifyOTPView(APIView):
                 amount=pmt.amount_due,
             )
 
-            job.payment_status = "collected"
+            job.payment_status = "paid"
 
             # Service completion gate: If service proof is submitted / completed, close the job
             if job.status in ["proof_submitted", "service_completed"]:
                 try:
                     apply_transition(job, "completed", actor=request.user)
-                except Exception:
-                    job.status = "completed"
-                    job.save(update_fields=["payment_status", "status"])
+                except ValidationError as ve:
+                    logger.warning("Could not complete job #%s after payment OTP verification: %s", job.id, ve)
+                    job.save(update_fields=["payment_status"])
+                except Exception as e:
+                    logger.exception("Unexpected error completing job #%s after payment OTP verification: %s", job.id, e)
+                    job.save(update_fields=["payment_status"])
             else:
                 job.save(update_fields=["payment_status"])
 
@@ -1666,14 +1681,17 @@ class WorkforceCustomerPaymentConfirmView(APIView):
                     amount=pmt.amount_due,
                 )
 
-                job.payment_status = "collected"
+                job.payment_status = "paid"
 
                 if job.status in ["proof_submitted", "service_completed"]:
                     try:
                         apply_transition(job, "completed", actor=request.user)
-                    except Exception:
-                        job.status = "completed"
-                        job.save(update_fields=["payment_status", "status"])
+                    except ValidationError as ve:
+                        logger.warning("Could not complete job #%s after customer payment confirm: %s", job.id, ve)
+                        job.save(update_fields=["payment_status"])
+                    except Exception as e:
+                        logger.exception("Unexpected error completing job #%s after customer payment confirm: %s", job.id, e)
+                        job.save(update_fields=["payment_status"])
                 else:
                     job.save(update_fields=["payment_status"])
 
@@ -1730,23 +1748,38 @@ class WorkforceDispatchEligibleListView(APIView):
 
     def get(self, request):
         from django.db.models import Exists, OuterRef, Prefetch
+        from django.utils.dateparse import parse_datetime
+        from workforce_api.services.automatic_dispatch import check_candidate_eligibility, haversine_distance
+
         service_name = request.query_params.get("service", "").strip()
         job_id = request.query_params.get("job_id")
+        job = None
+        cust_lat = None
+        cust_lon = None
 
         if job_id:
             job = ServiceRequest.objects.filter(pk=job_id).first()
             if job:
                 service_name = service_name or job.issue_title or job.service_category
+                if job.latitude is not None and job.longitude is not None:
+                    try:
+                        cust_lat = float(job.latitude)
+                        cust_lon = float(job.longitude)
+                    except (ValueError, TypeError):
+                        pass
 
         today_dow = timezone.now().weekday()
         busy_subquery = ServiceRequest.objects.filter(
             assigned_employee_id=OuterRef("pk"),
-            status__in=["accepted", "on_the_way", "in_progress"]
+            status__in=["accepted", "on_the_way", "arrived", "in_progress", "service_completed", "proof_submitted", "payment_pending"]
         )
 
+        candidates_qs = Employee.objects.filter(is_active=True).select_related("user", "company")
+        if request.user and getattr(request.user, "company_id", None):
+            candidates_qs = candidates_qs.filter(company_id=request.user.company_id)
+
         candidates = list(
-            Employee.objects.filter(is_active=True)
-            .select_related("user", "company")
+            candidates_qs
             .annotate(is_busy_job=Exists(busy_subquery))
             .prefetch_related(
                 Prefetch(
@@ -1763,12 +1796,25 @@ class WorkforceDispatchEligibleListView(APIView):
                     to_attr="prefetched_today_schedules"
                 ),
                 Prefetch(
-                    "employee_skills",
+                    "skills",
                     queryset=WorkforceEmployeeSkill.objects.filter(is_verified=True).select_related("skill"),
                     to_attr="prefetched_verified_skills"
                 )
             )
         )
+
+        now = timezone.now()
+        GATE_NAMES = {
+            "G1": "Account Active",
+            "G2": "Registration Approved",
+            "G3": "Required Documents Approved",
+            "G4": "Mandatory Compliance Valid",
+            "G5": "Working Schedule Active",
+            "G6": "Service / Skill Match",
+            "G7": "Online & Available Presence",
+            "G8": "Not On Leave",
+            "G9": "Single-Job Concurrency Free",
+        }
 
         eligible = []
         for emp in candidates:
@@ -1776,7 +1822,58 @@ class WorkforceDispatchEligibleListView(APIView):
             reg_status = onboarding.get("status", "not_started")
             approved_svcs = [s.get("name", "") for s in onboarding.get("services", []) if s.get("status") == "approved"]
 
-            is_eligible, reason = check_technician_eligibility(emp, service_name)
+            is_eligible, reason, gate_results = check_candidate_eligibility(emp, service_name)
+
+            # GPS telemetry extraction
+            last_loc = getattr(emp.user, "last_known_location", None) or {}
+            emp_lat = last_loc.get("latitude") if last_loc.get("latitude") is not None else last_loc.get("lat")
+            emp_lon = last_loc.get("longitude") if last_loc.get("longitude") is not None else (last_loc.get("lng") or last_loc.get("lon"))
+
+            gps_age_s = None
+            updated_at_str = last_loc.get("updated_at")
+            if updated_at_str:
+                try:
+                    loc_dt = parse_datetime(str(updated_at_str))
+                    if loc_dt:
+                        if timezone.is_naive(loc_dt):
+                            loc_dt = timezone.make_aware(loc_dt)
+                        gps_age_s = max(0, round((now - loc_dt).total_seconds()))
+                except Exception:
+                    pass
+
+            dist_km = None
+            if cust_lat is not None and cust_lon is not None and emp_lat is not None and emp_lon is not None:
+                try:
+                    dist_m = haversine_distance(cust_lat, cust_lon, float(emp_lat), float(emp_lon))
+                    dist_km = round(dist_m / 1000.0, 2)
+                except (ValueError, TypeError):
+                    pass
+
+            gps_freshness = "MISSING"
+            if gps_age_s is not None:
+                if gps_age_s <= 30:
+                    gps_freshness = "LIVE"
+                elif gps_age_s <= 120:
+                    gps_freshness = "UPDATING"
+                elif gps_age_s <= 300:
+                    gps_freshness = "DELAYED"
+                else:
+                    gps_freshness = "STALE"
+
+            # Compute rank score
+            score = 0
+            if is_eligible:
+                proximity_score = max(0.0, 100.0 - ((dist_km or 25.0) * 2.0))
+                clock_in_bonus = 10.0 if (emp.bank_details or {}).get("attendance", {}).get("is_clocked_in") else 0.0
+                score = round(proximity_score + clock_in_bonus, 1)
+
+            gate_audit = []
+            for g_code, g_name in GATE_NAMES.items():
+                gate_audit.append({
+                    "gate": g_code,
+                    "name": g_name,
+                    "passed": bool(gate_results.get(g_code, False)),
+                })
 
             eligible.append({
                 "id": emp.id,
@@ -1789,7 +1886,15 @@ class WorkforceDispatchEligibleListView(APIView):
                 "approved_services": approved_svcs,
                 "is_dispatch_ready": is_eligible,
                 "ineligibility_reason": reason if not is_eligible else "",
+                "distance_km": dist_km,
+                "score": score,
+                "gps_age_seconds": gps_age_s,
+                "gps_freshness": gps_freshness,
+                "gate_audit": gate_audit,
             })
+
+        # Sort: eligible candidates first (by score descending), then ineligible candidates
+        eligible.sort(key=lambda x: (1 if x["is_dispatch_ready"] else 0, x["score"]), reverse=True)
 
         return Response(eligible, status=status.HTTP_200_OK)
 
@@ -1864,16 +1969,22 @@ class WorkforceJobAcceptOfferView(APIView):
                 }, status=status.HTTP_409_CONFLICT)
 
             # RULE 1: Server-side Single Active Job Enforcement (Race-Safe)
-            conflicting = ServiceRequest.objects.select_for_update().filter(
-                assigned_employee=emp_obj,
-                status__in=ACTIVE_WORKLOAD_STATUSES
-            ).exclude(pk=job_obj.pk).first()
+            from workforce_api.services.workload import (
+                get_employee_active_job,
+                supersede_other_offers_for_employee,
+                reconcile_employee_availability,
+            )
 
-            if conflicting:
+            conflicting = get_employee_active_job(emp_obj, for_update=True)
+            if conflicting and conflicting.pk != job_obj.pk:
+                logger.warning(
+                    f"[ACCEPT_BLOCKED] employee={emp_obj.id} requested_job={job_obj.id} "
+                    f"active_job={conflicting.id} reason=EMPLOYEE_ALREADY_BUSY"
+                )
                 return Response({
                     "error": f"Cannot accept job: You already have an active job (Job #{conflicting.id}).",
                     "code": "EMPLOYEE_ALREADY_BUSY",
-                    "message": "You already have an active job.",
+                    "message": "You already have an active job. Complete it before accepting another job.",
                     "active_job_id": conflicting.id,
                 }, status=status.HTTP_409_CONFLICT)
 
@@ -1909,7 +2020,11 @@ class WorkforceJobAcceptOfferView(APIView):
                     offer.status = WorkforceJobOffer.Status.EXPIRED
                     offer.save()
                     run_automatic_dispatch(job_obj, excluded_employee_ids=[emp_obj.id])
-                    return Response({"error": "Job offer has expired.", "code": "OFFER_EXPIRED"}, status=status.HTTP_400_BAD_REQUEST)
+                    return Response({
+                        "error": "This offer has expired.",
+                        "code": "OFFER_EXPIRED",
+                        "message": "This offer has expired."
+                    }, status=status.HTTP_409_CONFLICT)
                 offer.status = WorkforceJobOffer.Status.ACCEPTED
                 offer.save()
 
@@ -1952,16 +2067,8 @@ class WorkforceJobAcceptOfferView(APIView):
                         }
                     )
 
-            # Expire all other pending OFFERED jobs for this winning employee
-            other_offers = WorkforceJobOffer.objects.select_for_update().filter(
-                employee=emp_obj,
-                status=WorkforceJobOffer.Status.OFFERED
-            ).exclude(pk=offer.pk if offer else 0)
-
-            for o_off in other_offers:
-                o_off.status = WorkforceJobOffer.Status.SUPERSEDED
-                o_off.rejection_reason = "SUPERSEDED_BY_ANOTHER_ACCEPTANCE"
-                o_off.save(update_fields=["status", "rejection_reason"])
+            # Supersede all other pending OFFERED jobs for this winning employee
+            supersede_other_offers_for_employee(emp_obj, job_obj)
 
             # Unset any prior primary EmployeeJob for this service request
             EmployeeJob.objects.filter(service_request=job_obj, is_primary=True).exclude(employee=emp_obj).update(is_primary=False)
@@ -2181,15 +2288,10 @@ class WorkforceJobCancelAssignmentView(APIView):
                 rejection_reason=f"[{reason_code}] {reason_text}".strip(),
             )
 
-            # Release Employee Availability: check if employee has any other active jobs
-            has_other_active = ServiceRequest.objects.filter(
-                assigned_employee=emp_obj,
-                status__in=ACTIVE_WORKLOAD_STATUSES,
-            ).exists()
-
-            if not has_other_active:
-                emp_obj.current_availability = "available"
-                emp_obj.save(update_fields=["current_availability"])
+            # Release Employee Availability: reconcile against remaining active jobs
+            from workforce_api.services.workload import reconcile_employee_availability
+            reconcile_employee_availability(emp_obj)
+            logger.info(f"[EMPLOYEE_RELEASED] employee={emp_obj.id} cancelled_job={job_obj.id} state={emp_obj.current_availability.upper()}")
 
             window_seconds = max(0, int((now - accepted_at).total_seconds())) if accepted_at else None
 
@@ -3942,28 +4044,34 @@ class WorkforceLocationUpdateView(APIView):
 class WorkforceJobLiveTrackingView(APIView):
     """
     Returns live tracking coordinates and metadata for an assigned job.
-    Accessible only to the authorized customer who owns the booking or the assigned technician.
+    Accessible to:
+      1. The authorized customer who owns the booking
+      2. The assigned technician
+      3. An authorized workforce admin within the same tenant company
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk):
         user = request.user
         from service_requests.models import ServiceRequest
+        from accounts.permissions import is_admin_role
+
         job = ServiceRequest.objects.filter(pk=pk).select_related("assigned_employee__user", "customer", "company").first()
         if not job:
             return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
         is_owner_customer = (job.customer == user)
         is_assigned_tech = (job.assigned_employee and job.assigned_employee.user == user)
+        is_tenant_admin = is_admin_role(user) and (job.company == getattr(user, "company", None) or getattr(user, "is_superuser", False))
 
-        if not (is_owner_customer or is_assigned_tech):
+        if not (is_owner_customer or is_assigned_tech or is_tenant_admin):
             return Response({
                 "error": "Unauthorized to view tracking for this job.",
                 "code": "UNAUTHORIZED_TRACKING"
             }, status=status.HTTP_403_FORBIDDEN)
 
-        # Cross-tenant check for technician
-        if is_assigned_tech and job.company and getattr(user, "company", None) and job.company != user.company:
+        # Cross-tenant check for technician or admin
+        if (is_assigned_tech or is_admin_role(user)) and job.company and getattr(user, "company", None) and job.company != user.company:
             return Response({"error": "Unauthorized: Cross-company access forbidden.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         now = timezone.now()
@@ -3972,6 +4080,7 @@ class WorkforceJobLiveTrackingView(APIView):
 
         # Privacy Guard: If job is completed/cancelled/closed/redispatching, or has no assigned technician
         if job.status in ["completed", "cancelled", "closed", "redispatching"] or not job.assigned_employee:
+            logger.info(f"[MAP_RECONCILIATION] job_id={job.id} status={job.status} technician_masked=True")
             return Response({
                 "job_id": job.id,
                 "request_id": job.request_id,
@@ -4038,6 +4147,13 @@ class WorkforceJobLiveTrackingView(APIView):
             verification = PreServiceVerification.objects.filter(job=job).first()
         geofence_passed = bool(verification and verification.geofence_passed)
 
+        # Include Work Start OTP only for authorized customer / admin when unverified
+        start_otp = None
+        if (is_owner_customer or is_tenant_admin) and verification and verification.otp_code and not verification.otp_verified:
+            start_otp = verification.otp_code
+
+        logger.info(f"[MAP_RECONCILIATION] job_id={job.id} freshness_state={freshness_state} distance_m={distance_m} age_seconds={age_seconds}")
+
         return Response({
             "job_id": job.id,
             "request_id": job.request_id,
@@ -4056,6 +4172,7 @@ class WorkforceJobLiveTrackingView(APIView):
             "distance_m": distance_m,
             "geofence_passed": geofence_passed,
             "geofence_radius_meters": 300.0,
+            "start_otp": start_otp,
             "freshness_state": freshness_state,
             "age_seconds": age_seconds,
             "updated_at": now.isoformat(),
@@ -4111,18 +4228,73 @@ class WorkforceNotificationListView(APIView):
             "notifications": data,
         }, status=status.HTTP_200_OK)
 
+    def delete(self, request):
+        user = request.user
+        ids = request.data.get("ids", None) if isinstance(request.data, dict) else None
+        if not ids:
+            id_param = request.query_params.get("id", None)
+            ids_param = request.query_params.get("ids", None)
+            if ids_param:
+                ids = [int(x.strip()) for x in ids_param.split(",") if x.strip().isdigit()]
+            elif id_param and id_param.isdigit():
+                ids = [int(id_param)]
+
+        qs = WorkforceNotification.objects.filter(recipient=user)
+        if ids:
+            qs = qs.filter(id__in=ids)
+
+        deleted_count, _ = qs.delete()
+        unread_count = WorkforceNotification.objects.filter(recipient=user, is_read=False).count()
+        return Response({
+            "message": "Notifications cleared.",
+            "deleted_count": deleted_count,
+            "unread_count": unread_count,
+        }, status=status.HTTP_200_OK)
+
 
 class WorkforceNotificationMarkReadView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, pk=None):
         user = request.user
+        ids = request.data.get("ids", None) if isinstance(request.data, dict) else None
         if pk:
             WorkforceNotification.objects.filter(pk=pk, recipient=user).update(is_read=True, read_at=timezone.now())
+        elif ids and isinstance(ids, list):
+            WorkforceNotification.objects.filter(id__in=ids, recipient=user).update(is_read=True, read_at=timezone.now())
         else:
             WorkforceNotification.objects.filter(recipient=user, is_read=False).update(is_read=True, read_at=timezone.now())
 
-        return Response({"message": "Notifications marked as read."}, status=status.HTTP_200_OK)
+        unread_count = WorkforceNotification.objects.filter(recipient=user, is_read=False).count()
+        return Response({"message": "Notifications marked as read.", "unread_count": unread_count}, status=status.HTTP_200_OK)
+
+
+class WorkforceNotificationClearView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk=None):
+        user = request.user
+        if pk:
+            deleted_count, _ = WorkforceNotification.objects.filter(pk=pk, recipient=user).delete()
+        else:
+            ids = request.data.get("ids", None) if isinstance(request.data, dict) else None
+            all_flag = request.data.get("all", False) if isinstance(request.data, dict) else False
+            if ids and isinstance(ids, list):
+                deleted_count, _ = WorkforceNotification.objects.filter(id__in=ids, recipient=user).delete()
+            elif all_flag or not ids:
+                deleted_count, _ = WorkforceNotification.objects.filter(recipient=user).delete()
+            else:
+                deleted_count = 0
+
+        unread_count = WorkforceNotification.objects.filter(recipient=user, is_read=False).count()
+        return Response({
+            "message": "Notifications cleared.",
+            "deleted_count": deleted_count,
+            "unread_count": unread_count,
+        }, status=status.HTTP_200_OK)
+
+    def delete(self, request, pk=None):
+        return self.post(request, pk=pk)
 
 
 # ─── 22. Workforce Scheduling Module ──────────────────────────────────────────
