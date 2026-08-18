@@ -7,7 +7,8 @@ import { Toolbar } from '../../components/enterprise/Toolbar.jsx';
 import { DataTable } from '../../components/enterprise/DataTable.jsx';
 import { StatusBadge } from '../../components/enterprise/StatusBadge.jsx';
 import { Pagination } from '../../components/enterprise/Pagination.jsx';
-import { Briefcase, ArrowRight, User, Send, MapPin, Calendar } from 'lucide-react';
+import { CustomerLiveTrackingModal } from '../../components/common/CustomerLiveTrackingModal.jsx';
+import { Briefcase, ArrowRight, User, Send, MapPin, Calendar, Navigation } from 'lucide-react';
 
 export function AdminJobsPage() {
   const [jobs, setJobs] = useState([]);
@@ -16,6 +17,7 @@ export function AdminJobsPage() {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize] = useState(12);
   const [isLoading, setIsLoading] = useState(true);
+  const [liveTrackingJobId, setLiveTrackingJobId] = useState(null);
 
   const loadJobs = async () => {
     try {
@@ -45,8 +47,6 @@ export function AdminJobsPage() {
 
       return matchesSearch && matchesStatus;
     });
-
-    return list.sort((a, b) => (b.id || 0) - (a.id || 0));
   }, [jobs, searchTerm, statusFilter]);
 
   const paginatedData = useMemo(() => {
@@ -108,15 +108,31 @@ export function AdminJobsPage() {
       key: 'action',
       header: 'Action',
       align: 'right',
-      render: (_, row) => (
-        <Link
-          to="/workforce/admin/dispatch"
-          className="px-2.5 py-1 rounded bg-blue-50 hover:bg-blue-100 text-blue-700 font-bold text-xs border border-blue-200 transition-colors inline-flex items-center gap-1"
-        >
-          <span>Dispatch Hub</span>
-          <ArrowRight className="w-3 h-3" />
-        </Link>
-      ),
+      render: (_, row) => {
+        const isTrackable = ['assigned', 'accepted', 'on_the_way', 'arrived', 'in_progress', 'completed'].includes((row.status || '').toLowerCase());
+        return (
+          <div className="flex items-center justify-end gap-1.5">
+            {isTrackable && (
+              <button
+                type="button"
+                onClick={() => setLiveTrackingJobId(row.id)}
+                className="px-2 py-1 rounded bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold text-xs border border-emerald-200 transition-colors inline-flex items-center gap-1"
+                title="View Live Road Tracking"
+              >
+                <Navigation className="w-3 h-3 text-emerald-600" />
+                <span>Track</span>
+              </button>
+            )}
+            <Link
+              to="/workforce/admin/dispatch"
+              className="px-2.5 py-1 rounded bg-blue-50 hover:bg-blue-100 text-blue-700 font-bold text-xs border border-blue-200 transition-colors inline-flex items-center gap-1"
+            >
+              <span>Dispatch</span>
+              <ArrowRight className="w-3 h-3" />
+            </Link>
+          </div>
+        );
+      },
     },
   ];
 
@@ -174,6 +190,14 @@ export function AdminJobsPage() {
             onPageChange={setCurrentPage}
           />
         )}
+
+        {/* Operational Live Tracking Modal */}
+        <CustomerLiveTrackingModal
+          jobId={liveTrackingJobId}
+          isOpen={Boolean(liveTrackingJobId)}
+          onClose={() => setLiveTrackingJobId(null)}
+          viewRole="admin"
+        />
       </div>
     </AppShell>
   );

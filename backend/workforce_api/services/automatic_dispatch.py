@@ -16,6 +16,7 @@ from django.contrib.auth import get_user_model
 from django.utils.dateparse import parse_datetime
 
 from service_requests.models import ServiceRequest, EmployeeJob
+from service_requests.state_machine import apply_transition
 from employees.models import Employee
 from workforce_api.models import (
     WorkforceJobOffer,
@@ -25,6 +26,7 @@ from workforce_api.models import (
     WorkforceEmployeeSchedule,
 )
 from time_tracking.geo import haversine_distance
+from workforce_api.services.workload import get_employee_active_job, ACTIVE_WORKLOAD_STATUSES
 
 logger = logging.getLogger("workforce.dispatch")
 
@@ -38,7 +40,7 @@ MAX_DISPATCH_RADIUS_KM = 50.0
 DEFAULT_OFFER_DURATION_MINUTES = 5
 
 # Dispatchable database statuses
-DISPATCHABLE_STATUSES = ["draft", "new_request", "confirmed", "unassigned", "assigned"]
+DISPATCHABLE_STATUSES = ["draft", "new_request", "confirmed", "unassigned", "assigned", "redispatching"]
 
 # Canonical service synonyms and explicit alias dictionary
 EXPLICIT_SERVICE_ALIASES = {
@@ -142,28 +144,90 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
         return False, "Gate 2: Technician registration onboarding is not approved.", gate_results
 
     # ── Gate 3: Required Documents Approved ───────────────────────────────────
-    documents = onboarding.get("documents", {})
-    if any(doc.get("status") != "approved" for doc in documents.values()):
-        gate_results["G3"] = False
-        logger.debug(f"[9GATE_REJECT_GATE3_DOCUMENTS_UNAPPROVED] Employee #{emp.id} has unapproved documents.")
-        return False, "Gate 3: Technician has unapproved dossier documents.", gate_results
+    if emp and getattr(emp, "company_id", None):
+        from workforce_api.models import WorkforceRequiredDocument, WorkforceEmployeeDocument
+        mandatory_doc_reqs = WorkforceRequiredDocument.objects.filter(company_id=emp.company_id, is_mandatory=True)
+        if mandatory_doc_reqs.exists():
+            if hasattr(emp, "prefetched_employee_documents"):
+                emp_docs_map = {d.requirement_id: d for d in emp.prefetched_employee_documents}
+            else:
+                emp_docs_map = {
+                    d.requirement_id: d
+                    for d in WorkforceEmployeeDocument.objects.filter(employee=emp, requirement__in=mandatory_doc_reqs)
+                }
+
+            today = timezone.now().date()
+            for req_doc in mandatory_doc_reqs:
+                emp_doc = emp_docs_map.get(req_doc.id)
+                if not emp_doc or emp_doc.status != "APPROVED":
+                    gate_results["G3"] = False
+                    st = emp_doc.status if emp_doc else "MISSING"
+                    logger.debug(f"[9GATE_REJECT_GATE3_DOCUMENTS_UNAPPROVED] Employee #{emp.id} mandatory document '{req_doc.title}' is {st}.")
+                    return False, f"Gate 3: Technician mandatory document '{req_doc.title}' is {st} (must be APPROVED).", gate_results
+                if emp_doc.expiry_date and emp_doc.expiry_date < today:
+                    gate_results["G3"] = False
+                    logger.debug(f"[9GATE_REJECT_GATE3_DOCUMENTS_EXPIRED] Employee #{emp.id} mandatory document '{req_doc.title}' expired on {emp_doc.expiry_date}.")
+                    return False, f"Gate 3: Technician mandatory document '{req_doc.title}' expired on {emp_doc.expiry_date}.", gate_results
+        else:
+            documents = onboarding.get("documents", {})
+            if any(doc.get("status") in ["rejected", "pending_review", "missing"] for doc in documents.values()):
+                gate_results["G3"] = False
+                logger.debug(f"[9GATE_REJECT_GATE3_DOCUMENTS_UNAPPROVED] Employee #{emp.id} has unapproved documents.")
+                return False, "Gate 3: Technician has unapproved dossier documents.", gate_results
+    else:
+        documents = onboarding.get("documents", {})
+        if any(doc.get("status") in ["rejected", "pending_review", "missing"] for doc in documents.values()):
+            gate_results["G3"] = False
+            return False, "Gate 3: Technician has unapproved dossier documents.", gate_results
 
     # ── Gate 4: Mandatory Compliance Valid ────────────────────────────────────
-    if hasattr(emp, "prefetched_invalid_compliance"):
-        if emp.prefetched_invalid_compliance:
-            gate_results["G4"] = False
-            logger.debug(f"[9GATE_REJECT_GATE4_COMPLIANCE_INVALID] Employee #{emp.id} has invalid compliance.")
-            return False, "Gate 4: Technician has expired or rejected mandatory compliance document.", gate_results
+    if emp and getattr(emp, "company_id", None):
+        from workforce_api.models import WorkforceComplianceRequirement
+        mandatory_comp_reqs = WorkforceComplianceRequirement.objects.filter(company_id=emp.company_id, is_mandatory=True)
+        if mandatory_comp_reqs.exists():
+            today = timezone.now().date()
+            emp_comp_records = list(WorkforceEmployeeCompliance.objects.filter(employee=emp, requirement__in=mandatory_comp_reqs))
+            emp_comp_map = {c.requirement_id: c for c in emp_comp_records}
+            for comp_req in mandatory_comp_reqs:
+                c_rec = emp_comp_map.get(comp_req.id)
+                if not c_rec or c_rec.status in ["MISSING", "PENDING_REVIEW", "REJECTED", "EXPIRED"]:
+                    gate_results["G4"] = False
+                    st = c_rec.status if c_rec else "MISSING"
+                    logger.debug(f"[9GATE_REJECT_GATE4_COMPLIANCE_INVALID] Employee #{emp.id} mandatory compliance '{comp_req.title}' is {st}.")
+                    return False, f"Gate 4: Mandatory compliance '{comp_req.title}' is {st} (must be VALID).", gate_results
+                if c_rec.expiry_date and c_rec.expiry_date < today:
+                    gate_results["G4"] = False
+                    return False, f"Gate 4: Mandatory compliance '{comp_req.title}' expired on {c_rec.expiry_date}.", gate_results
+        else:
+            if hasattr(emp, "prefetched_invalid_compliance"):
+                if emp.prefetched_invalid_compliance:
+                    gate_results["G4"] = False
+                    logger.debug(f"[9GATE_REJECT_GATE4_COMPLIANCE_INVALID] Employee #{emp.id} has invalid compliance.")
+                    return False, "Gate 4: Technician has expired or rejected mandatory compliance document.", gate_results
+            else:
+                mandatory_comp = WorkforceEmployeeCompliance.objects.filter(
+                    employee=emp,
+                    requirement__is_mandatory=True,
+                    status__in=["EXPIRED", "REJECTED"],
+                ).first()
+                if mandatory_comp:
+                    gate_results["G4"] = False
+                    logger.debug(f"[9GATE_REJECT_GATE4_COMPLIANCE_INVALID] Employee #{emp.id} compliance '{mandatory_comp.requirement.title}' is {mandatory_comp.status}.")
+                    return False, f"Gate 4: Technician has expired or rejected mandatory compliance document: '{mandatory_comp.requirement.title}'.", gate_results
     else:
-        mandatory_comp = WorkforceEmployeeCompliance.objects.filter(
-            employee=emp,
-            requirement__is_mandatory=True,
-            status__in=["EXPIRED", "REJECTED"],
-        ).first()
-        if mandatory_comp:
-            gate_results["G4"] = False
-            logger.debug(f"[9GATE_REJECT_GATE4_COMPLIANCE_INVALID] Employee #{emp.id} compliance '{mandatory_comp.requirement.title}' is {mandatory_comp.status}.")
-            return False, f"Gate 4: Technician has expired or rejected mandatory compliance document: '{mandatory_comp.requirement.title}'.", gate_results
+        if hasattr(emp, "prefetched_invalid_compliance"):
+            if emp.prefetched_invalid_compliance:
+                gate_results["G4"] = False
+                return False, "Gate 4: Technician has expired or rejected mandatory compliance document.", gate_results
+        else:
+            mandatory_comp = WorkforceEmployeeCompliance.objects.filter(
+                employee=emp,
+                requirement__is_mandatory=True,
+                status__in=["EXPIRED", "REJECTED"],
+            ).first()
+            if mandatory_comp:
+                gate_results["G4"] = False
+                return False, f"Gate 4: Technician has expired or rejected mandatory compliance document: '{mandatory_comp.requirement.title}'.", gate_results
 
     # ── Gate 5: Working Schedule ──────────────────────────────────────────────
     if hasattr(emp, "prefetched_today_schedules"):
@@ -225,26 +289,20 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
                 logger.debug(f"[9GATE_REJECT_GATE8_LEAVE_ACTIVE] Employee #{emp.id} on approved leave ({start_date} to {end_date}).")
                 return False, f"Gate 8: Technician is on approved leave from {start_date} to {end_date}.", gate_results
 
-    # ── Gate 9: Workload Concurrency ──────────────────────────────────────────
-    if hasattr(emp, "is_busy_job"):
-        if emp.is_busy_job:
-            gate_results["G9"] = False
-            logger.debug(f"[9GATE_REJECT_GATE9_WORKLOAD_BUSY] Employee #{emp.id} has active busy job.")
-            return False, "Gate 9: Technician is busy on active job assignment.", gate_results
-    else:
-        active_job = ServiceRequest.objects.filter(
-            assigned_employee=emp,
-            status__in=["accepted", "on_the_way", "arrived", "in_progress"],
-        ).first()
-        if active_job:
-            gate_results["G9"] = False
-            logger.debug(f"[9GATE_REJECT_GATE9_WORKLOAD_BUSY] Employee #{emp.id} is busy on active Job #{active_job.id}.")
-            return False, f"Gate 9: Technician is busy on active Job #{active_job.id} ({active_job.request_id}).", gate_results
+    # ── Gate 9: Workload Concurrency (Single-Active-Job Isolation) ──────────────
+    from workforce_api.services.workload import get_employee_active_job
+    active_job = get_employee_active_job(emp)
+    if active_job:
+        gate_results["G9"] = False
+        logger.info(
+            f"[DISPATCH_REJECT] employee={emp.id} reason=EMPLOYEE_ALREADY_BUSY active_job={active_job.id}"
+        )
+        return False, f"Gate 9: Technician is busy on active Job #{active_job.id} ({active_job.request_id}).", gate_results
 
     return True, "All 9 Eligibility Gates Passed", gate_results
 
 
-def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) -> List[Dict[str, Any]]:
+def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, excluded_employee_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """
     Finds and ranks all eligible candidate employees for a given ServiceRequest.
     Uses database-level filtering and prefetching for optimal WAN performance.
@@ -269,9 +327,10 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
         return []
 
     today_dow = timezone.now().weekday()
+    from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES, get_employee_active_job
     busy_subquery = ServiceRequest.objects.filter(
         assigned_employee_id=OuterRef("pk"),
-        status__in=["accepted", "on_the_way", "arrived", "in_progress"]
+        status__in=ACTIVE_WORKLOAD_STATUSES
     )
 
     candidates_qs = (
@@ -307,10 +366,15 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
     if job_obj.company_id:
         candidates_qs = candidates_qs.filter(company_id=job_obj.company_id)
 
-    # Exclude candidates who have already received or rejected an offer for this job
+    # Exclude candidates who have already received or rejected/cancelled an offer for this job, or explicitly excluded
     previous_offers = set(
-        WorkforceJobOffer.objects.filter(job=job_obj).values_list("employee_id", flat=True)
+        WorkforceJobOffer.objects.filter(
+            job=job_obj,
+            status__in=["OFFERED", "REJECTED", "CANCELLED", "ACCEPTED"]
+        ).values_list("employee_id", flat=True)
     )
+    if excluded_employee_ids:
+        previous_offers.update(excluded_employee_ids)
 
     ranked_candidates = []
     now = timezone.now()
@@ -326,7 +390,7 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
         emp_lon = last_loc.get("longitude") if last_loc.get("longitude") is not None else (last_loc.get("lng") or last_loc.get("lon"))
 
         gps_age_s = None
-        updated_at_str = last_loc.get("updated_at")
+        updated_at_str = last_loc.get("updated_at") or last_loc.get("captured_at")
         if updated_at_str:
             try:
                 loc_dt = parse_datetime(str(updated_at_str))
@@ -424,7 +488,7 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
     return ranked_candidates
 
 
-def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) -> Tuple[bool, str]:
+def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, excluded_employee_ids: Optional[List[int]] = None) -> Tuple[bool, str]:
     """
     Executes automatic dispatch for a single ServiceRequest:
     1. Locks ServiceRequest row with select_for_update inside transaction.atomic()
@@ -469,8 +533,7 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
         # Validate customer booking coordinates
         if job_obj.latitude is None or job_obj.longitude is None:
             if job_obj.status != "unassigned":
-                job_obj.status = "unassigned"
-                job_obj.save(update_fields=["status"])
+                apply_transition(job_obj, "unassigned")
             logger.warning(f"[DISPATCH_GPS_MISSING] Job #{job_id} is missing coordinates.")
             return False, "Customer booking is missing valid GPS coordinates."
 
@@ -480,7 +543,11 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
         )
 
         # Find eligible candidate technicians
-        candidates = get_eligible_candidates(job_obj, max_gps_age_seconds=max_gps_age_seconds)
+        candidates = get_eligible_candidates(
+            job_obj,
+            max_gps_age_seconds=max_gps_age_seconds,
+            excluded_employee_ids=excluded_employee_ids,
+        )
 
         WorkforceEventLog.objects.create(
             event_type="CANDIDATES_EVALUATED",
@@ -513,6 +580,15 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
         top_dist_km = top_candidate["distance_km"]
         top_score = top_candidate["score"]
 
+        # Final workload concurrency verification boundary
+        busy_check = get_employee_active_job(top_emp)
+        if busy_check:
+            logger.warning(
+                f"[DISPATCH_REJECT] employee={top_emp.id} job={job_obj.id} "
+                f"reason=EMPLOYEE_ALREADY_BUSY active_job={busy_check.id}"
+            )
+            return False, f"Technician #{top_emp.id} is busy on active Job #{busy_check.id}. Cannot offer Job #{job_obj.id}."
+
         # Expire any previous offers for this job that might be dangling
         WorkforceJobOffer.objects.filter(job=job_obj, status=WorkforceJobOffer.Status.OFFERED).update(status=WorkforceJobOffer.Status.EXPIRED)
 
@@ -526,9 +602,9 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
             expires_at=expires_at,
         )
 
-        if job_obj.status in ["draft", "new_request", "confirmed", "unassigned"]:
-            job_obj.status = "assigned"
-            job_obj.save(update_fields=["status"])
+        # Keep ServiceRequest unassigned until candidate accepts via backend atomic transaction
+        if job_obj.status in ["draft", "new_request", "confirmed"]:
+            apply_transition(job_obj, "unassigned")
 
         WorkforceEventLog.objects.create(
             user=top_emp.user,
@@ -655,7 +731,7 @@ def reconsider_jobs_for_employee(employee_or_id) -> int:
     """
     emp_id = employee_or_id.pk if hasattr(employee_or_id, "pk") else employee_or_id
     emp = Employee.objects.filter(pk=emp_id).first()
-    if not emp or not emp.is_active or not emp.is_online or emp.current_availability != "available":
+    if not emp or not emp.is_active or not emp.is_online or emp.current_availability != "available" or get_employee_active_job(emp):
         return 0
 
     now = timezone.now()

@@ -18,13 +18,12 @@ import {
   apiTriggerAutoDispatch,
   apiGetWorkforceJobs,
   apiGetFleetMap,
-  apiGetLeaves,
-  apiAdminDecideLeave,
   apiGetAdminPendingServices,
   apiDecideService,
   apiGetAdminPendingExtensions,
   apiAdminDecideExtension,
   apiToggleLocationActive,
+  apiGetJobTimeline,
 } from '../../api/workforceService.js';
 import { apiGetLocations, apiCreateLocation } from '../../api/clockInApi.js';
 import { apiRequest } from '../../api/client.js';
@@ -60,6 +59,8 @@ import {
   Save,
   Loader,
   Radio,
+  History,
+  Eye,
 } from 'lucide-react';
 
 // ─── Delete location helper ───────────────────────────────────────────────────
@@ -101,14 +102,19 @@ function FleetMapVisual({ fleetData }) {
     if (!apiLoaded || !mapContainerRef.current) return;
     if (mapRef.current) return; // already initialized
     const google = window.google;
-    mapRef.current = new google.maps.Map(mapContainerRef.current, {
-      center: { lat: 20.5937, lng: 78.9629 },
-      zoom: 5,
-      mapTypeControl: false,
-      streetViewControl: false,
-      fullscreenControl: false,
-    });
-    infoWindowRef.current = new google.maps.InfoWindow();
+    if (!google?.maps?.Map || !google?.maps?.ControlPosition) return;
+    try {
+      mapRef.current = new google.maps.Map(mapContainerRef.current, {
+        center: { lat: 20.5937, lng: 78.9629 },
+        zoom: 5,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false,
+      });
+      infoWindowRef.current = new google.maps.InfoWindow();
+    } catch (err) {
+      console.error('Error initializing AdminOperationsPage map:', err);
+    }
   }, [apiLoaded]);
 
   // Update markers whenever fleet data changes
@@ -407,7 +413,6 @@ export function AdminOperationsPage() {
   const [technicians, setTechnicians] = useState([]);
   const [eligibleFleet, setEligibleFleet] = useState([]);
   const [fleetMap, setFleetMap] = useState([]);
-  const [leaves, setLeaves] = useState([]);
   const [pendingServices, setPendingServices] = useState([]);
   const [pendingExtensions, setPendingExtensions] = useState([]);
   const [locations, setLocations] = useState([]);
@@ -421,16 +426,18 @@ export function AdminOperationsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [dispatchLoading, setDispatchLoading] = useState(false);
   const [statusMsg, setStatusMsg] = useState({ type: '', text: '' });
+  const [timelineJob, setTimelineJob] = useState(null);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineData, setTimelineData] = useState(null);
 
   const loadData = async () => {
     try {
       setIsLoading(true);
-      const [techs, jobsList, eligible, leavesData, locsData, fleetData, pendingSvcData, pendingExtData] =
+      const [techs, jobsList, eligible, locsData, fleetData, pendingSvcData, pendingExtData] =
         await Promise.all([
           apiGetAdminApplications('approved').catch(() => []),
           apiGetWorkforceJobs().catch(() => []),
           apiGetEligibleTechnicians().catch(() => []),
-          apiGetLeaves().catch(() => []),
           apiGetLocations().catch(() => []),
           apiGetFleetMap().catch(() => []),
           apiGetAdminPendingServices().catch(() => []),
@@ -441,7 +448,6 @@ export function AdminOperationsPage() {
       setTechnicians(safe(techs));
       setJobs(safe(jobsList));
       setEligibleFleet(safe(eligible));
-      setLeaves(safe(leavesData));
       setLocations(safe(locsData));
       setFleetMap(safe(fleetData));
       setPendingServices(safe(pendingSvcData));
@@ -497,19 +503,18 @@ export function AdminOperationsPage() {
     }
   };
 
-  const handleDecideLeave = async (empId, leaveId, action) => {
+  const handleOpenTimeline = async (job) => {
+    if (!job) return;
+    setTimelineJob(job);
+    setTimelineLoading(true);
+    setTimelineData(null);
     try {
-      setStatusMsg({ type: '', text: '' });
-      let reason = '';
-      if (action === 'reject') {
-        reason = prompt('Enter rejection reason:') || 'Administrative decision';
-      }
-      await apiAdminDecideLeave(empId, leaveId, action, reason);
-      setStatusMsg({ type: 'success', text: `Leave application ${action}d successfully.` });
-      await loadData();
-      setTimeout(() => setStatusMsg({ type: '', text: '' }), 4000);
+      const data = await apiGetJobTimeline(job.id);
+      setTimelineData(data);
     } catch (err) {
-      setStatusMsg({ type: 'error', text: err.message || 'Action failed.' });
+      setTimelineData({ error: err.message || 'Failed to load timeline.' });
+    } finally {
+      setTimelineLoading(false);
     }
   };
 
@@ -611,11 +616,6 @@ export function AdminOperationsPage() {
       label: `Work Locations (${Array.isArray(locations) ? locations.length : 0})`,
       icon: MapPin,
     },
-    {
-      id: 'leaves',
-      label: `Leave Schedule (${Array.isArray(leaves) ? leaves.length : 0})`,
-      icon: Calendar,
-    },
   ];
 
   return (
@@ -624,7 +624,7 @@ export function AdminOperationsPage() {
         {/* Header */}
         <PageHeader
           title="Dynamic Dispatch & Fleet Operations"
-          subtitle="Skill-based technician matching, real-time GPS telemetry radar, and leave management"
+          subtitle="Skill-based technician matching and real-time GPS telemetry radar"
           actions={
             <button
               onClick={loadData}
@@ -756,15 +756,25 @@ export function AdminOperationsPage() {
                       </span>
                     </div>
                     {selectedJob && (
-                      <button
-                        type="button"
-                        onClick={handleTriggerAutoDispatch}
-                        disabled={dispatchLoading}
-                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs inline-flex items-center gap-1 shadow-sm transition-colors"
-                      >
-                        <Sparkles className="w-3.5 h-3.5" />
-                        {dispatchLoading ? 'Reconciling...' : 'Re-evaluate Auto-Dispatch'}
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleOpenTimeline(selectedJob)}
+                          className="px-2.5 py-1.5 bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 font-bold rounded text-xs inline-flex items-center gap-1.5 shadow-sm transition-colors"
+                        >
+                          <History className="w-3.5 h-3.5 text-blue-600" />
+                          View Timeline
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleTriggerAutoDispatch}
+                          disabled={dispatchLoading}
+                          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs inline-flex items-center gap-1 shadow-sm transition-colors"
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          {dispatchLoading ? 'Reconciling...' : 'Re-evaluate Auto-Dispatch'}
+                        </button>
+                      </div>
                     )}
                   </div>
 
@@ -776,54 +786,94 @@ export function AdminOperationsPage() {
                     </div>
                   </div>
 
-                  <div className="divide-y divide-slate-100 max-h-[440px] overflow-y-auto">
+                  <div className="divide-y divide-slate-100 max-h-[460px] overflow-y-auto">
                     {eligibleFleet.length > 0 ? (
                       eligibleFleet.map((tech) => (
                         <div
                           key={tech.id}
-                          className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-slate-50 transition-colors"
+                          className={`p-3.5 space-y-2 hover:bg-slate-50 transition-colors ${
+                            tech.is_dispatch_ready ? 'bg-white' : 'bg-slate-50/60 opacity-80'
+                          }`}
                         >
-                          <div className="flex items-center gap-3">
-                            <div className="w-8 h-8 rounded bg-slate-100 border border-slate-200 flex items-center justify-center font-bold text-slate-800 text-xs shrink-0">
-                              {tech.name ? tech.name[0].toUpperCase() : 'T'}
-                            </div>
-                            <div>
-                              <div className="flex items-center gap-2">
-                                <p className="text-xs font-bold text-slate-900">{tech.name}</p>
-                                <StatusBadge
-                                  status={tech.is_online ? 'online' : 'offline'}
-                                  label={tech.is_online ? 'Online' : 'Offline'}
-                                  size="xs"
-                                />
-                                {tech.is_clocked_in && (
-                                  <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 text-[10px] font-bold border border-blue-200">
-                                    Shift Active (+10)
-                                  </span>
-                                )}
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                            <div className="flex items-center gap-3">
+                              <div className={`w-9 h-9 rounded-lg border flex items-center justify-center font-bold text-xs shrink-0 ${
+                                tech.is_dispatch_ready
+                                  ? 'bg-blue-50 border-blue-200 text-blue-700'
+                                  : 'bg-slate-100 border-slate-200 text-slate-500'
+                              }`}>
+                                {tech.name ? tech.name[0].toUpperCase() : 'T'}
                               </div>
-                              <p className="text-[11px] text-slate-500 font-mono">
-                                {tech.employee_id} • {tech.phone || 'No phone'}
-                              </p>
-                              <p className="text-[10px] text-slate-600 mt-0.5 truncate max-w-sm">
-                                Approved Skills: {tech.approved_services?.join(', ') || 'General Service'}
-                              </p>
+                              <div>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <p className="text-xs font-bold text-slate-900">{tech.name}</p>
+                                  <StatusBadge
+                                    status={tech.is_online ? 'online' : 'offline'}
+                                    label={tech.is_online ? 'Online' : 'Offline'}
+                                    size="xs"
+                                  />
+                                  {tech.gps_freshness && (
+                                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold ${
+                                      tech.gps_freshness === 'LIVE' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' :
+                                      tech.gps_freshness === 'UPDATING' ? 'bg-blue-50 text-blue-700 border border-blue-200' :
+                                      tech.gps_freshness === 'DELAYED' ? 'bg-amber-50 text-amber-700 border border-amber-200' :
+                                      'bg-slate-100 text-slate-600 border border-slate-200'
+                                    }`}>
+                                      GPS: {tech.gps_freshness} {tech.gps_age_seconds != null ? `(${tech.gps_age_seconds}s)` : ''}
+                                    </span>
+                                  )}
+                                  {tech.is_dispatch_ready && tech.score != null && (
+                                    <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-900 text-[10px] font-bold">
+                                      Match Score: {tech.score}
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-[11px] text-slate-500 font-mono mt-0.5">
+                                  {tech.employee_id} • {tech.phone || 'No phone'}
+                                </p>
+                              </div>
+                            </div>
+
+                            <div className="flex flex-col items-end gap-1 text-right shrink-0">
+                              {tech.distance_km != null ? (
+                                <span className="font-mono text-xs font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                                  {tech.distance_km.toFixed(1)} km away
+                                </span>
+                              ) : (
+                                <span className="text-[10px] text-slate-400 font-mono">
+                                  Proximity Pending GPS
+                                </span>
+                              )}
+                              <span className={`text-[10px] font-bold ${
+                                tech.is_dispatch_ready ? 'text-emerald-700' : 'text-rose-700'
+                              }`}>
+                                {tech.is_dispatch_ready ? '✓ Qualified Candidate' : tech.ineligibility_reason || 'Ineligible'}
+                              </span>
                             </div>
                           </div>
 
-                          <div className="flex flex-col items-end gap-1 text-right shrink-0">
-                            {tech.distance_km != null ? (
-                              <span className="font-mono text-xs font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
-                                {tech.distance_km.toFixed(1)} km away
+                          {/* 9-Gate Real Evaluation Audit Pills */}
+                          {tech.gate_audit && (
+                            <div className="pt-1.5 border-t border-slate-100 flex flex-wrap items-center gap-1 text-[10px]">
+                              <span className="font-bold text-slate-500 uppercase tracking-wider text-[9px] mr-1">
+                                9-Gate Evaluation:
                               </span>
-                            ) : (
-                              <span className="text-[10px] text-slate-400 font-mono">
-                                Proximity Pending GPS
-                              </span>
-                            )}
-                            <span className="text-[10px] text-emerald-700 font-semibold">
-                              Eligible Candidate
-                            </span>
-                          </div>
+                              {tech.gate_audit.map((g) => (
+                                <span
+                                  key={g.gate}
+                                  title={`${g.gate}: ${g.name} (${g.passed ? 'PASSED' : 'REJECTED'})`}
+                                  className={`px-1.5 py-0.5 rounded font-mono font-semibold flex items-center gap-0.5 ${
+                                    g.passed
+                                      ? 'bg-emerald-50 text-emerald-800 border border-emerald-200/80'
+                                      : 'bg-rose-50 text-rose-800 border border-rose-200/80'
+                                  }`}
+                                >
+                                  <span>{g.passed ? '✓' : '✗'}</span>
+                                  <span>{g.name}</span>
+                                </span>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       ))
                     ) : (
@@ -938,82 +988,6 @@ export function AdminOperationsPage() {
                         <tr>
                           <td colSpan={6} className="px-4 py-8 text-center text-slate-500">
                             No fleet units reporting GPS coordinates.
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-
-            {/* ── TAB 3: LEAVE SCHEDULE ── */}
-            {activeTab === 'leaves' && (
-              <div className="space-y-4">
-                <div>
-                  <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                    Technician Leave & Absence Schedule
-                  </h3>
-                  <p className="text-[11px] text-slate-500">
-                    Personnel on approved leave are excluded from dynamic dispatch availability.
-                  </p>
-                </div>
-
-                <div className="border border-slate-200 rounded overflow-hidden">
-                  <table className="w-full text-left text-xs">
-                    <thead className="bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-600 uppercase">
-                      <tr>
-                        <th className="px-4 py-2.5">Technician</th>
-                        <th className="px-4 py-2.5">Leave Type</th>
-                        <th className="px-4 py-2.5">Start Date</th>
-                        <th className="px-4 py-2.5">End Date</th>
-                        <th className="px-4 py-2.5">Reason</th>
-                        <th className="px-4 py-2.5 text-right">Status / Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {leaves.length > 0 ? (
-                        leaves.map((l) => (
-                          <tr key={`${l.employee_pk || l.employee_id}_${l.id}`} className="hover:bg-slate-50/50">
-                            <td className="px-4 py-3 font-bold text-slate-900">
-                              {l.employee_name || l.employee_id}
-                              <span className="block text-[10px] text-slate-500 font-mono font-normal">
-                                {l.employee_id}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3 font-medium text-slate-800">{l.leave_type}</td>
-                            <td className="px-4 py-3 font-mono text-slate-700">{l.start_date}</td>
-                            <td className="px-4 py-3 font-mono text-slate-700">{l.end_date}</td>
-                            <td className="px-4 py-3 text-slate-600">{l.reason || '—'}</td>
-                            <td className="px-4 py-3 text-right">
-                              <div className="flex items-center justify-end gap-1.5">
-                                <StatusBadge status={l.status || 'submitted'} size="xs" />
-                                {l.status === 'submitted' && l.employee_pk && (
-                                  <>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleDecideLeave(l.employee_pk, l.id, 'approve')}
-                                      className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[10px]"
-                                    >
-                                      Approve
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleDecideLeave(l.employee_pk, l.id, 'reject')}
-                                      className="px-2 py-0.5 rounded bg-rose-600 hover:bg-rose-700 text-white font-bold text-[10px]"
-                                    >
-                                      Reject
-                                    </button>
-                                  </>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        ))
-                      ) : (
-                        <tr>
-                          <td colSpan={6} className="px-4 py-8 text-center text-slate-500">
-                            No planned leaves registered in schedule.
                           </td>
                         </tr>
                       )}
@@ -1365,6 +1339,93 @@ export function AdminOperationsPage() {
                 className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-xs font-bold"
               >
                 Delete Location
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── JOB LIFECYCLE TIMELINE MODAL ── */}
+      {timelineJob && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4 overflow-y-auto">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden my-8">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200 bg-slate-50">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-blue-100 border border-blue-200 flex items-center justify-center text-blue-600">
+                  <History className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                    Job Lifecycle Timeline — #{timelineJob.request_id || `SR-${timelineJob.id}`}
+                    <StatusBadge status={timelineJob.status} size="xs" />
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    {timelineJob.service_title || timelineJob.service_category || timelineJob.issue_title} • Customer: {timelineJob.customer_name || 'Customer'}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => { setTimelineJob(null); setTimelineData(null); }}
+                className="p-1.5 rounded-lg hover:bg-slate-200 text-slate-500 transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-5 max-h-[60vh] overflow-y-auto">
+              {timelineLoading ? (
+                <div className="p-12 text-center flex flex-col items-center justify-center gap-2 text-slate-500">
+                  <Loader className="w-6 h-6 animate-spin text-blue-600" />
+                  <span className="text-xs font-semibold">Correlating lifecycle audit events...</span>
+                </div>
+              ) : timelineData?.error ? (
+                <div className="p-4 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-700">
+                  {timelineData.error}
+                </div>
+              ) : Array.isArray(timelineData?.timeline) && timelineData.timeline.length > 0 ? (
+                <div className="relative pl-6 space-y-6 before:absolute before:left-2.5 before:top-2 before:bottom-2 before:w-0.5 before:bg-slate-200">
+                  {timelineData.timeline.map((item, idx) => (
+                    <div key={idx} className="relative group">
+                      <div className="absolute -left-6 top-1 w-5 h-5 rounded-full bg-white border-2 border-blue-600 flex items-center justify-center text-[9px] font-bold text-blue-600">
+                        {idx + 1}
+                      </div>
+                      <div className="bg-slate-50 hover:bg-blue-50/50 border border-slate-200 rounded-lg p-3 transition-colors">
+                        <div className="flex items-center justify-between text-xs mb-1">
+                          <span className="font-bold text-slate-900">{item.title}</span>
+                          <span className="text-[10px] font-mono text-slate-500">
+                            {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-600 leading-relaxed">{item.description}</p>
+                        <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-200/60 text-[10px] text-slate-500">
+                          <span className="font-medium text-slate-700">Actor: {item.actor}</span>
+                          <span className="font-mono text-slate-400">{item.event_type}</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="p-8 text-center text-xs text-slate-500">
+                  No lifecycle events recorded for this job yet.
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex items-center justify-between">
+              <span className="text-[11px] text-slate-500">
+                Total Events: <strong>{timelineData?.event_count || 0}</strong>
+              </span>
+              <button
+                type="button"
+                onClick={() => { setTimelineJob(null); setTimelineData(null); }}
+                className="px-4 py-1.5 bg-slate-800 hover:bg-slate-900 text-white font-bold rounded-lg text-xs transition-colors"
+              >
+                Close Timeline
               </button>
             </div>
           </div>

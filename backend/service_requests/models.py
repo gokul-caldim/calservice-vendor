@@ -91,6 +91,7 @@ class ServiceRequest(models.Model):
         EN_ROUTE              = "en_route",              "En Route"
         ARRIVED               = "arrived",               "Arrived"
         IN_PROGRESS           = "in_progress",           "In Progress"
+        REDISPATCHING         = "redispatching",         "Redispatching"
         COMPLETED             = "completed",             "Completed"
         CANCELLED             = "cancelled",             "Cancelled"
         UNABLE_TO_COMPLETE    = "unable_to_complete",    "Unable To Complete"
@@ -175,6 +176,16 @@ class ServiceRequest(models.Model):
     collection_method = models.CharField(max_length=50, blank=True, default="")
     collection_reference = models.CharField(max_length=100, blank=True, default="")
 
+    workforce_job_id = models.CharField(max_length=100, blank=True, default="")
+    external_assignment_id = models.CharField(max_length=100, blank=True, default="")
+    technician_name = models.CharField(max_length=200, blank=True, default="")
+    technician_phone = models.CharField(max_length=50, blank=True, default="")
+    technician_photo = models.TextField(blank=True, default="")
+    technician_rating = models.FloatField(null=True, blank=True)
+    payment_collected_by_name = models.CharField(max_length=200, blank=True, default="")
+    collection_method = models.CharField(max_length=50, blank=True, default="")
+    collection_reference = models.CharField(max_length=100, blank=True, default="")
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -198,8 +209,11 @@ class ServiceRequest(models.Model):
             try:
                 from workforce_api.services.automatic_dispatch import dispatch_job
                 dispatch_job(self)
-            except Exception:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger("workforce.dispatch").exception(
+                    f"[AUTO_DISPATCH_TRIGGER_FAILED] Failed to trigger automatic dispatch for Job #{self.id}: {e}"
+                )
 
 
 
@@ -258,7 +272,7 @@ class ServiceRequest(models.Model):
                 if msg not in pending_dependencies:
                     pending_dependencies.append(msg)
 
-        # 4. Check payment state machine: If cash collection is pending, job cannot close
+        # 4. Check payment state machine: Payment must be verified as PAID before closing job
         try:
             from workforce_api.models import JobPayment
             pmt = getattr(self, "payment_record", None) or JobPayment.objects.filter(job=self).first()
@@ -266,11 +280,14 @@ class ServiceRequest(models.Model):
                 if pmt.payment_status == JobPayment.PaymentStatus.CASH_PENDING:
                     pending_dependencies.append("Cash payment collection has been reported but is awaiting customer confirmation.")
                 elif pmt.payment_status == JobPayment.PaymentStatus.PENDING and pmt.payment_method == JobPayment.PaymentMethod.CASH_ON_SERVICE:
-                    pending_dependencies.append("Cash on service payment collection is required before closing job.")
+                    pending_dependencies.append("Cash on service payment collection and confirmation is required before closing job.")
                 elif pmt.payment_status not in [JobPayment.PaymentStatus.PAID, "PAID", "paid"]:
                     pending_dependencies.append(f"Payment is in '{pmt.payment_status}' state (must be PAID before closing job).")
-        except Exception:
-            pass
+            else:
+                if str(self.payment_status).lower() not in ["paid", "collected"]:
+                    pending_dependencies.append(f"Payment status is '{self.payment_status}' (must be PAID before closing job).")
+        except Exception as e:
+            pending_dependencies.append(f"Payment verification failed: {str(e)}")
 
         is_ready = len(pending_dependencies) == 0
         reason = "Ready for completion." if is_ready else f"Cannot complete ServiceRequest: {'; '.join(pending_dependencies)}"

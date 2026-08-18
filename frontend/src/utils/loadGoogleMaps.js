@@ -15,7 +15,9 @@ export function loadMapsApi(apiKey) {
     return Boolean(
       window.google &&
       window.google.maps &&
-      typeof window.google.maps.Map === 'function'
+      typeof window.google.maps.Map === 'function' &&
+      window.google.maps.ControlPosition &&
+      typeof window.google.maps.Marker === 'function'
     );
   };
 
@@ -47,9 +49,14 @@ export function loadMapsApi(apiKey) {
       }
 
       window.__initGoogleMapsWorkforce = () => {
-        if (isMapsReady()) {
-          resolve(window.google.maps);
-        }
+        const checkReady = () => {
+          if (isMapsReady()) {
+            resolve(window.google.maps);
+          } else {
+            setTimeout(checkReady, 50);
+          }
+        };
+        checkReady();
       };
 
       const script = document.createElement('script');

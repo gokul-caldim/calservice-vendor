@@ -81,79 +81,92 @@ export function LocationPickerMap({
   useEffect(() => {
     if (!apiLoaded || !mapContainerRef.current) return;
     const google = window.google;
+    if (!google?.maps?.Map || !google?.maps?.ControlPosition) return;
 
-    const map = new google.maps.Map(mapContainerRef.current, {
-      center: { lat: defaultLat, lng: defaultLng },
-      zoom: defaultZoom,
-      mapTypeControl: false,
-      streetViewControl: false,
-      fullscreenControl: false,
-      zoomControl: true,
-    });
-    mapRef.current = map;
+    try {
+      const map = new google.maps.Map(mapContainerRef.current, {
+        center: { lat: defaultLat, lng: defaultLng },
+        zoom: defaultZoom,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false,
+        zoomControl: true,
+      });
+      mapRef.current = map;
 
-    // Draggable marker
-    const marker = new google.maps.Marker({
-      position: { lat: defaultLat, lng: defaultLng },
-      map,
-      draggable: true,
-      title: 'Drag to set location',
-      visible: latitude != null,
-    });
-    markerRef.current = marker;
-
-    // Geofence circle (admin mode)
-    if (geofenceRadius != null) {
-      const circle = new google.maps.Circle({
+      // Draggable marker
+      const marker = new google.maps.Marker({
+        position: { lat: defaultLat, lng: defaultLng },
         map,
-        center: marker.getPosition(),
-        radius: geofenceRadius,
-        strokeColor: '#2563EB',
-        strokeOpacity: 0.6,
-        strokeWeight: 2,
-        fillColor: '#3B82F6',
-        fillOpacity: 0.1,
+        draggable: true,
+        title: 'Drag to set location',
+        visible: latitude != null,
       });
-      circleRef.current = circle;
-    }
+      markerRef.current = marker;
 
-    // Map click → place marker
-    map.addListener('click', (e) => {
-      const lat = e.latLng.lat();
-      const lng = e.latLng.lng();
-      marker.setPosition({ lat, lng });
-      marker.setVisible(true);
-      if (circleRef.current) circleRef.current.setCenter({ lat, lng });
-      onPositionChange(lat, lng);
-    });
+      // Geofence circle (admin mode)
+      if (geofenceRadius != null) {
+        const circle = new google.maps.Circle({
+          map,
+          center: marker.getPosition(),
+          radius: geofenceRadius,
+          strokeColor: '#2563EB',
+          strokeOpacity: 0.6,
+          strokeWeight: 2,
+          fillColor: '#3B82F6',
+          fillOpacity: 0.1,
+        });
+        circleRef.current = circle;
+      }
 
-    // Marker drag end
-    marker.addListener('dragend', () => {
-      const pos = marker.getPosition();
-      const lat = pos.lat();
-      const lng = pos.lng();
-      if (circleRef.current) circleRef.current.setCenter({ lat, lng });
-      onPositionChange(lat, lng);
-    });
-
-    // Places Autocomplete
-    if (showSearch && searchInputRef.current && google.maps.places) {
-      const autocomplete = new google.maps.places.Autocomplete(searchInputRef.current, {
-        fields: ['geometry', 'formatted_address'],
-      });
-      autocomplete.addListener('place_changed', () => {
-        const place = autocomplete.getPlace();
-        if (!place.geometry?.location) return;
-        const lat = place.geometry.location.lat();
-        const lng = place.geometry.location.lng();
-        map.setCenter({ lat, lng });
-        map.setZoom(16);
+      // Map click → place marker
+      const clickListener = map.addListener('click', (e) => {
+        const lat = e.latLng.lat();
+        const lng = e.latLng.lng();
         marker.setPosition({ lat, lng });
         marker.setVisible(true);
         if (circleRef.current) circleRef.current.setCenter({ lat, lng });
         onPositionChange(lat, lng);
       });
-      autocompleteRef.current = autocomplete;
+
+      // Marker drag end
+      const dragListener = marker.addListener('dragend', () => {
+        const pos = marker.getPosition();
+        const lat = pos.lat();
+        const lng = pos.lng();
+        if (circleRef.current) circleRef.current.setCenter({ lat, lng });
+        onPositionChange(lat, lng);
+      });
+
+      // Places Autocomplete
+      let placeListener = null;
+      if (showSearch && searchInputRef.current && google.maps.places) {
+        const autocomplete = new google.maps.places.Autocomplete(searchInputRef.current, {
+          fields: ['geometry', 'formatted_address'],
+        });
+        placeListener = autocomplete.addListener('place_changed', () => {
+          const place = autocomplete.getPlace();
+          if (!place.geometry?.location) return;
+          const lat = place.geometry.location.lat();
+          const lng = place.geometry.location.lng();
+          map.setCenter({ lat, lng });
+          map.setZoom(16);
+          marker.setPosition({ lat, lng });
+          marker.setVisible(true);
+          if (circleRef.current) circleRef.current.setCenter({ lat, lng });
+          onPositionChange(lat, lng);
+        });
+        autocompleteRef.current = autocomplete;
+      }
+
+      return () => {
+        if (clickListener && google?.maps?.event) google.maps.event.removeListener(clickListener);
+        if (dragListener && google?.maps?.event) google.maps.event.removeListener(dragListener);
+        if (placeListener && google?.maps?.event) google.maps.event.removeListener(placeListener);
+      };
+    } catch (err) {
+      console.error('Error initializing map:', err);
+      setApiError('Failed to initialize map display. Please refresh.');
     }
 
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -24,15 +24,11 @@ import { AdminApplicationDetailPage } from './pages/admin/AdminApplicationDetail
 import { AdminEmployeesPage } from './pages/admin/AdminEmployeesPage.jsx';
 import { AdminJobsPage } from './pages/admin/AdminJobsPage.jsx';
 import { AdminOperationsPage } from './pages/admin/AdminOperationsPage.jsx';
-
-import { AdminPayrollPage } from './pages/admin/AdminPayrollPage.jsx';
-import { AdminCompliancePage } from './pages/admin/AdminCompliancePage.jsx';
 import { AdminReportsPage } from './pages/admin/AdminReportsPage.jsx';
-import { AdminSchedulingPage } from './pages/admin/AdminSchedulingPage.jsx';
-import { AdminAttendancePage } from './pages/admin/AdminAttendancePage.jsx';
-import { AdminLeavePage } from './pages/admin/AdminLeavePage.jsx';
 import { AdminSkillsPage } from './pages/admin/AdminSkillsPage.jsx';
 import { CustomerTrackingPage } from './pages/CustomerTrackingPage.jsx';
+
+import { CustomerTrackingPage } from './pages/customer/CustomerTrackingPage.jsx';
 
 function RootRedirect() {
   const { isReady, isAuthenticated, isAdmin, registrationStatus } = useAuth();
@@ -127,38 +123,12 @@ export function App() {
               </EmployeeRoute>
             }
           />
-          <Route
-            path="/workforce/employee/schedule"
-            element={
-              <EmployeeRoute>
-                <EmployeeDashboardPage />
-              </EmployeeRoute>
-            }
-          />
-          <Route
-            path="/workforce/employee/attendance"
-            element={
-              <EmployeeRoute>
-                <EmployeeDashboardPage />
-              </EmployeeRoute>
-            }
-          />
-          <Route
-            path="/workforce/employee/leave"
-            element={
-              <EmployeeRoute>
-                <EmployeeDashboardPage />
-              </EmployeeRoute>
-            }
-          />
-          <Route
-            path="/workforce/employee/earnings"
-            element={
-              <EmployeeRoute>
-                <EmployeeDashboardPage />
-              </EmployeeRoute>
-            }
-          />
+          {/* Removed Employee Routes Redirects */}
+          <Route path="/workforce/employee/schedule" element={<Navigate to="/workforce/employee/dashboard" replace />} />
+          <Route path="/workforce/employee/attendance" element={<Navigate to="/workforce/employee/dashboard" replace />} />
+          <Route path="/workforce/employee/leave" element={<Navigate to="/workforce/employee/dashboard" replace />} />
+          <Route path="/workforce/employee/earnings" element={<Navigate to="/workforce/employee/dashboard" replace />} />
+
           <Route
             path="/workforce/employee/documents"
             element={
@@ -290,62 +260,16 @@ export function App() {
               </AdminRoute>
             }
           />
-          <Route
-            path="/workforce/admin/documents"
-            element={
-              <AdminRoute>
-                <AdminCompliancePage />
-              </AdminRoute>
-            }
-          />
-          <Route
-            path="/workforce/admin/scheduling"
-            element={
-              <AdminRoute>
-                <AdminSchedulingPage />
-              </AdminRoute>
-            }
-          />
-          <Route
-            path="/workforce/admin/attendance"
-            element={
-              <AdminRoute>
-                <AdminAttendancePage />
-              </AdminRoute>
-            }
-          />
-          <Route
-            path="/workforce/admin/timesheets"
-            element={
-              <AdminRoute>
-                <AdminAttendancePage />
-              </AdminRoute>
-            }
-          />
-          <Route
-            path="/workforce/admin/leave"
-            element={
-              <AdminRoute>
-                <AdminLeavePage />
-              </AdminRoute>
-            }
-          />
-          <Route
-            path="/workforce/admin/payroll"
-            element={
-              <AdminRoute>
-                <AdminPayrollPage />
-              </AdminRoute>
-            }
-          />
-          <Route
-            path="/workforce/admin/compliance"
-            element={
-              <AdminRoute>
-                <AdminCompliancePage />
-              </AdminRoute>
-            }
-          />
+
+          {/* Removed Admin Routes Redirects */}
+          <Route path="/workforce/admin/documents" element={<Navigate to="/workforce/admin/applications" replace />} />
+          <Route path="/workforce/admin/scheduling" element={<Navigate to="/workforce/admin" replace />} />
+          <Route path="/workforce/admin/attendance" element={<Navigate to="/workforce/admin" replace />} />
+          <Route path="/workforce/admin/timesheets" element={<Navigate to="/workforce/admin" replace />} />
+          <Route path="/workforce/admin/leave" element={<Navigate to="/workforce/admin" replace />} />
+          <Route path="/workforce/admin/payroll" element={<Navigate to="/workforce/admin" replace />} />
+          <Route path="/workforce/admin/compliance" element={<Navigate to="/workforce/admin" replace />} />
+
           <Route
             path="/workforce/admin/reports"
             element={
@@ -363,9 +287,9 @@ export function App() {
             }
           />
 
-          {/* Customer Live Technician Tracking (Standalone Public View, Auth enforced by API) */}
+          {/* Customer Live Tracking Routes */}
           <Route path="/track/:jobId" element={<CustomerTrackingPage />} />
-          <Route path="/workforce/customer/track/:jobId" element={<CustomerTrackingPage />} />
+          <Route path="/customer/track/:jobId" element={<CustomerTrackingPage />} />
 
           {/* Fallback */}
           <Route path="*" element={<Navigate to="/workforce/login" replace />} />

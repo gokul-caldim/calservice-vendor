@@ -395,7 +395,11 @@ class WorkforceJobOffer(models.Model):
         OFFERED = "OFFERED", "Offered"
         ACCEPTED = "ACCEPTED", "Accepted"
         REJECTED = "REJECTED", "Rejected"
+        DECLINED = "DECLINED", "Declined"
         EXPIRED = "EXPIRED", "Expired"
+        SUPERSEDED = "SUPERSEDED", "Superseded"
+        SUPERSEDED_BY_ACCEPTANCE = "SUPERSEDED_BY_ACCEPTANCE", "Superseded by Acceptance"
+        CANCELLED = "CANCELLED", "Cancelled"
 
     job = models.ForeignKey(
         "service_requests.ServiceRequest",
@@ -408,7 +412,7 @@ class WorkforceJobOffer(models.Model):
         related_name="job_offers",
     )
     status = models.CharField(
-        max_length=20,
+        max_length=50,
         choices=Status.choices,
         default=Status.OFFERED,
         db_index=True,
@@ -424,6 +428,62 @@ class WorkforceJobOffer(models.Model):
 
     def __str__(self):
         return f"Offer Job #{self.job_id} to {self.employee} ({self.status})"
+
+
+class WorkforceJobLifecycleEvent(models.Model):
+    """
+    Immutable audit event for workforce job state transitions.
+    """
+    class EventType(models.TextChoices):
+        EMPLOYEE_JOB_ACCEPTED = "EMPLOYEE_JOB_ACCEPTED", "Employee Job Accepted"
+        EMPLOYEE_JOB_CANCELLED = "EMPLOYEE_JOB_CANCELLED", "Employee Job Cancelled"
+        EMPLOYEE_JOB_REDISPATCH_STARTED = "EMPLOYEE_JOB_REDISPATCH_STARTED", "Employee Job Redispatch Started"
+        NEW_EMPLOYEE_ASSIGNED = "NEW_EMPLOYEE_ASSIGNED", "New Employee Assigned"
+
+    job = models.ForeignKey(
+        "service_requests.ServiceRequest",
+        on_delete=models.CASCADE,
+        related_name="lifecycle_events",
+    )
+    employee = models.ForeignKey(
+        "employees.Employee",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="job_lifecycle_events",
+    )
+    company = models.ForeignKey(
+        "companies.Company",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="job_lifecycle_events",
+    )
+    actor_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="actor_job_lifecycle_events",
+    )
+    event_type = models.CharField(max_length=50, choices=EventType.choices, db_index=True)
+    previous_status = models.CharField(max_length=50, blank=True, default="")
+    new_status = models.CharField(max_length=50, blank=True, default="")
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancellation_deadline = models.DateTimeField(null=True, blank=True)
+    reason_code = models.CharField(max_length=50, blank=True, default="")
+    reason_text = models.TextField(blank=True, default="")
+    cancellation_window_seconds = models.IntegerField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "workforce_job_lifecycle_event"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.event_type} for Job #{self.job_id} by {self.actor_user_id} at {self.created_at}"
 
 
 class PreServiceVerification(models.Model):
@@ -988,6 +1048,13 @@ class JobTrackingSession(models.Model):
         indexes = [
             models.Index(fields=["job", "status"]),
             models.Index(fields=["employee", "status"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["job"],
+                condition=models.Q(status="ACTIVE"),
+                name="unique_active_tracking_session_per_job",
+            ),
         ]
 
     def __str__(self):
