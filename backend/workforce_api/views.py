@@ -98,19 +98,35 @@ User = get_user_model()
 
 
 
-def get_request_company(request):
+def resolve_actor_company(request):
     """
-    Strict Tenant Isolation Helper:
-    Resolves authenticated user's company context explicitly.
-    Fails safely with fallback if company context is missing or inaccessible.
+    Authoritative Multi-Tenant Company Context Resolver:
+    Resolves the authenticated user's company context strictly without arbitrary fallback.
+    Returns:
+        Company instance if resolved, or None if context cannot be determined.
+    Rules:
+        - If user is not authenticated: returns None.
+        - If user has explicit company foreign key (user.company): returns user.company.
+        - If user has employee_profile (user.employee_profile.company): returns employee_profile.company.
+        - If user is a superuser without an assigned company: returns None (indicating superuser operates cross-tenant unless explicitly scoped).
+        - NEVER returns Company.objects.first() fallback.
     """
     if not request or not hasattr(request, "user") or not request.user or not request.user.is_authenticated:
-        return Company.objects.first()
-    if hasattr(request.user, "company") and request.user.company:
-        return request.user.company
-    if hasattr(request.user, "employee_profile") and request.user.employee_profile:
-        return request.user.employee_profile.company
-    return Company.objects.first()
+        return None
+    user = request.user
+    if getattr(user, "company", None):
+        return user.company
+    emp = getattr(user, "employee_profile", None)
+    if emp and getattr(emp, "company", None):
+        return emp.company
+    return None
+
+
+def get_request_company(request):
+    """
+    Compatibility wrapper around resolve_actor_company.
+    """
+    return resolve_actor_company(request)
 
 
 # ─── 1. Lightweight Employee Signup (Step 1) ──────────────────────────────────
@@ -124,7 +140,18 @@ class WorkforceSignupView(APIView):
         data = serializer.validated_data
 
         with transaction.atomic():
-            company = Company.objects.first()
+            company_id = request.data.get("company_id")
+            company_slug = request.data.get("company_slug")
+            company = None
+            if company_id:
+                try:
+                    company = Company.objects.filter(pk=int(company_id), is_active=True).first()
+                except (ValueError, TypeError):
+                    pass
+            if not company and company_slug:
+                company = Company.objects.filter(slug=company_slug, is_active=True).first()
+            if not company:
+                company = Company.objects.filter(slug="calservices", is_active=True).first()
             if not company:
                 region, _ = Region.objects.get_or_create(
                     code="IN",
@@ -460,10 +487,13 @@ class WorkforceAdminApplicationsListView(APIView):
 
     def get(self, request):
         status_filter = request.query_params.get("status", "").strip().lower()
-        company = getattr(request.user, "company", None)
-        employees = Employee.objects.select_related("user", "company").order_by("-id")
-        if company:
-            employees = employees.filter(company=company)
+        company = resolve_actor_company(request)
+        if getattr(request.user, "is_superuser", False):
+            employees = Employee.objects.select_related("user", "company").order_by("-id")
+        elif company:
+            employees = Employee.objects.filter(company=company).select_related("user", "company").order_by("-id")
+        else:
+            return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
 
         results = []
         for emp in employees:
@@ -489,6 +519,14 @@ class WorkforceAdminApplicationDetailView(APIView):
         if not emp:
             return Response({"error": "Candidate dossier not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # Cross-company tenant isolation check
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id != user_company.id:
+                return Response({"error": "Unauthorized cross-company access.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+
         serializer = WorkforceEmployeeProfileSerializer(emp)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -500,6 +538,14 @@ class WorkforceAdminDocumentVerifyView(APIView):
         emp = Employee.objects.filter(pk=pk).first()
         if not emp:
             return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Cross-company tenant isolation check
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id != user_company.id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         action = request.data.get("action", "").lower()
         reason = request.data.get("reason", "")
@@ -540,8 +586,11 @@ class WorkforceAdminBulkDocumentVerifyView(APIView):
 
         # Tenant isolation
         if not getattr(request.user, "is_superuser", False):
-            if request.user.company_id and emp.company_id and request.user.company_id != emp.company_id:
-                return Response({"error": "Unauthorized cross-company action."}, status=status.HTTP_403_FORBIDDEN)
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id != user_company.id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         # Prevent employee from approving their own documents
         if getattr(request.user, "employee_profile", None) and request.user.employee_profile.id == emp.id and not getattr(request.user, "is_superuser", False):
@@ -757,10 +806,13 @@ class WorkforceAdminPendingServicesListView(APIView):
     permission_classes = [IsWorkforceAdmin]
 
     def get(self, request):
-        company_id = request.user.company_id if not getattr(request.user, "is_superuser", False) else None
-        qs = Employee.objects.select_related("user", "company")
-        if company_id:
-            qs = qs.filter(company_id=company_id)
+        if getattr(request.user, "is_superuser", False):
+            qs = Employee.objects.select_related("user", "company")
+        else:
+            company = resolve_actor_company(request)
+            if not company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            qs = Employee.objects.filter(company=company).select_related("user", "company")
 
         pending_requests = []
         for emp in qs:
@@ -792,8 +844,11 @@ class WorkforceAdminServiceDecideView(APIView):
 
         # Tenant isolation
         if not getattr(request.user, "is_superuser", False):
-            if request.user.company_id and emp.company_id and request.user.company_id != emp.company_id:
-                return Response({"error": "Unauthorized cross-company action."}, status=status.HTTP_403_FORBIDDEN)
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id != user_company.id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         # Prevent employee from approving their own request
         if getattr(request.user, "employee_profile", None) and request.user.employee_profile.id == emp.id and not getattr(request.user, "is_superuser", False):
@@ -861,8 +916,11 @@ class WorkforceAdminBulkServiceDecideView(APIView):
 
         # Tenant isolation
         if not getattr(request.user, "is_superuser", False):
-            if request.user.company_id and emp.company_id and request.user.company_id != emp.company_id:
-                return Response({"error": "Unauthorized cross-company action."}, status=status.HTTP_403_FORBIDDEN)
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id != user_company.id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         # Prevent employee from approving their own request
         if getattr(request.user, "employee_profile", None) and request.user.employee_profile.id == emp.id and not getattr(request.user, "is_superuser", False):
@@ -948,6 +1006,14 @@ class WorkforceAdminRequestCorrectionView(APIView):
         if not emp:
             return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # Cross-company tenant isolation check
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id != user_company.id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+
         notes = request.data.get("notes", "").strip()
         if not notes:
             return Response({"error": "Correction notes are required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -975,6 +1041,14 @@ class WorkforceAdminApproveApplicationView(APIView):
         emp = Employee.objects.filter(pk=pk).select_related("user").first()
         if not emp:
             return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Cross-company tenant isolation check
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id != user_company.id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         if not emp.is_active or not emp.user.is_active:
             return Response({"error": "Cannot approve candidate: User account is inactive."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1028,6 +1102,14 @@ class WorkforceAdminRejectApplicationView(APIView):
         if not emp:
             return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # Cross-company tenant isolation check
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if emp.company_id != user_company.id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+
         reason = request.data.get("reason", "Qualifications or documents did not meet verification criteria.")
 
         bank_details = emp.bank_details or {}
@@ -1061,16 +1143,31 @@ class WorkforcePresenceToggleView(APIView):
         if not emp:
             return Response({"error": "Employee profile not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        from workforce_api.services.workload import get_employee_active_job, reconcile_employee_availability
+
+        active_job = get_employee_active_job(emp.id)
         desired_state = request.data.get("is_online")
+        is_requesting_offline = (desired_state is False) or (desired_state is None and emp.is_online)
+
+        if active_job and is_requesting_offline:
+            req_id = active_job.request_id or f"SR-{active_job.id}"
+            return Response({
+                "error": f"Cannot go offline while actively working on assigned job {req_id} ({active_job.service_category}). Please complete or cancel the assignment first.",
+                "code": "ACTIVE_JOB_IN_PROGRESS",
+                "active_job_id": active_job.id,
+                "request_id": req_id,
+                "is_online": True,
+                "availability": "busy",
+            }, status=status.HTTP_400_BAD_REQUEST)
+
         if desired_state is not None:
             emp.is_online = bool(desired_state)
         else:
             emp.is_online = not emp.is_online
 
         emp.save(update_fields=["is_online"])
-        from workforce_api.services.workload import reconcile_employee_availability
         reconcile_employee_availability(emp)
-        emp.refresh_from_db(fields=["current_availability"])
+        emp.refresh_from_db(fields=["current_availability", "is_online"])
 
         try:
             PresenceLog.objects.create(
@@ -1195,6 +1292,14 @@ class WorkforceJobTransitionView(APIView):
                 has_emp_job = False
             if not emp or (job.assigned_employee != emp and not has_emp_job):
                 return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
+            if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+        elif not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not job.company_id or user_company.id != job.company_id:
+                return Response({"error": "Unauthorized: Job belongs to another vendor company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         try:
             new_status = apply_transition(job, target_status, actor=request.user)
@@ -1228,8 +1333,14 @@ class WorkforceJobProofView(APIView):
         if not is_admin_role(request.user):
             if not emp or job.assigned_employee != emp:
                 return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
-            if emp.company_id and job.company_id and emp.company_id != job.company_id:
-                return Response({"error": "Unauthorized access to job belonging to another company."}, status=status.HTTP_403_FORBIDDEN)
+            if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+        elif not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not job.company_id or user_company.id != job.company_id:
+                return Response({"error": "Unauthorized: Job belongs to another vendor company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         if job.status not in ["in_progress", "proof_submitted"]:
             return Response({"error": f"Cannot submit completion proof for job in status '{job.status}'. Expected 'in_progress'."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1300,8 +1411,14 @@ class WorkforceJobPaymentDetailView(APIView):
         if not is_admin_role(request.user):
             if not emp or job.assigned_employee != emp:
                 return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
-            if emp.company_id and job.company_id and emp.company_id != job.company_id:
-                return Response({"error": "Unauthorized access to job belonging to another company."}, status=status.HTTP_403_FORBIDDEN)
+            if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+        elif not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not job.company_id or user_company.id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         is_online = (job.payment_method or "").upper() in ["ONLINE", "PREPAID"]
         pmt, _ = JobPayment.objects.get_or_create(
@@ -1344,8 +1461,14 @@ class WorkforceJobCashCollectView(APIView):
         if not is_admin_role(request.user):
             if not emp or job.assigned_employee != emp:
                 return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
-            if emp.company_id and job.company_id and emp.company_id != job.company_id:
-                return Response({"error": "Unauthorized access to job belonging to another company."}, status=status.HTTP_403_FORBIDDEN)
+            if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+        elif not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not job.company_id or user_company.id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         with transaction.atomic():
             pmt, created = JobPayment.objects.select_for_update().get_or_create(
@@ -1469,8 +1592,14 @@ class WorkforceJobPaymentVerifyOTPView(APIView):
         if not is_admin_role(request.user):
             if not emp or job.assigned_employee != emp:
                 return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
-            if emp.company_id and job.company_id and emp.company_id != job.company_id:
-                return Response({"error": "Unauthorized access to job belonging to another company."}, status=status.HTTP_403_FORBIDDEN)
+            if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+        elif not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not job.company_id or user_company.id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         with transaction.atomic():
             pmt = JobPayment.objects.select_for_update().filter(job=job).first()
@@ -1576,7 +1705,8 @@ class WorkforceJobPaymentVerifyOTPView(APIView):
 class WorkforceCustomerJobPaymentView(APIView):
     """
     Customer views their own booking payment details.
-    Only accessible by the authenticated customer who owns the booking.
+    Only accessible by the authenticated customer who owns the booking,
+    or a platform admin, or a vendor admin of the booking's company.
     NEVER exposes payment_confirmation_otp_hash or internal secrets.
     """
     permission_classes = [permissions.IsAuthenticated]
@@ -1586,8 +1716,17 @@ class WorkforceCustomerJobPaymentView(APIView):
         if not job:
             return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        if job.customer != request.user and not is_admin_role(request.user):
-            return Response({"error": "Unauthorized: You do not own this booking."}, status=status.HTTP_403_FORBIDDEN)
+        is_customer = (
+            job.customer == request.user
+            or str(getattr(job, "customer_name", "")).lower() == request.user.username.lower()
+            or getattr(job, "phone", "") == getattr(request.user, "username", "")
+        )
+        is_platform_operator = getattr(request.user, "is_superuser", False)
+        user_company = resolve_actor_company(request)
+        is_vendor_admin_owner = is_admin_role(request.user) and bool(job.company_id and user_company and job.company_id == user_company.id)
+
+        if not (is_customer or is_platform_operator or is_vendor_admin_owner):
+            return Response({"error": "Unauthorized: You do not own this booking.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         is_online = (job.payment_method or "").upper() in ["ONLINE", "PREPAID"]
         pmt, _ = JobPayment.objects.get_or_create(
@@ -1635,8 +1774,17 @@ class WorkforceCustomerPaymentConfirmView(APIView):
         if not job:
             return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        if job.customer != request.user and not is_admin_role(request.user):
-            return Response({"error": "Unauthorized: You do not own this booking."}, status=status.HTTP_403_FORBIDDEN)
+        is_customer = (
+            job.customer == request.user
+            or str(getattr(job, "customer_name", "")).lower() == request.user.username.lower()
+            or getattr(job, "phone", "") == getattr(request.user, "username", "")
+        )
+        is_platform_operator = getattr(request.user, "is_superuser", False)
+        user_company = resolve_actor_company(request)
+        is_vendor_admin_owner = is_admin_role(request.user) and bool(job.company_id and user_company and job.company_id == user_company.id)
+
+        if not (is_customer or is_platform_operator or is_vendor_admin_owner):
+            return Response({"error": "Unauthorized: You do not own this booking.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         with transaction.atomic():
             pmt = JobPayment.objects.select_for_update().filter(job=job).first()
@@ -1747,8 +1895,6 @@ def check_technician_eligibility(emp, service_name=None, prefetched_data=None):
     from .services.automatic_dispatch import check_candidate_eligibility
     return check_candidate_eligibility(emp, service_name)
 
-    return True, "Eligible"
-
 
 class WorkforceDispatchEligibleListView(APIView):
     permission_classes = [IsWorkforceAdmin]
@@ -1767,6 +1913,10 @@ class WorkforceDispatchEligibleListView(APIView):
         if job_id:
             job = ServiceRequest.objects.filter(pk=job_id).first()
             if job:
+                if not getattr(request.user, "is_superuser", False):
+                    user_company = resolve_actor_company(request)
+                    if not user_company or not job.company_id or user_company.id != job.company_id:
+                        return Response({"error": "Unauthorized cross-company job query.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
                 service_name = service_name or job.issue_title or job.service_category
                 if job.latitude is not None and job.longitude is not None:
                     try:
@@ -1783,8 +1933,11 @@ class WorkforceDispatchEligibleListView(APIView):
         )
 
         candidates_qs = Employee.objects.filter(is_active=True).select_related("user", "company")
-        if request.user and getattr(request.user, "company_id", None):
-            candidates_qs = candidates_qs.filter(company_id=request.user.company_id)
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            candidates_qs = candidates_qs.filter(company=user_company)
 
         candidates = list(
             candidates_qs
@@ -1945,7 +2098,7 @@ class WorkforceJobAcceptOfferView(APIView):
             return Response({"error": "Employee profile not found.", "code": "PROFILE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
         # Cross-company tenant isolation check
-        if emp.company_id and job.company_id and emp.company_id != job.company_id:
+        if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
             return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         with transaction.atomic():
@@ -2172,7 +2325,7 @@ class WorkforceJobCancelAssignmentView(APIView):
             return Response({"error": "Employee profile not found.", "code": "PROFILE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
         # Cross-company tenant isolation check
-        if emp.company_id and job.company_id and emp.company_id != job.company_id:
+        if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
             return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         # Authorization: must be the currently assigned technician
@@ -2346,7 +2499,6 @@ class WorkforceJobCancelAssignmentView(APIView):
             }, status=status.HTTP_200_OK)
 
 
-
 class WorkforceJobRejectOfferView(APIView):
     permission_classes = [IsApprovedTechnician]
 
@@ -2359,8 +2511,8 @@ class WorkforceJobRejectOfferView(APIView):
         if not emp:
             return Response({"error": "Employee profile not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        if emp.company_id and job.company_id and emp.company_id != job.company_id:
-            return Response({"error": "Unauthorized access to job belonging to another company."}, status=status.HTTP_403_FORBIDDEN)
+        if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
+            return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         reason = request.data.get("reason", "Technician declined offer.").strip()
 
@@ -2453,6 +2605,14 @@ class WorkforceJobExtensionView(APIView):
         if not is_admin_role(request.user):
             if not emp or job.assigned_employee != emp:
                 return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
+            if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+        elif not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not job.company_id or user_company.id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         extensions = WorkforceWorkExtension.objects.filter(job=job).order_by("-created_at")
         serializer = WorkforceWorkExtensionSerializer(extensions, many=True)
@@ -2467,6 +2627,14 @@ class WorkforceJobExtensionView(APIView):
         if not is_admin_role(request.user):
             if not emp or job.assigned_employee != emp:
                 return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
+            if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+        elif not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not job.company_id or user_company.id != job.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         if job.status not in ["in_progress", "proof_submitted"]:
             return Response({
@@ -2583,6 +2751,14 @@ class WorkforceAdminExtensionDecideView(APIView):
         if not job:
             return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # Cross-company tenant isolation check
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not job.company_id or user_company.id != job.company_id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+
         action = str(request.data.get("action", "")).upper()
         reason = str(request.data.get("reason", "")).strip()
 
@@ -2662,18 +2838,23 @@ class WorkforceAdminPendingExtensionsListView(APIView):
     permission_classes = [IsWorkforceAdmin]
 
     def get(self, request):
-        emp = getattr(request.user, "employee_profile", None)
-        company = emp.company if emp else getattr(request.user, "company", None)
-
-        qs = WorkforceWorkExtension.objects.filter(
-            status__in=[
-                WorkforceWorkExtension.Status.REQUESTED,
-                WorkforceWorkExtension.Status.PENDING_ASSIGNMENT,
-            ]
-        ).select_related("job", "technician__user", "required_skill", "specialist_technician__user").order_by("-created_at")
-
-        if company:
-            qs = qs.filter(Q(company=company) | Q(job__company=company))
+        if getattr(request.user, "is_superuser", False):
+            qs = WorkforceWorkExtension.objects.filter(
+                status__in=[
+                    WorkforceWorkExtension.Status.REQUESTED,
+                    WorkforceWorkExtension.Status.PENDING_ASSIGNMENT,
+                ]
+            ).select_related("job", "technician__user", "required_skill", "specialist_technician__user").order_by("-created_at")
+        else:
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            qs = WorkforceWorkExtension.objects.filter(
+                status__in=[
+                    WorkforceWorkExtension.Status.REQUESTED,
+                    WorkforceWorkExtension.Status.PENDING_ASSIGNMENT,
+                ]
+            ).filter(Q(company=user_company) | Q(job__company=user_company)).select_related("job", "technician__user", "required_skill", "specialist_technician__user").order_by("-created_at")
 
         serializer = WorkforceWorkExtensionSerializer(qs, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -2908,6 +3089,14 @@ class WorkforceAdminAssignSpecialistView(APIView):
         if not job:
             return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # Cross-company tenant isolation check
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not job.company_id or user_company.id != job.company_id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+
         specialist_emp_id = request.data.get("specialist_employee_id") or request.data.get("employee_id")
         if not specialist_emp_id:
             return Response({"error": "specialist_employee_id is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -2915,6 +3104,10 @@ class WorkforceAdminAssignSpecialistView(APIView):
         specialist_emp = Employee.objects.filter(pk=specialist_emp_id).first()
         if not specialist_emp:
             return Response({"error": "Specialist technician not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Invariant: Assigned specialist employee must belong to the same company as the job
+        if not job.company_id or not specialist_emp.company_id or job.company_id != specialist_emp.company_id:
+            return Response({"error": "Specialist technician must belong to the same vendor company as the job.", "code": "CROSS_TENANT_ASSIGNMENT_FORBIDDEN"}, status=status.HTTP_400_BAD_REQUEST)
 
         with transaction.atomic():
             extension = (
@@ -3531,13 +3724,15 @@ class WorkforceLeaveListView(APIView):
 
         if is_admin_role(user):
             # Admin sees leave applications for their company workforce
-            company = getattr(user, "company", None)
-            emp_qs = Employee.objects.filter(is_active=True)
-            if company:
-                emp_qs = emp_qs.filter(company=company)
-            all_employees = emp_qs.select_related("user")
+            if getattr(user, "is_superuser", False):
+                emp_qs = Employee.objects.filter(is_active=True).select_related("user")
+            else:
+                user_company = resolve_actor_company(request)
+                if not user_company:
+                    return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+                emp_qs = Employee.objects.filter(is_active=True, company=user_company).select_related("user")
             all_leaves = []
-            for e in all_employees:
+            for e in emp_qs:
                 e_leaves = (e.bank_details or {}).get("leaves", [])
                 for l in e_leaves:
                     all_leaves.append({
@@ -3652,6 +3847,13 @@ class WorkforceAdminLeaveDecideView(APIView):
         if not emp:
             return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not emp.company_id or user_company.id != emp.company_id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+
         action = request.data.get("action", "").lower()  # approve, reject
         reason = request.data.get("reason", "").strip()
 
@@ -3698,17 +3900,18 @@ class WorkforceFleetMapView(APIView):
 
     def get(self, request):
         user = request.user
-        emp = getattr(user, "employee_profile", None)
-        company = emp.company if emp else getattr(user, "company", None)
-        if not company:
-            return Response(
-                {"error": "Company context required.", "code": "NO_COMPANY"},
-                status=status.HTTP_403_FORBIDDEN,
+        if getattr(user, "is_superuser", False):
+            technicians = list(Employee.objects.filter(is_active=True).select_related("user", "company"))
+        else:
+            company = resolve_actor_company(request)
+            if not company:
+                return Response(
+                    {"error": "Tenant company context required.", "code": "TENANT_REQUIRED"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            technicians = list(
+                Employee.objects.filter(is_active=True, company=company).select_related("user", "company")
             )
-
-        technicians = list(
-            Employee.objects.filter(is_active=True, company=company).select_related("user")
-        )
         tech_ids = [e.id for e in technicians]
 
         active_jobs_map = {}
@@ -4065,23 +4268,30 @@ class WorkforceJobLiveTrackingView(APIView):
         if not job:
             return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
-        is_owner_customer = (job.customer == user)
-        is_assigned_tech = (job.assigned_employee and job.assigned_employee.user == user)
-        is_tenant_admin = is_admin_role(user) and (job.company == getattr(user, "company", None) or getattr(user, "is_superuser", False))
+        is_owner_customer = (
+            job.customer == user
+            or str(getattr(job, "customer_name", "")).lower() == user.username.lower()
+            or getattr(job, "phone", "") == getattr(user, "username", "")
+        )
+        is_assigned_tech = bool(job.assigned_employee and job.assigned_employee.user == user)
+        is_platform_admin = getattr(user, "is_superuser", False)
+        user_company = resolve_actor_company(request)
+        is_tenant_admin = is_admin_role(user) and bool(job.company_id and user_company and job.company_id == user_company.id)
 
-        if not (is_owner_customer or is_assigned_tech or is_tenant_admin):
+        if not (is_owner_customer or is_assigned_tech or is_platform_admin or is_tenant_admin):
             return Response({
                 "error": "Unauthorized to view tracking for this job.",
-                "code": "UNAUTHORIZED_TRACKING"
+                "code": "CROSS_TENANT_FORBIDDEN"
             }, status=status.HTTP_403_FORBIDDEN)
 
-        # Cross-tenant check for technician or admin
-        if (is_assigned_tech or is_admin_role(user)) and job.company and getattr(user, "company", None) and job.company != user.company:
+        # Cross-tenant check for assigned technician
+        if is_assigned_tech and job.company_id and user_company and job.company_id != user_company.id:
             return Response({"error": "Unauthorized: Cross-company access forbidden.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         now = timezone.now()
         cust_lat = float(job.latitude) if job.latitude else None
         cust_lon = float(job.longitude) if job.longitude else None
+        tech = job.assigned_employee
 
         # Privacy Guard: If job is completed/cancelled/closed/redispatching, or has no assigned technician
         if job.status in ["completed", "cancelled", "closed", "redispatching"] or not job.assigned_employee:
@@ -4247,27 +4457,34 @@ class WorkforceNotificationListView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        user = request.user
-        notifs = WorkforceNotification.objects.filter(recipient=user)[:50]
-        unread_count = WorkforceNotification.objects.filter(recipient=user, is_read=False).count()
+        try:
+            user = request.user
+            notifs = WorkforceNotification.objects.filter(recipient=user).order_by("-created_at")[:50]
+            unread_count = WorkforceNotification.objects.filter(recipient=user, is_read=False).count()
 
-        data = [
-            {
-                "id": n.id,
-                "title": n.title,
-                "message": n.message,
-                "notification_type": n.notification_type,
-                "related_object_id": n.related_object_id,
-                "is_read": n.is_read,
-                "created_at": n.created_at.isoformat(),
-            }
-            for n in notifs
-        ]
+            data = [
+                {
+                    "id": n.id,
+                    "title": n.title,
+                    "message": n.message,
+                    "notification_type": n.notification_type,
+                    "related_object_id": n.related_object_id,
+                    "is_read": n.is_read,
+                    "created_at": n.created_at.isoformat() if n.created_at else timezone.now().isoformat(),
+                }
+                for n in notifs
+            ]
 
-        return Response({
-            "unread_count": unread_count,
-            "notifications": data,
-        }, status=status.HTTP_200_OK)
+            return Response({
+                "unread_count": unread_count,
+                "notifications": data,
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error("WorkforceNotificationListView GET error: %s", str(e), exc_info=True)
+            return Response({
+                "unread_count": 0,
+                "notifications": [],
+            }, status=status.HTTP_200_OK)
 
     def delete(self, request):
         user = request.user
@@ -4451,10 +4668,13 @@ class WorkforceSkillManageView(APIView):
     permission_classes = [IsWorkforceAdmin]
 
     def get(self, request):
-        company = get_request_company(request)
-        if not company:
-            return Response({"error": "Tenant company context missing.", "code": "TENANT_MISSING", "details": {}}, status=status.HTTP_403_FORBIDDEN)
-        skills = WorkforceSkill.objects.filter(company=company)
+        if getattr(request.user, "is_superuser", False):
+            skills = WorkforceSkill.objects.all()
+        else:
+            company = resolve_actor_company(request)
+            if not company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            skills = WorkforceSkill.objects.filter(company=company)
         data = [
             {
                 "id": s.id,
@@ -4469,9 +4689,9 @@ class WorkforceSkillManageView(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        company = get_request_company(request)
-        if not company:
-            return Response({"error": "Tenant company context missing.", "code": "TENANT_MISSING", "details": {}}, status=status.HTTP_403_FORBIDDEN)
+        company = resolve_actor_company(request)
+        if not company and not getattr(request.user, "is_superuser", False):
+            return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
         name = request.data.get("name", "").strip()
         code = request.data.get("code", "").strip()
         category = request.data.get("category", "General").strip()
@@ -4516,6 +4736,13 @@ class WorkforceEmployeeSkillAssignView(APIView):
         emp = Employee.objects.filter(pk=emp_id).first()
         if not emp:
             return Response({"error": "Employee not found.", "code": "NOT_FOUND", "details": {}}, status=status.HTTP_404_NOT_FOUND)
+
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not emp.company_id or user_company.id != emp.company_id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         skill_id = request.data.get("skill_id")
         proficiency = request.data.get("proficiency_level", "INTERMEDIATE")
@@ -4581,10 +4808,13 @@ class WorkforceComplianceRequirementView(APIView):
     permission_classes = [IsWorkforceAdmin]
 
     def get(self, request):
-        company = get_request_company(request)
-        if not company:
-            return Response({"error": "Tenant company context missing.", "code": "TENANT_MISSING", "details": {}}, status=status.HTTP_403_FORBIDDEN)
-        reqs = WorkforceComplianceRequirement.objects.filter(company=company)
+        if getattr(request.user, "is_superuser", False):
+            reqs = WorkforceComplianceRequirement.objects.all()
+        else:
+            company = resolve_actor_company(request)
+            if not company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            reqs = WorkforceComplianceRequirement.objects.filter(company=company)
         data = [
             {
                 "id": r.id,
@@ -4598,9 +4828,9 @@ class WorkforceComplianceRequirementView(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        company = get_request_company(request)
-        if not company:
-            return Response({"error": "Tenant company context missing.", "code": "TENANT_MISSING", "details": {}}, status=status.HTTP_403_FORBIDDEN)
+        company = resolve_actor_company(request)
+        if not company and not getattr(request.user, "is_superuser", False):
+            return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
         title = request.data.get("title", "").strip()
         is_mandatory = bool(request.data.get("is_mandatory", True))
         validity_days = int(request.data.get("validity_days", 365))
@@ -4637,17 +4867,23 @@ class WorkforceEmployeeComplianceView(APIView):
         emp = getattr(user, "employee_profile", None)
 
         if is_admin_role(user):
-            company = getattr(user, "company", None)
             if emp_id:
+                emp_obj = Employee.objects.filter(pk=emp_id).first()
+                if not emp_obj:
+                    return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
+                if not getattr(user, "is_superuser", False):
+                    user_company = resolve_actor_company(request)
+                    if not user_company or not emp_obj.company_id or user_company.id != emp_obj.company_id:
+                        return Response({"error": "Unauthorized cross-company query.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
                 qs = WorkforceEmployeeCompliance.objects.filter(employee_id=emp_id)
             else:
                 qs = WorkforceEmployeeCompliance.objects.all()
 
             if not user.is_superuser:
-                if company:
-                    qs = qs.filter(requirement__company=company)
-                else:
-                    qs = qs.none()
+                user_company = resolve_actor_company(request)
+                if not user_company:
+                    return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+                qs = qs.filter(requirement__company=user_company)
             records = qs.select_related("requirement", "employee__user")
         else:
             if not emp:
@@ -4804,8 +5040,14 @@ class WorkforceAdminPayrollListView(APIView):
     permission_classes = [IsWorkforceAdmin]
 
     def get(self, request):
-        company = getattr(request.user, "company", None) or Company.objects.first()
-        periods = WorkforcePayPeriod.objects.filter(company=company)
+        if getattr(request.user, "is_superuser", False):
+            periods = WorkforcePayPeriod.objects.all()
+        else:
+            company = resolve_actor_company(request)
+            if not company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            periods = WorkforcePayPeriod.objects.filter(company=company)
+
         data = [
             {
                 "id": p.id,
@@ -4821,7 +5063,13 @@ class WorkforceAdminPayrollListView(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        company = getattr(request.user, "company", None) or Company.objects.first()
+        if getattr(request.user, "is_superuser", False):
+            company = resolve_actor_company(request)
+        else:
+            company = resolve_actor_company(request)
+            if not company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+
         name = request.data.get("name", "").strip()
         start_date = request.data.get("start_date")
         end_date = request.data.get("end_date")
@@ -4854,6 +5102,14 @@ class WorkforceAdminPayrollProcessView(APIView):
         period = WorkforcePayPeriod.objects.filter(pk=period_id).first()
         if not period:
             return Response({"error": "Pay period not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Cross-company tenant isolation check
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not period.company_id or user_company.id != period.company_id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         action = request.data.get("action", "process").lower()
 
@@ -4971,9 +5227,12 @@ class WorkforceReportsView(APIView):
         status_filter = request.query_params.get("status")
 
         user = request.user
-        company = getattr(user, "company", None)
-        if not user.is_superuser and not company:
-            return Response({"report_type": report_type, "total_records": 0, "rows": []}, status=status.HTTP_200_OK)
+        if not user.is_superuser:
+            company = resolve_actor_company(request)
+            if not company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+        else:
+            company = None
 
         if report_type == "employee":
             qs = Employee.objects.all().select_related("user")
@@ -5733,7 +5992,14 @@ class WorkforceAdminChangeRequestsListView(APIView):
 
     def get(self, request):
         status_filter = request.query_params.get("status", "").strip().upper()
-        reqs = WorkforceEmployeeChangeRequest.objects.select_related("employee__user", "reviewed_by").order_by("-created_at")
+        if getattr(request.user, "is_superuser", False):
+            reqs = WorkforceEmployeeChangeRequest.objects.select_related("employee__user", "reviewed_by").order_by("-created_at")
+        else:
+            company = resolve_actor_company(request)
+            if not company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            reqs = WorkforceEmployeeChangeRequest.objects.filter(company=company).select_related("employee__user", "reviewed_by").order_by("-created_at")
+
         if status_filter:
             reqs = reqs.filter(status=status_filter)
 
@@ -5748,6 +6014,13 @@ class WorkforceAdminChangeRequestDecideView(APIView):
         change_req = WorkforceEmployeeChangeRequest.objects.select_related("employee__user").filter(pk=pk).first()
         if not change_req:
             return Response({"error": "Change Request not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not getattr(request.user, "is_superuser", False):
+            user_company = resolve_actor_company(request)
+            if not user_company:
+                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
+            if not change_req.company_id or user_company.id != change_req.company_id:
+                return Response({"error": "Unauthorized cross-company action.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         action = (request.data.get("action") or "").strip().upper()
         admin_notes = request.data.get("admin_notes", "").strip()
@@ -6436,16 +6709,18 @@ class WorkforceAdminLocationToggleView(APIView):
     def patch(self, request, pk):
         from time_tracking.models import Location
         user = request.user
-        emp = getattr(user, "employee_profile", None)
-        company = emp.company if emp else getattr(user, "company", None)
-        if not company:
-            return Response(
-                {"error": "Company context required.", "code": "NO_COMPANY"},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-        try:
-            loc = Location.objects.get(pk=pk, company=company)
-        except Location.DoesNotExist:
+        if getattr(user, "is_superuser", False):
+            loc = Location.objects.filter(pk=pk).first()
+        else:
+            company = resolve_actor_company(request)
+            if not company:
+                return Response(
+                    {"error": "Tenant company context required.", "code": "TENANT_REQUIRED"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            loc = Location.objects.filter(pk=pk, company=company).first()
+
+        if not loc:
             return Response(
                 {"error": "Location not found.", "code": "NOT_FOUND"},
                 status=status.HTTP_404_NOT_FOUND,
@@ -6472,11 +6747,19 @@ class WorkforceAdminLocationAssignEmployeeView(APIView):
     def _get_location(self, request, pk):
         from time_tracking.models import Location
         user = request.user
-        emp = getattr(user, "employee_profile", None)
-        company = emp.company if emp else getattr(user, "company", None)
+        if getattr(user, "is_superuser", False):
+            loc = Location.objects.filter(pk=pk).first()
+            if not loc:
+                return None, Response(
+                    {"error": "Location not found.", "code": "NOT_FOUND"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            return loc, None
+
+        company = resolve_actor_company(request)
         if not company:
             return None, Response(
-                {"error": "Company context required.", "code": "NO_COMPANY"},
+                {"error": "Tenant company context required.", "code": "TENANT_REQUIRED"},
                 status=status.HTTP_403_FORBIDDEN,
             )
         try:

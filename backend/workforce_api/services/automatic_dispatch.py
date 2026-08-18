@@ -363,8 +363,11 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
         )
     )
 
-    if job_obj.company_id:
-        candidates_qs = candidates_qs.filter(company_id=job_obj.company_id)
+    if not job_obj.company_id:
+        logger.warning(f"[DISPATCH_COMPANY_MISSING] Job #{job_obj.id} lacks an associated company/vendor tenant. Cannot dispatch without company context.")
+        return []
+
+    candidates_qs = candidates_qs.filter(company_id=job_obj.company_id)
 
     # Exclude candidates who have already received or rejected/cancelled an offer for this job, or explicitly excluded
     previous_offers = set(
@@ -560,8 +563,15 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
                 job_obj.assigned_employee = None
                 job_obj.save(update_fields=["status", "assigned_employee"])
 
-            logger.info(f"[DISPATCH_NO_CANDIDATE] No eligible technician found for Job #{job_id}.")
-            admin_user = get_user_model().objects.filter(role="admin").first()
+            admin_user = None
+            if job_obj.company:
+                admin_user = get_user_model().objects.filter(
+                    Q(role__in=["admin", "manager"]) | Q(is_staff=True),
+                    company=job_obj.company
+                ).first()
+            if not admin_user:
+                admin_user = get_user_model().objects.filter(is_superuser=True).first()
+
             if admin_user:
                 service_name = job_obj.issue_title or job_obj.service_category or "Service"
                 WorkforceNotification.objects.create(

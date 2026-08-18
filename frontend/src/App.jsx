@@ -26,8 +26,6 @@ import { AdminJobsPage } from './pages/admin/AdminJobsPage.jsx';
 import { AdminOperationsPage } from './pages/admin/AdminOperationsPage.jsx';
 import { AdminReportsPage } from './pages/admin/AdminReportsPage.jsx';
 import { AdminSkillsPage } from './pages/admin/AdminSkillsPage.jsx';
-import { CustomerTrackingPage } from './pages/CustomerTrackingPage.jsx';
-
 import { CustomerTrackingPage } from './pages/customer/CustomerTrackingPage.jsx';
 
 function RootRedirect() {
@@ -117,6 +115,14 @@ export function App() {
           {/* Approved Technician Workspace */}
           <Route
             path="/workforce/employee/dashboard"
+            element={
+              <EmployeeRoute>
+                <EmployeeDashboardPage />
+              </EmployeeRoute>
+            }
+          />
+          <Route
+            path="/workforce/employee/jobs"
             element={
               <EmployeeRoute>
                 <EmployeeDashboardPage />

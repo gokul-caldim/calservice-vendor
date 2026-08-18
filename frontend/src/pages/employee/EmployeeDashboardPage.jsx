@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { useLocation } from 'react-router-dom';
+import { useLocation, Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthProvider.jsx';
+import { ClockInCard } from '../../components/employee/ClockInCard.jsx';
 import {
   apiGetWorkforceJobs,
   apiTransitionJob,
@@ -27,6 +28,7 @@ import {
   apiBulkRequestServices,
   apiRemoveService,
   apiVerifyArrival,
+  apiUploadDocument,
 } from '../../api/workforceService.js';
 import { apiClockIn } from '../../api/clockInApi.js';
 import { JobTrackingMap } from '../../components/employee/JobTrackingMap.jsx';
@@ -70,6 +72,11 @@ import {
   Compass,
   Briefcase,
   RefreshCw,
+  Eye,
+  Download,
+  ExternalLink,
+  File,
+  Star,
 } from 'lucide-react';
 
 export function EmployeeDashboardPage() {
@@ -150,6 +157,29 @@ export function EmployeeDashboardPage() {
 
   // Selected job for detailed inspection workspace
   const [selectedJob, setSelectedJob] = useState(null);
+
+  // Document Dossier Preview & Upload State
+  const [viewingDoc, setViewingDoc] = useState(null);
+  const [isUploadingDoc, setIsUploadingDoc] = useState(false);
+  const [uploadingDocKey, setUploadingDocKey] = useState(null);
+
+  const handleDocUpload = async (docKey, file, title = '') => {
+    if (!file) return;
+    try {
+      setIsUploadingDoc(true);
+      setUploadingDocKey(docKey);
+      setError('');
+      await apiUploadDocument(docKey, file, title || docKey);
+      setSuccessMsg(`Document ${title || docKey} updated successfully.`);
+      await loadDashboard();
+      setTimeout(() => setSuccessMsg(''), 4000);
+    } catch (err) {
+      setError(err.message || 'Failed to update document.');
+    } finally {
+      setIsUploadingDoc(false);
+      setUploadingDocKey(null);
+    }
+  };
 
   // Phase 2 Pre-Service Verification state
   const [preServiceState, setPreServiceState] = useState({
@@ -846,6 +876,11 @@ export function EmployeeDashboardPage() {
 
 
   const handleToggleOnline = async () => {
+    if (hasActiveJob) {
+      const activeJobRef = activeJobs[0]?.request_id || (activeJobs[0]?.id ? `SR-${activeJobs[0].id}` : 'your active assignment');
+      setError(`Cannot go offline while actively working on ${activeJobRef}. Please complete or cancel the active job first.`);
+      return;
+    }
     try {
       setError('');
       await togglePresence();
@@ -1080,8 +1115,27 @@ export function EmployeeDashboardPage() {
     }
   };
 
+  const isJobsRoute = pathname.includes('/jobs');
+  const isDocumentsRoute = pathname.includes('/documents');
+  const isServicesRoute = pathname.includes('/services');
+  const isSettingsRoute = pathname.includes('/settings');
+  const isHomeRoute = !isJobsRoute && !isDocumentsRoute && !isServicesRoute && !isSettingsRoute;
+
+  const breadcrumbs = [
+    { label: 'Home', to: '/workforce/employee/dashboard' },
+    ...(isJobsRoute
+      ? [{ label: 'Jobs Queue' }]
+      : isDocumentsRoute
+        ? [{ label: 'Documents' }]
+        : isServicesRoute
+          ? [{ label: 'Services' }]
+          : isSettingsRoute
+            ? [{ label: 'Settings' }]
+            : [{ label: 'Technician Hub' }]),
+  ];
+
   return (
-    <AppShell breadcrumbs={[{ label: 'Home' }, { label: 'Technician Hub' }]}>
+    <AppShell breadcrumbs={breadcrumbs}>
       <div className="space-y-4">
         {/* Availability & Shift Status Bar */}
         <div className="bg-white border border-slate-200 rounded p-4 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -1095,8 +1149,8 @@ export function EmployeeDashboardPage() {
                   {user?.firstName ? `${user.firstName} ${user.lastName}` : user?.username}
                 </h1>
                 <StatusBadge
-                  status={isOnline ? 'online' : 'offline'}
-                  label={isOnline ? 'AVAILABLE' : 'OFFLINE'}
+                  status={hasActiveJob ? 'busy' : (isOnline ? 'online' : 'offline')}
+                  label={hasActiveJob ? 'ON JOB (BUSY)' : (isOnline ? 'AVAILABLE' : 'OFFLINE')}
                 />
                 {isClockedIn && (
                   <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200">
@@ -1116,13 +1170,21 @@ export function EmployeeDashboardPage() {
             <button
               type="button"
               onClick={handleToggleOnline}
+              disabled={hasActiveJob}
+              title={
+                hasActiveJob
+                  ? `Locked Online: Currently active on assignment (${activeJobs[0]?.request_id || 'active job'})`
+                  : (isOnline ? 'Click to go OFFLINE' : 'Click to go ONLINE')
+              }
               className={`px-3.5 py-1.5 rounded text-xs font-bold transition-colors shadow-sm ${
-                isOnline
-                  ? 'bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300'
-                  : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                hasActiveJob
+                  ? 'bg-blue-50 text-blue-800 border border-blue-200 cursor-not-allowed opacity-90'
+                  : isOnline
+                    ? 'bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300'
+                    : 'bg-emerald-600 hover:bg-emerald-700 text-white'
               }`}
             >
-              {isOnline ? 'GO OFFLINE' : 'GO ONLINE'}
+              {hasActiveJob ? 'BUSY • ON ACTIVE JOB' : (isOnline ? 'GO OFFLINE' : 'GO ONLINE')}
             </button>
           </div>
         </div>
@@ -1140,20 +1202,31 @@ export function EmployeeDashboardPage() {
 
         {/* 1. DOCUMENTS TAB */}
         {pathname.includes('/documents') && (
-          <div className="bg-white border border-slate-200 rounded overflow-hidden shadow-sm">
-            <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-              <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
-                <ShieldCheck className="w-4 h-4 text-blue-600" />
-                Verified Identification & Dossier Documents
-              </h2>
+          <div className="bg-white border border-slate-200 rounded-lg overflow-hidden shadow-sm space-y-0">
+            <div className="bg-slate-50 px-4 py-3.5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-blue-600" />
+                  Verified Identification & Dossier Documents
+                </h2>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Mandatory KYC dossier, government identity credentials, and bank account proofs on file.
+                </p>
+              </div>
+              <span className="text-[11px] font-mono font-bold text-slate-600 bg-white px-2.5 py-1 rounded border border-slate-200 self-start sm:self-auto">
+                ID: {profile?.employee_id || user?.username}
+              </span>
             </div>
-            <div className="p-4">
+
+            <div className="p-0 overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50 text-slate-600 font-semibold uppercase text-[11px] border-b border-slate-200">
                   <tr>
-                    <th className="px-4 py-2.5">Document Type</th>
-                    <th className="px-4 py-2.5">Document Number</th>
-                    <th className="px-4 py-2.5">Verification Status</th>
+                    <th className="px-4 py-3">Document Type</th>
+                    <th className="px-4 py-3">Document Number</th>
+                    <th className="px-4 py-3">Uploaded File / Preview</th>
+                    <th className="px-4 py-3">Verification Status</th>
+                    <th className="px-4 py-3 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -1163,25 +1236,121 @@ export function EmployeeDashboardPage() {
                     if (entries.length === 0) {
                       return (
                         <tr>
-                          <td colSpan={3} className="px-4 py-8 text-center text-slate-500">
-                            No onboarding dossier documents on file.
+                          <td colSpan={5} className="px-4 py-12 text-center text-slate-500">
+                            <FileText className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+                            <p className="font-semibold text-slate-700">No onboarding dossier documents on file.</p>
+                            <p className="text-[11px] text-slate-400 mt-1">Uploaded identity proofs and compliance certificates will appear here.</p>
                           </td>
                         </tr>
                       );
                     }
-                    return entries.map(([docKey, docVal]) => (
-                      <tr key={docKey} className="hover:bg-slate-50">
-                        <td className="px-4 py-3 font-semibold text-slate-800 capitalize">
-                          {docKey.replace(/_/g, ' ')}
-                        </td>
-                        <td className="px-4 py-3 font-mono text-slate-700">
-                          {docVal?.document_number || '—'}
-                        </td>
-                        <td className="px-4 py-3">
-                          <StatusBadge status={docVal?.status || 'approved'} size="xs" />
-                        </td>
-                      </tr>
-                    ));
+                    return entries.map(([docKey, docVal]) => {
+                      const fileUrl = docVal?.file_url;
+                      const title = docVal?.title || docKey.replace(/_/g, ' ');
+                      const docNumber = docVal?.document_number || '—';
+                      const docStatus = (docVal?.status || 'approved').toLowerCase();
+                      const isImage = fileUrl && (fileUrl.match(/\.(jpeg|jpg|gif|png|webp)/i) || fileUrl.startsWith('data:image'));
+
+                      return (
+                        <tr key={docKey} className="hover:bg-slate-50/80 transition-colors">
+                          <td className="px-4 py-3 font-semibold text-slate-800 capitalize">
+                            <div className="flex items-center gap-2.5">
+                              <div className="w-8 h-8 rounded bg-blue-50 text-blue-600 flex items-center justify-center shrink-0 border border-blue-100 font-bold">
+                                <FileText className="w-4 h-4" />
+                              </div>
+                              <div>
+                                <p className="font-bold text-slate-900 capitalize">{title}</p>
+                                <span className="text-[10px] text-slate-400 font-mono uppercase">{docKey}</span>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 font-mono text-slate-700 font-medium">
+                            {docNumber !== '—' ? (
+                              <span className="bg-slate-100 px-2 py-0.5 rounded border border-slate-200 text-[11px]">
+                                {docNumber}
+                              </span>
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3">
+                            {fileUrl ? (
+                              <button
+                                type="button"
+                                onClick={() => setViewingDoc({ key: docKey, title, docNumber, status: docStatus, fileUrl })}
+                                className="group flex items-center gap-2.5 p-1 pr-2.5 rounded border border-slate-200 bg-white hover:bg-blue-50 hover:border-blue-300 transition-all text-left cursor-pointer"
+                              >
+                                {isImage ? (
+                                  <img
+                                    src={fileUrl}
+                                    alt={title}
+                                    className="w-8 h-8 object-cover rounded border border-slate-200 group-hover:border-blue-400"
+                                    onError={(e) => { e.target.style.display = 'none'; }}
+                                  />
+                                ) : (
+                                  <div className="w-8 h-8 rounded bg-slate-100 flex items-center justify-center text-slate-500 group-hover:text-blue-600">
+                                    <File className="w-4 h-4" />
+                                  </div>
+                                )}
+                                <div>
+                                  <span className="text-xs font-semibold text-slate-800 group-hover:text-blue-700 flex items-center gap-1">
+                                    <span>View Uploaded File</span>
+                                    <ExternalLink className="w-3 h-3 opacity-60 group-hover:opacity-100" />
+                                  </span>
+                                  <span className="text-[10px] text-slate-400 block font-mono truncate max-w-[140px]">
+                                    {fileUrl.split('/').pop() || 'Attached Document'}
+                                  </span>
+                                </div>
+                              </button>
+                            ) : (
+                              <span className="text-slate-400 text-xs italic">No file attached</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3">
+                            <StatusBadge status={docStatus} size="xs" />
+                          </td>
+                          <td className="px-4 py-3 text-right space-x-1.5">
+                            {fileUrl && (
+                              <button
+                                type="button"
+                                onClick={() => setViewingDoc({ key: docKey, title, docNumber, status: docStatus, fileUrl })}
+                                className="px-2.5 py-1 bg-white hover:bg-slate-50 text-slate-700 font-bold rounded border border-slate-300 text-[11px] inline-flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                              >
+                                <Eye className="w-3.5 h-3.5 text-slate-500" />
+                                <span>Preview</span>
+                              </button>
+                            )}
+                            {fileUrl && (
+                              <a
+                                href={fileUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                download
+                                className="px-2.5 py-1 bg-white hover:bg-slate-50 text-blue-700 font-bold rounded border border-blue-200 text-[11px] inline-flex items-center gap-1 transition-colors shadow-2xs"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>Download</span>
+                              </a>
+                            )}
+                            <label className="px-2.5 py-1 bg-slate-50 hover:bg-slate-100 text-slate-700 font-semibold rounded border border-slate-200 text-[11px] inline-flex items-center gap-1 transition-colors cursor-pointer shadow-2xs">
+                              <Upload className="w-3 h-3 text-slate-500" />
+                              <span>{uploadingDocKey === docKey ? 'Uploading...' : 'Replace'}</span>
+                              <input
+                                type="file"
+                                className="hidden"
+                                disabled={isUploadingDoc}
+                                accept="image/*,.pdf"
+                                onChange={(e) => {
+                                  if (e.target.files?.[0]) {
+                                    handleDocUpload(docKey, e.target.files[0], title);
+                                  }
+                                }}
+                              />
+                            </label>
+                          </td>
+                        </tr>
+                      );
+                    });
                   })()}
                 </tbody>
               </table>
@@ -1502,137 +1671,462 @@ export function EmployeeDashboardPage() {
           </div>
         )}
 
-        {/* 8. DEFAULT: ACTIVE JOBS WORKSPACE */}
-        {!pathname.includes('/documents') &&
-          !pathname.includes('/services') &&
-          !pathname.includes('/settings') && (
-            <>
-              {/* ⚡ Active Assignment Workload Status Card */}
-              {hasActiveJob && (
-                <div className="bg-blue-50 border border-blue-200 rounded p-3 text-xs text-blue-900 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
-                  <div className="flex items-center gap-2.5">
-                    <span className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse shrink-0" />
-                    <span>
-                      <strong>ACTIVE ASSIGNMENT IN PROGRESS:</strong> You are currently working on <strong>{activeJobs[0].request_id || `SR-${activeJobs[0].id}`}</strong> ({activeJobs[0].service_title || activeJobs[0].service_category}). Complete current service to receive new job dispatches.
-                    </span>
-                  </div>
-                  <span className="text-[10px] font-mono uppercase bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded border border-blue-300 shrink-0 self-start sm:self-auto">
+        {/* ── HOME ROUTE: TECHNICIAN HOME HUB ── */}
+        {isHomeRoute && (
+          <div className="space-y-4">
+            {/* Shift Attendance & Real-Time Location Telemetry Card */}
+            <ClockInCard
+              onRefreshData={loadDashboard}
+              employeeId={profile?.employee_id || user?.username}
+              employeeName={user?.firstName ? `${user.firstName} ${user.lastName}` : user?.username}
+              isOnline={isOnline}
+              timeTracking={timeTracking}
+            />
+
+            {/* Quick Operational Metrics */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="p-3.5 bg-white border border-slate-200 rounded shadow-xs space-y-1">
+                <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Active Workload</span>
+                <p className="text-xl font-bold text-slate-900 font-mono">{activeJobs.length}</p>
+                <span className="text-[10px] text-blue-700 font-semibold">{hasActiveJob ? 'In Progress' : 'Standby'}</span>
+              </div>
+              <div className="p-3.5 bg-white border border-slate-200 rounded shadow-xs space-y-1">
+                <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Completed Jobs</span>
+                <p className="text-xl font-bold text-slate-900 font-mono">{completedJobs.length}</p>
+                <span className="text-[10px] text-emerald-700 font-semibold">Total Handled</span>
+              </div>
+              <div className="p-3.5 bg-white border border-slate-200 rounded shadow-xs space-y-1">
+                <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Authorized Services</span>
+                <p className="text-xl font-bold text-slate-900 font-mono">{approvedServices.length}</p>
+                <span className="text-[10px] text-indigo-700 font-semibold">Dispatch Eligible</span>
+              </div>
+              <div className="p-3.5 bg-white border border-slate-200 rounded shadow-xs space-y-1">
+                <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Shift State</span>
+                <p className="text-sm font-bold text-slate-900 mt-1 uppercase">{isClockedIn ? (isBreak ? 'On Break' : 'Clocked In') : 'Off Duty'}</p>
+                <span className="text-[10px] text-slate-500 font-medium">{isOnline ? 'Online' : 'Offline'}</span>
+              </div>
+            </div>
+
+            {/* Quick Action Navigation Cards */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+              <Link
+                to="/workforce/employee/jobs"
+                className="p-3.5 bg-white hover:bg-blue-50/50 border border-slate-200 hover:border-blue-300 rounded shadow-xs transition-all flex items-start gap-3 group"
+              >
+                <div className="p-2 rounded bg-blue-50 text-blue-700 group-hover:bg-blue-600 group-hover:text-white transition-colors">
+                  <Briefcase className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 text-xs flex items-center gap-1 group-hover:text-blue-700">
+                    <span>Jobs Workspace</span>
+                    <span className="text-[10px] text-blue-600 font-normal">({activeJobs.length} active)</span>
+                  </h3>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    View active queue, customer directions & job execution
+                  </p>
+                </div>
+              </Link>
+
+              <Link
+                to="/workforce/employee/performance"
+                className="p-3.5 bg-white hover:bg-amber-50/50 border border-slate-200 hover:border-amber-300 rounded shadow-xs transition-all flex items-start gap-3 group"
+              >
+                <div className="p-2 rounded bg-amber-50 text-amber-700 group-hover:bg-amber-500 group-hover:text-white transition-colors">
+                  <Star className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 text-xs group-hover:text-amber-700">
+                    Performance & Reviews
+                  </h3>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Customer ratings, feedback & completion metrics
+                  </p>
+                </div>
+              </Link>
+
+              <Link
+                to="/workforce/employee/location"
+                className="p-3.5 bg-white hover:bg-emerald-50/50 border border-slate-200 hover:border-emerald-300 rounded shadow-xs transition-all flex items-start gap-3 group"
+              >
+                <div className="p-2 rounded bg-emerald-50 text-emerald-700 group-hover:bg-emerald-600 group-hover:text-white transition-colors">
+                  <MapPin className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 text-xs group-hover:text-emerald-700">
+                    Saved Locations
+                  </h3>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Territories, base addresses & GPS zones
+                  </p>
+                </div>
+              </Link>
+
+              <Link
+                to="/workforce/employee/documents"
+                className="p-3.5 bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-300 rounded shadow-xs transition-all flex items-start gap-3 group"
+              >
+                <div className="p-2 rounded bg-slate-100 text-slate-700 group-hover:bg-slate-700 group-hover:text-white transition-colors">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 text-xs group-hover:text-slate-800">
+                    Dossier Documents
+                  </h3>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Verified ID proofs, licenses & certifications
+                  </p>
+                </div>
+              </Link>
+            </div>
+
+            {/* ⚡ Active Assignment Workload Status Card */}
+            {hasActiveJob && (
+              <div className="bg-blue-50 border border-blue-200 rounded p-3 text-xs text-blue-900 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse shrink-0" />
+                  <span>
+                    <strong>ACTIVE ASSIGNMENT IN PROGRESS:</strong> You are currently working on <strong>{activeJobs[0].request_id || `SR-${activeJobs[0].id}`}</strong> ({activeJobs[0].service_title || activeJobs[0].service_category}). Complete current service to receive new job dispatches.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
+                  <Link
+                    to="/workforce/employee/jobs"
+                    className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-[11px] transition-colors shadow-xs"
+                  >
+                    Open in Jobs Workspace →
+                  </Link>
+                  <span className="text-[10px] font-mono uppercase bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded border border-blue-300">
                     BUSY • SINGLE WORKLOAD
                   </span>
                 </div>
-              )}
+              </div>
+            )}
 
-              {/* ⚡ Dedicated Incoming Job Offers Section */}
-              {incomingOffers.length > 0 && (
-                <div className="space-y-2 bg-amber-50 border-2 border-amber-400 rounded p-4 shadow-md">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className="relative flex h-3 w-3">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
-                        <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
-                      </span>
-                      <h2 className="text-xs font-bold text-amber-950 uppercase tracking-wider flex items-center gap-1.5">
-                        <Sparkles className="w-4 h-4 text-amber-600" />
-                        Exclusive Job Offer Available ({incomingOffers.length})
-                      </h2>
-                    </div>
-                    <span className="text-[11px] font-bold text-amber-900 bg-amber-200/80 px-2 py-0.5 rounded">
-                      Action Required
+            {/* ⚡ Dedicated Incoming Job Offers Section */}
+            {incomingOffers.length > 0 && (
+              <div className="space-y-2 bg-amber-50 border-2 border-amber-400 rounded p-4 shadow-md">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="relative flex h-3 w-3">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
                     </span>
+                    <h2 className="text-xs font-bold text-amber-950 uppercase tracking-wider flex items-center gap-1.5">
+                      <Sparkles className="w-4 h-4 text-amber-600" />
+                      Exclusive Job Offer Available ({incomingOffers.length})
+                    </h2>
                   </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
-                    {incomingOffers.map((offerJob) => {
-                      const presentation = getEmployeeJobPresentation(offerJob);
-                      return (
-                        <div
-                          key={offerJob.id}
-                          className="bg-white border border-amber-300 rounded p-3.5 shadow-sm space-y-2.5"
-                        >
-                          <div className="flex items-start justify-between gap-2">
-                            <div>
-                              <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
-                                {offerJob.request_id || `SR-${offerJob.id}`}
-                              </span>
-                              <h3 className="text-sm font-bold text-slate-900 mt-1">
-                                {offerJob.service_title || offerJob.service_category}
-                              </h3>
-                            </div>
-                            {offerJob.distance_km != null && (
-                              <span className="font-mono text-xs font-bold text-emerald-800 bg-emerald-50 px-2 py-1 rounded border border-emerald-200 shrink-0">
-                                📍 {offerJob.distance_km.toFixed(1)} km away
-                              </span>
-                            )}
-                          </div>
-
-                          <div className="text-xs text-slate-600 bg-slate-50 p-2 rounded border border-slate-100 space-y-1">
-                            <p className="flex items-center gap-1.5 truncate">
-                              <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                              <span className="truncate">{offerJob.address || 'Customer site address provided upon acceptance'}</span>
-                            </p>
-                            {presentation?.offerExpiresAt && (
-                              <p className="flex items-center gap-1.5 text-rose-700 font-semibold text-[11px]">
-                                <Clock className="w-3.5 h-3.5 shrink-0 animate-pulse" />
-                                <span>Expires: {new Date(presentation.offerExpiresAt).toLocaleTimeString()}</span>
-                              </p>
-                            )}
-                          </div>
-
-                          <div className="flex items-center gap-2 pt-1">
-                            <button
-                              type="button"
-                              onClick={() => handleAcceptOffer(offerJob.id)}
-                              disabled={actionLoading === offerJob.id}
-                              className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
-                            >
-                              <CheckCircle2 className="w-4 h-4" />
-                              <span>{actionLoading === offerJob.id ? 'Accepting...' : 'ACCEPT JOB'}</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleRejectOffer(offerJob.id)}
-                              disabled={actionLoading === offerJob.id}
-                              className="px-3.5 py-2 bg-white hover:bg-rose-50 text-rose-700 border border-rose-300 font-bold rounded text-xs transition-colors cursor-pointer disabled:opacity-50"
-                            >
-                              DECLINE
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
+                  <span className="text-[11px] font-bold text-amber-900 bg-amber-200/80 px-2 py-0.5 rounded">
+                    Action Required
+                  </span>
                 </div>
-              )}
 
-              {/* Authorized Services Strip */}
-              <div className="bg-white border border-slate-200 rounded p-3 shadow-sm">
-                <div className="flex items-center justify-between mb-2">
-                  <h2 className="text-[11px] font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
-                    <Wrench className="w-3.5 h-3.5 text-blue-600" />
-                    Your Authorized Dispatch Services ({approvedServices.length})
-                  </h2>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {approvedServices.length > 0 ? (
-                    approvedServices.map((svc) => (
-                      <span
-                        key={svc.id}
-                        className="px-2 py-0.5 bg-slate-50 border border-slate-200 rounded text-[11px] font-medium text-slate-800 inline-flex items-center gap-1"
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                  {incomingOffers.map((offerJob) => {
+                    const presentation = getEmployeeJobPresentation(offerJob);
+                    return (
+                      <div
+                        key={offerJob.id}
+                        className="bg-white border border-amber-300 rounded p-3.5 shadow-sm space-y-2.5"
                       >
-                        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                        <span>{svc.name}</span>
-                      </span>
-                    ))
-                  ) : (
-                    <span className="text-xs text-slate-500">
-                      Awaiting Admin service authorizations.
-                    </span>
-                  )}
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                              {offerJob.request_id || `SR-${offerJob.id}`}
+                            </span>
+                            <h3 className="text-sm font-bold text-slate-900 mt-1">
+                              {offerJob.service_title || offerJob.service_category}
+                            </h3>
+                          </div>
+                          {offerJob.distance_km != null && (
+                            <span className="font-mono text-xs font-bold text-emerald-800 bg-emerald-50 px-2 py-1 rounded border border-emerald-200 shrink-0">
+                              📍 {offerJob.distance_km.toFixed(1)} km away
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="text-xs text-slate-600 bg-slate-50 p-2 rounded border border-slate-100 space-y-1">
+                          <p className="flex items-center gap-1.5 truncate">
+                            <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                            <span className="truncate">{offerJob.address || 'Customer site address provided upon acceptance'}</span>
+                          </p>
+                          {presentation?.offerExpiresAt && (
+                            <p className="flex items-center gap-1.5 text-rose-700 font-semibold text-[11px]">
+                              <Clock className="w-3.5 h-3.5 shrink-0 animate-pulse" />
+                              <span>Expires: {new Date(presentation.offerExpiresAt).toLocaleTimeString()}</span>
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => handleAcceptOffer(offerJob.id)}
+                            disabled={actionLoading === offerJob.id}
+                            className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                          >
+                            <CheckCircle2 className="w-4 h-4" />
+                            <span>{actionLoading === offerJob.id ? 'Accepting...' : 'ACCEPT JOB'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRejectOffer(offerJob.id)}
+                            disabled={actionLoading === offerJob.id}
+                            className="px-3.5 py-2 bg-white hover:bg-rose-50 text-rose-700 border border-rose-300 font-bold rounded text-xs transition-colors cursor-pointer disabled:opacity-50"
+                          >
+                            DECLINE
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
+            )}
 
-              {/* Task-Oriented Job Workspace */}
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+            {/* Authorized Services Strip */}
+            <div className="bg-white border border-slate-200 rounded p-3 shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-[11px] font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
+                  <Wrench className="w-3.5 h-3.5 text-blue-600" />
+                  Your Authorized Dispatch Services ({approvedServices.length})
+                </h2>
+                <Link
+                  to="/workforce/employee/services"
+                  className="text-[11px] font-semibold text-blue-600 hover:underline"
+                >
+                  Manage Services →
+                </Link>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {approvedServices.length > 0 ? (
+                  approvedServices.map((svc) => (
+                    <span
+                      key={svc.id}
+                      className="px-2 py-0.5 bg-slate-50 border border-slate-200 rounded text-[11px] font-medium text-slate-800 inline-flex items-center gap-1"
+                    >
+                      <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                      <span>{svc.name}</span>
+                    </span>
+                  ))
+                ) : (
+                  <span className="text-xs text-slate-500">
+                    Awaiting Admin service authorizations.
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Today's Jobs & Work Orders Overview Table */}
+            <div className="bg-white border border-slate-200 rounded overflow-hidden shadow-sm">
+              <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+                <div>
+                  <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
+                    <Briefcase className="w-4 h-4 text-blue-600" />
+                    Assigned Jobs Summary ({allJobs.length})
+                  </h2>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Overview of your active and past service requests.
+                  </p>
+                </div>
+                <Link
+                  to="/workforce/employee/jobs"
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs transition-colors shadow-xs"
+                >
+                  Open Full Jobs Workspace →
+                </Link>
+              </div>
+
+              {allJobs.length > 0 ? (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 text-slate-600 font-semibold uppercase text-[11px] border-b border-slate-200">
+                      <tr>
+                        <th className="px-4 py-2.5">Request ID</th>
+                        <th className="px-4 py-2.5">Service</th>
+                        <th className="px-4 py-2.5">Customer</th>
+                        <th className="px-4 py-2.5">Status</th>
+                        <th className="px-4 py-2.5">Amount</th>
+                        <th className="px-4 py-2.5 text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {allJobs.slice(0, 5).map((job) => {
+                        const presentation = getEmployeeJobPresentation(job, hasActiveJob);
+                        return (
+                          <tr key={job.id} className="hover:bg-slate-50">
+                            <td className="px-4 py-3 font-mono font-bold text-blue-700">
+                              {job.request_id || `SR-${job.id}`}
+                            </td>
+                            <td className="px-4 py-3 font-semibold text-slate-900">
+                              {job.service_title || job.service_category}
+                            </td>
+                            <td className="px-4 py-3 text-slate-600">
+                              {job.customer_name || 'Customer'}
+                            </td>
+                            <td className="px-4 py-3">
+                              <StatusBadge
+                                status={presentation?.badgeStatus || job.status}
+                                label={presentation?.badgeLabel}
+                                size="xs"
+                              />
+                            </td>
+                            <td className="px-4 py-3 font-mono font-semibold text-slate-800">
+                              ₹{job.total_amount || '0.00'}
+                            </td>
+                            <td className="px-4 py-3 text-right">
+                              <Link
+                                to="/workforce/employee/jobs"
+                                onClick={() => setSelectedJob(job)}
+                                className="px-2.5 py-1 bg-slate-100 hover:bg-blue-50 text-blue-700 font-bold rounded border border-slate-200 hover:border-blue-300 text-[11px] transition-colors"
+                              >
+                                View Job
+                              </Link>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="p-8 text-center text-slate-500 text-xs">
+                  No service requests assigned yet. Go online to receive automatic dispatches.
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── JOBS ROUTE: DEDICATED FULL JOBS WORKSPACE ── */}
+        {isJobsRoute && (
+          <div className="space-y-4">
+            {/* ⚡ Active Assignment Workload Status Card */}
+            {hasActiveJob && (
+              <div className="bg-blue-50 border border-blue-200 rounded p-3 text-xs text-blue-900 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse shrink-0" />
+                  <span>
+                    <strong>ACTIVE ASSIGNMENT IN PROGRESS:</strong> You are currently working on <strong>{activeJobs[0].request_id || `SR-${activeJobs[0].id}`}</strong> ({activeJobs[0].service_title || activeJobs[0].service_category}). Complete current service to receive new job dispatches.
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono uppercase bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded border border-blue-300 shrink-0 self-start sm:self-auto">
+                  BUSY • SINGLE WORKLOAD
+                </span>
+              </div>
+            )}
+
+            {/* ⚡ Dedicated Incoming Job Offers Section */}
+            {incomingOffers.length > 0 && (
+              <div className="space-y-2 bg-amber-50 border-2 border-amber-400 rounded p-4 shadow-md">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="relative flex h-3 w-3">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
+                    </span>
+                    <h2 className="text-xs font-bold text-amber-950 uppercase tracking-wider flex items-center gap-1.5">
+                      <Sparkles className="w-4 h-4 text-amber-600" />
+                      Exclusive Job Offer Available ({incomingOffers.length})
+                    </h2>
+                  </div>
+                  <span className="text-[11px] font-bold text-amber-900 bg-amber-200/80 px-2 py-0.5 rounded">
+                    Action Required
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                  {incomingOffers.map((offerJob) => {
+                    const presentation = getEmployeeJobPresentation(offerJob);
+                    return (
+                      <div
+                        key={offerJob.id}
+                        className="bg-white border border-amber-300 rounded p-3.5 shadow-sm space-y-2.5"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                              {offerJob.request_id || `SR-${offerJob.id}`}
+                            </span>
+                            <h3 className="text-sm font-bold text-slate-900 mt-1">
+                              {offerJob.service_title || offerJob.service_category}
+                            </h3>
+                          </div>
+                          {offerJob.distance_km != null && (
+                            <span className="font-mono text-xs font-bold text-emerald-800 bg-emerald-50 px-2 py-1 rounded border border-emerald-200 shrink-0">
+                              📍 {offerJob.distance_km.toFixed(1)} km away
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="text-xs text-slate-600 bg-slate-50 p-2 rounded border border-slate-100 space-y-1">
+                          <p className="flex items-center gap-1.5 truncate">
+                            <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                            <span className="truncate">{offerJob.address || 'Customer site address provided upon acceptance'}</span>
+                          </p>
+                          {presentation?.offerExpiresAt && (
+                            <p className="flex items-center gap-1.5 text-rose-700 font-semibold text-[11px]">
+                              <Clock className="w-3.5 h-3.5 shrink-0 animate-pulse" />
+                              <span>Expires: {new Date(presentation.offerExpiresAt).toLocaleTimeString()}</span>
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => handleAcceptOffer(offerJob.id)}
+                            disabled={actionLoading === offerJob.id}
+                            className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                          >
+                            <CheckCircle2 className="w-4 h-4" />
+                            <span>{actionLoading === offerJob.id ? 'Accepting...' : 'ACCEPT JOB'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRejectOffer(offerJob.id)}
+                            disabled={actionLoading === offerJob.id}
+                            className="px-3.5 py-2 bg-white hover:bg-rose-50 text-rose-700 border border-rose-300 font-bold rounded text-xs transition-colors cursor-pointer disabled:opacity-50"
+                          >
+                            DECLINE
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Authorized Services Strip */}
+            <div className="bg-white border border-slate-200 rounded p-3 shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-[11px] font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
+                  <Wrench className="w-3.5 h-3.5 text-blue-600" />
+                  Your Authorized Dispatch Services ({approvedServices.length})
+                </h2>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {approvedServices.length > 0 ? (
+                  approvedServices.map((svc) => (
+                    <span
+                      key={svc.id}
+                      className="px-2 py-0.5 bg-slate-50 border border-slate-200 rounded text-[11px] font-medium text-slate-800 inline-flex items-center gap-1"
+                    >
+                      <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                      <span>{svc.name}</span>
+                    </span>
+                  ))
+                ) : (
+                  <span className="text-xs text-slate-500">
+                    Awaiting Admin service authorizations.
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Task-Oriented Job Workspace */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
                 {/* Left Column: Assigned Jobs List (5 cols) */}
                 <div className="lg:col-span-5 border border-slate-200 bg-white rounded overflow-hidden shadow-sm flex flex-col">
                   <div className="bg-slate-50 px-3.5 py-2.5 border-b border-slate-200 flex flex-col gap-2">
@@ -2549,7 +3043,7 @@ export function EmployeeDashboardPage() {
                   )}
                 </div>
               </div>
-            </>
+            </div>
           )}
 
 
@@ -3093,6 +3587,78 @@ export function EmployeeDashboardPage() {
               </button>
             </div>
           </div>
+        </Modal>
+
+        {/* Modal: View Uploaded Document Preview */}
+        <Modal
+          isOpen={Boolean(viewingDoc)}
+          onClose={() => setViewingDoc(null)}
+          title={`Document Dossier: ${viewingDoc?.title || 'Preview'}`}
+        >
+          {viewingDoc && (
+            <div className="space-y-4 p-2">
+              <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs">
+                <div>
+                  <span className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider block">Document Type</span>
+                  <strong className="text-slate-900 capitalize text-sm">{viewingDoc.title}</strong>
+                </div>
+                {viewingDoc.docNumber && viewingDoc.docNumber !== '—' && (
+                  <div>
+                    <span className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider block">Document Number</span>
+                    <span className="font-mono font-bold text-slate-800 bg-white px-2 py-0.5 rounded border border-slate-200">{viewingDoc.docNumber}</span>
+                  </div>
+                )}
+                <div>
+                  <span className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider block">Status</span>
+                  <StatusBadge status={viewingDoc.status} size="xs" />
+                </div>
+              </div>
+
+              {/* Document File Viewer (Image / PDF / File) */}
+              <div className="border border-slate-200 rounded-lg overflow-hidden bg-slate-900/5 min-h-[260px] max-h-[500px] flex items-center justify-center">
+                {viewingDoc.fileUrl?.match(/\.(jpeg|jpg|gif|png|webp)/i) || viewingDoc.fileUrl?.startsWith('data:image') ? (
+                  <img
+                    src={viewingDoc.fileUrl}
+                    alt={viewingDoc.title}
+                    className="max-h-[480px] w-auto max-w-full object-contain mx-auto rounded shadow-sm"
+                  />
+                ) : viewingDoc.fileUrl?.match(/\.pdf/i) ? (
+                  <iframe
+                    src={viewingDoc.fileUrl}
+                    title={viewingDoc.title}
+                    className="w-full h-[480px] border-0"
+                  />
+                ) : (
+                  <div className="p-8 text-center space-y-3">
+                    <FileText className="w-16 h-16 text-blue-500 mx-auto" />
+                    <div>
+                      <p className="font-bold text-slate-800 text-sm">Uploaded Document File Attached</p>
+                      <p className="text-xs text-slate-500 mt-1 font-mono break-all max-w-md mx-auto">{viewingDoc.fileUrl}</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between pt-2 border-t border-slate-200">
+                <a
+                  href={viewingDoc.fileUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs transition-colors shadow-xs flex items-center gap-1.5"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Open in Full Tab</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setViewingDoc(null)}
+                  className="px-4 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded text-xs transition-colors"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          )}
         </Modal>
 
         {/* Real-Time Live Camera Viewfinder & Snapshot Modal */}

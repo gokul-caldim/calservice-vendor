@@ -288,6 +288,10 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
 
   const handlePresenceToggle = async () => {
     if (registrationStatus !== 'approved') return;
+    if (user?.availability === 'busy') {
+      alert('Cannot change availability or go offline while actively working on an assigned job.');
+      return;
+    }
     try {
       setIsToggling(true);
       await togglePresence();
@@ -307,6 +311,7 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
   };
 
   const isOnline = Boolean(user?.isOnline);
+  const isBusy = user?.availability === 'busy';
 
   return (
     <>
@@ -362,18 +367,34 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
                     <button
                       type="button"
                       onClick={handlePresenceToggle}
-                      disabled={isToggling}
+                      disabled={isToggling || isBusy}
                       className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-semibold border transition-all ${
-                        isOnline
-                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/30'
-                          : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'
+                        isBusy
+                          ? 'bg-blue-500/20 text-blue-300 border-blue-500/40 cursor-not-allowed'
+                          : isOnline
+                            ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/30'
+                            : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'
                       }`}
-                      title={isOnline ? 'You are ONLINE. Click to go OFFLINE' : 'You are OFFLINE. Click to go ONLINE'}
+                      title={
+                        isBusy
+                          ? 'Locked Online: You are actively working on an assigned job (BUSY).'
+                          : isOnline
+                            ? 'You are ONLINE. Click to go OFFLINE'
+                            : 'You are OFFLINE. Click to go ONLINE'
+                      }
                     >
                       <span
-                        className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}
+                        className={`w-2 h-2 rounded-full ${
+                          isBusy
+                            ? 'bg-blue-400 animate-pulse'
+                            : isOnline
+                              ? 'bg-emerald-400 animate-pulse'
+                              : 'bg-slate-500'
+                        }`}
                       />
-                      <span className="text-[11px] uppercase font-bold">{isOnline ? 'ONLINE' : 'OFFLINE'}</span>
+                      <span className="text-[11px] uppercase font-bold">
+                        {isBusy ? 'ON JOB (BUSY)' : isOnline ? 'ONLINE' : 'OFFLINE'}
+                      </span>
                       <Power className="w-3 h-3 ml-0.5 opacity-70" />
                     </button>
 
@@ -669,7 +690,7 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
                           {user.firstName ? `${user.firstName} ${user.lastName}` : user.username}
                         </p>
                         <p className="text-[10px] text-slate-500 uppercase tracking-wider mt-0.5">
-                          Role: {user.role}
+                          Role: {user.isAdmin ? 'Admin' : (user.isEmployee ? 'Technician' : (user.role || 'Employee'))}
                         </p>
                       </div>
 

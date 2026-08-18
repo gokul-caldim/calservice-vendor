@@ -116,8 +116,12 @@ def reconcile_employee_availability(employee_or_id) -> str:
 
     active_job = get_employee_active_job(emp_id)
 
+    update_fields = []
     if active_job:
         new_avail = "busy"
+        if not emp.is_online:
+            emp.is_online = True
+            update_fields.append("is_online")
     elif not emp.is_online:
         new_avail = "offline"
     else:
@@ -125,7 +129,10 @@ def reconcile_employee_availability(employee_or_id) -> str:
 
     if emp.current_availability != new_avail:
         emp.current_availability = new_avail
-        emp.save(update_fields=["current_availability"])
+        update_fields.append("current_availability")
+
+    if update_fields:
+        emp.save(update_fields=update_fields)
 
     logger.info(
         f"[EMPLOYEE_WORKLOAD] employee={emp.id} active_job={active_job.id if active_job else 'null'} "

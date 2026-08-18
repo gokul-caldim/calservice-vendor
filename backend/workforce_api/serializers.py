@@ -128,7 +128,30 @@ class WorkforceEmployeeProfileSerializer(serializers.ModelSerializer):
 
     def get_documents_status(self, obj):
         ob = (obj.bank_details or {}).get("onboarding", {})
-        return ob.get("documents", {})
+        docs_dict = dict(ob.get("documents", {}))
+
+        # Include relational WorkforceEmployeeDocument models if present
+        try:
+            from workforce_api.models import WorkforceEmployeeDocument
+            emp_docs = WorkforceEmployeeDocument.objects.filter(employee=obj).select_related("requirement")
+            for ed in emp_docs:
+                cat = ed.requirement.category or ed.requirement.title.lower().replace(" ", "_")
+                existing = docs_dict.get(cat, {})
+                docs_dict[cat] = {
+                    "category": cat,
+                    "title": ed.requirement.title or existing.get("title", cat.replace("_", " ").title()),
+                    "document_number": ed.document_number or existing.get("document_number", ""),
+                    "file_url": ed.file_url or existing.get("file_url", ""),
+                    "status": ed.status.lower() if ed.status else existing.get("status", "approved"),
+                    "issue_date": str(ed.issue_date) if ed.issue_date else existing.get("issue_date"),
+                    "expiry_date": str(ed.expiry_date) if ed.expiry_date else existing.get("expiry_date"),
+                    "uploaded_at": ed.created_at.isoformat() if ed.created_at else existing.get("uploaded_at"),
+                    "rejection_reason": ed.rejection_reason or existing.get("rejection_reason", ""),
+                }
+        except Exception:
+            pass
+
+        return docs_dict
 
     def get_controlled_fields(self, obj):
         # Fields that are locked once registration is submitted/approved

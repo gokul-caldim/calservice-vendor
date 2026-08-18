@@ -144,13 +144,16 @@ class MeView(APIView):
                 logger.warning("Error fetching employee profile for user #%s: %s", getattr(user, "id", None), str(e))
 
             company_id = getattr(user, "company_id", None)
-            company_name = "CalServices"
-            try:
-                company = getattr(user, "company", None)
-                if company:
-                    company_name = getattr(company, "company_name", "CalServices") or "CalServices"
-            except Exception:
-                pass
+            company_obj = getattr(user, "company", None)
+            if not company_obj and emp and getattr(emp, "company", None):
+                company_obj = emp.company
+                company_id = emp.company_id
+
+            company_name = getattr(company_obj, "company_name", None) if company_obj else None
+
+            user_role = getattr(user, "role", "employee")
+            if emp and user_role not in ["admin", "manager"]:
+                user_role = "employee"
 
             return Response({
                 "id": user.id,
@@ -158,7 +161,7 @@ class MeView(APIView):
                 "email": user.email or "",
                 "first_name": user.first_name or "",
                 "last_name": user.last_name or "",
-                "role": getattr(user, "role", "employee"),
+                "role": user_role,
                 "company": company_id,
                 "company_name": company_name,
                 "is_superuser": getattr(user, "is_superuser", False),

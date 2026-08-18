@@ -292,7 +292,7 @@ export function Sidebar({ onCloseMobile = () => {} }) {
           {!collapsed.myWork && (
             <div className="mt-1 space-y-0.5 pl-1">
               <NavLink
-                to="/workforce/employee/dashboard"
+                to="/workforce/employee/jobs"
                 onClick={onCloseMobile}
                 className={navItemClass}
               >
