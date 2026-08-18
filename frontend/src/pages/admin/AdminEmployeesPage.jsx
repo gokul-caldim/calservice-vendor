@@ -62,8 +62,6 @@ export function AdminEmployeesPage() {
 
       return matchesSearch && matchesStatus && matchesAvailability;
     });
-
-    return list.sort((a, b) => (b.id || 0) - (a.id || 0));
   }, [technicians, searchTerm, statusFilter, availabilityFilter]);
 
   const paginatedData = useMemo(() => {

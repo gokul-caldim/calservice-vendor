@@ -1,30 +1,80 @@
 /**
  * workforce-app/frontend/src/api/client.js
- * Universal fetch client sending httpOnly cookies and handling JSON errors.
+ * Universal fetch client handling Bearer tokens, CSRF tokens, silent refresh deduplication, and JSON errors.
  */
 
+import {
+  getAccessToken,
+  getRefreshToken,
+  setAuthTokens,
+  clearAuthTokens,
+} from '../utils/authTokens.js';
+import { classifyApiError } from '../utils/apiErrors.js';
+
+let inFlightRefreshPromise = null;
+
 function getCookie(name) {
-  let cookieValue = null;
-  if (document.cookie && document.cookie !== '') {
-    const cookies = document.cookie.split(';');
-    for (let i = 0; i < cookies.length; i++) {
-      const cookie = cookies[i].trim();
-      if (cookie.substring(0, name.length + 1) === (name + '=')) {
-        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
-        break;
-      }
+  if (typeof document === 'undefined' || !document.cookie) return null;
+  const cookies = document.cookie.split(';');
+  for (let i = 0; i < cookies.length; i++) {
+    const cookie = cookies[i].trim();
+    if (cookie.substring(0, name.length + 1) === name + '=') {
+      return decodeURIComponent(cookie.substring(name.length + 1));
     }
   }
-  return cookieValue;
+  return null;
+}
+
+/**
+ * Performs a silent token refresh using the existing /api/auth/refresh/ endpoint.
+ * Deduplicates multiple concurrent refresh requests.
+ */
+export async function apiRefreshToken() {
+  if (inFlightRefreshPromise) {
+    return inFlightRefreshPromise;
+  }
+
+  const refreshToken = getRefreshToken();
+  if (!refreshToken) {
+    clearAuthTokens();
+    return null;
+  }
+
+  inFlightRefreshPromise = (async () => {
+    try {
+      const res = await fetch('/api/auth/refresh/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const newToken = data.access_token || data.token;
+        if (newToken) {
+          setAuthTokens(newToken, refreshToken);
+          return newToken;
+        }
+      }
+
+      // Refresh failed (invalid/expired refresh token)
+      clearAuthTokens();
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      inFlightRefreshPromise = null;
+    }
+  })();
+
+  return inFlightRefreshPromise;
 }
 
 export async function apiRequest(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  
-  if (!options.isFormData) {
-    if (!headers.has('Content-Type')) {
-      headers.set('Content-Type', 'application/json');
-    }
+
+  if (!options.isFormData && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
   }
 
   const csrfToken = getCookie('csrftoken');
@@ -33,7 +83,7 @@ export async function apiRequest(path, options = {}) {
   }
 
   // Attach tab-scoped or stored Bearer token
-  const token = sessionStorage.getItem('wf_token') || localStorage.getItem('wf_token');
+  const token = getAccessToken();
   if (token && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${token}`);
   }
@@ -51,45 +101,40 @@ export async function apiRequest(path, options = {}) {
 
   const url = path.startsWith('http') ? path : `/api${path.startsWith('/') ? path : '/' + path}`;
 
-  let response = await fetch(url, config);
+  let response;
+  try {
+    response = await fetch(url, config);
+  } catch (netErr) {
+    const error = new Error('Network error. Please check your connection.');
+    error.status = 0;
+    error.code = 'NETWORK_ERROR';
+    error.originalError = netErr;
+    throw error;
+  }
 
-  // Auto-refresh token on 401
+  // Auto-refresh token on 401 for authenticated endpoints (excluding login/refresh)
   if (response.status === 401 && !path.includes('/auth/login') && !path.includes('/auth/refresh')) {
     if (!options._isRetry) {
-      const refreshToken = sessionStorage.getItem('wf_refresh_token') || localStorage.getItem('wf_refresh_token');
-      if (refreshToken) {
+      const newToken = await apiRefreshToken();
+      if (newToken) {
+        headers.set('Authorization', `Bearer ${newToken}`);
+        const retryConfig = { ...config, headers, _isRetry: true };
         try {
-          const refreshRes = await fetch('/api/auth/refresh/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ refresh_token: refreshToken }),
-          });
-
-          if (refreshRes.ok) {
-            const refreshData = await refreshRes.json();
-            const newToken = refreshData.access_token || refreshData.token;
-            if (newToken) {
-              sessionStorage.setItem('wf_token', newToken);
-              localStorage.setItem('wf_token', newToken);
-              headers.set('Authorization', `Bearer ${newToken}`);
-              const retryConfig = { ...config, headers, _isRetry: true };
-              response = await fetch(url, retryConfig);
-            }
-          }
-        } catch (_) {}
+          response = await fetch(url, retryConfig);
+        } catch (retryNetErr) {
+          const error = new Error('Network error during retry.');
+          error.status = 0;
+          error.code = 'NETWORK_ERROR';
+          error.originalError = retryNetErr;
+          throw error;
+        }
       }
     }
 
-    // If still 401 after retry or refresh failure, clear stale tab credentials
     if (response.status === 401) {
-      sessionStorage.removeItem('wf_token');
-      sessionStorage.removeItem('wf_refresh_token');
-      localStorage.removeItem('wf_token');
-      localStorage.removeItem('wf_refresh_token');
+      clearAuthTokens();
     }
   }
-
-
 
   if (response.status === 204) {
     return null;
@@ -100,12 +145,14 @@ export async function apiRequest(path, options = {}) {
   const data = isJson ? await response.json() : await response.text();
 
   if (!response.ok) {
-    const error = new Error(
+    const errorMsg =
       (data && data.error) ||
       (data && data.detail) ||
-      (data && typeof data === 'object' ? JSON.stringify(data) : 'Request failed')
-    );
+      (data && typeof data === 'object' ? JSON.stringify(data) : 'Request failed');
+
+    const error = new Error(errorMsg);
     error.status = response.status;
+    error.code = (data && data.code) || classifyApiError(response.status, data);
     error.data = data;
     throw error;
   }

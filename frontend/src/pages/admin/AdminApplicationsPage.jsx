@@ -99,8 +99,6 @@ export function AdminApplicationsPage() {
 
       return matchesSearch && matchesService;
     });
-
-    return list.sort((a, b) => (b.id || 0) - (a.id || 0));
   }, [applications, searchTerm, serviceFilter]);
 
   // Pagination slice

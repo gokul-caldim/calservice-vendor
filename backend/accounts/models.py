@@ -56,7 +56,7 @@ class User(AbstractBaseUser):
 
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.EMPLOYEE)
     bio = models.TextField(blank=True, default="")
-    phone = models.CharField(max_length=30, blank=True, default="")
+    phone = models.CharField(max_length=30, unique=True, null=True, blank=True)
     mobile_number = models.CharField(max_length=15, unique=True, null=True, blank=True, db_index=True)
     profile_complete = models.BooleanField(default=False)
     last_known_location = models.JSONField(null=True, blank=True, default=dict)
@@ -79,6 +79,13 @@ class User(AbstractBaseUser):
     class Meta:
         managed = False
         db_table = "accounts_user"
+
+    def save(self, *args, **kwargs):
+        if not self.phone:
+            self.phone = None
+        if not self.mobile_number:
+            self.mobile_number = None
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.username

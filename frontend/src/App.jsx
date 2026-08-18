@@ -32,6 +32,7 @@ import { AdminSchedulingPage } from './pages/admin/AdminSchedulingPage.jsx';
 import { AdminAttendancePage } from './pages/admin/AdminAttendancePage.jsx';
 import { AdminLeavePage } from './pages/admin/AdminLeavePage.jsx';
 import { AdminSkillsPage } from './pages/admin/AdminSkillsPage.jsx';
+import { CustomerTrackingPage } from './pages/CustomerTrackingPage.jsx';
 
 function RootRedirect() {
   const { isReady, isAuthenticated, isAdmin, registrationStatus } = useAuth();
@@ -361,6 +362,10 @@ export function App() {
               </AdminRoute>
             }
           />
+
+          {/* Customer Live Technician Tracking (Standalone Public View, Auth enforced by API) */}
+          <Route path="/track/:jobId" element={<CustomerTrackingPage />} />
+          <Route path="/workforce/customer/track/:jobId" element={<CustomerTrackingPage />} />
 
           {/* Fallback */}
           <Route path="*" element={<Navigate to="/workforce/login" replace />} />

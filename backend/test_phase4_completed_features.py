@@ -172,6 +172,8 @@ def run_tests():
             customer_name=f"{customer_user.first_name} {customer_user.last_name}",
             phone="9876543210",
             address="Indiranagar 100ft Rd, Bengaluru",
+            latitude=12.9716,
+            longitude=77.5946,
             service_category="Air Conditioner",
             issue_title=issue_title,
             description="AC servicing required.",

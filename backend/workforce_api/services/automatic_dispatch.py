@@ -488,9 +488,10 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS) 
         )
 
         if not candidates:
-            if job_obj.status != "unassigned":
+            if job_obj.status != "unassigned" or job_obj.assigned_employee is not None:
                 job_obj.status = "unassigned"
-                job_obj.save(update_fields=["status"])
+                job_obj.assigned_employee = None
+                job_obj.save(update_fields=["status", "assigned_employee"])
 
             logger.info(f"[DISPATCH_NO_CANDIDATE] No eligible technician found for Job #{job_id}.")
             admin_user = get_user_model().objects.filter(role="admin").first()

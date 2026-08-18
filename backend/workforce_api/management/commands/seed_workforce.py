@@ -21,12 +21,12 @@ class Command(BaseCommand):
     help = "Seeds Admin, Technician Employee, Candidate, and Sample Jobs for Workforce App."
 
     def handle(self, *args, **options):
-        self.stdout.write(self.style.NOTICE("─── Seeding Workforce Data ───"))
+        self.stdout.write(self.style.NOTICE("=== Seeding Workforce Data ==="))
 
         # 1. Ensure Region & Company
         region, _ = Region.objects.get_or_create(
             code="IN",
-            defaults={"name": "India", "currency": "INR", "currency_symbol": "₹"},
+            defaults={"name": "India", "currency": "INR", "currency_symbol": "Rs"},
         )
 
         company = Company.objects.first()
@@ -270,8 +270,8 @@ class Command(BaseCommand):
             job.save()
             self.stdout.write(self.style.SUCCESS(f"Updated Sample Job #{job.id} ({job.request_id}) status to ASSIGNED."))
 
-        self.stdout.write(self.style.NOTICE("─── Seeding Complete! ───"))
+        self.stdout.write(self.style.NOTICE("=== Seeding Complete! ==="))
         self.stdout.write(self.style.SUCCESS("Logins ready:"))
-        self.stdout.write(f"  • Admin:      admin@caldim.in    / Caldim@2026 (Routes to Admin Verification Queue)")
-        self.stdout.write(f"  • Employee:   employee@caldim.in / Caldim@2026 (Routes to Technician Dashboard)")
-        self.stdout.write(f"  • Candidate:  candidate@caldim.in / Caldim@2026 (Shows in Admin Review Queue)")
+        self.stdout.write(f"  * Admin:      admin@caldim.in    / Caldim@2026 (Routes to Admin Verification Queue)")
+        self.stdout.write(f"  * Employee:   employee@caldim.in / Caldim@2026 (Routes to Technician Dashboard)")
+        self.stdout.write(f"  * Candidate:  candidate@caldim.in / Caldim@2026 (Shows in Admin Review Queue)")

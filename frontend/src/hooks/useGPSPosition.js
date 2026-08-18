@@ -13,10 +13,12 @@
  *  - Only real browser GPS is used. No manual override of live coordinates.
  *  - Respects 5-minute update interval + 10m movement threshold to avoid flooding.
  *  - Cleans up on unmount: clears watchers and intervals.
- *  - Returns structured error states for permission denial and timeout.
+ *  - Circuit breaker: Stops GPS transmissions immediately if auth token is missing/expired to prevent 401 spam.
+ *  - Enforces EXACTLY ONE continuous watcher invariant.
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { getAccessToken } from '../utils/authTokens.js';
 
 // Minimum distance (metres) that must be exceeded before a new position is reported
 const MOVEMENT_THRESHOLD_METRES = 10;
@@ -42,13 +44,7 @@ function haversineMetres(lat1, lng1, lat2, lng2) {
 
 /**
  * Returns a Promise that resolves with the current GeolocationPosition, or
- * rejects with a structured error object:
- *   { code: 'PERMISSION_DENIED' | 'POSITION_UNAVAILABLE' | 'TIMEOUT' | 'UNSUPPORTED', message }
- *
- * Implements robust multi-tier fallback:
- * 1. Tries high accuracy (GPS hardware) for 6s.
- * 2. If it times out or returns POSITION_UNAVAILABLE (common on laptops/desktops without GPS chips),
- *    automatically falls back to standard accuracy (Wi-Fi/IP network geolocation).
+ * rejects with a structured error object.
  */
 export function getGPSPosition(preferHighAccuracy = true) {
   return new Promise((resolve, reject) => {
@@ -61,9 +57,7 @@ export function getGPSPosition(preferHighAccuracy = true) {
       navigator.geolocation.getCurrentPosition(
         (pos) => resolve(pos),
         (err) => {
-          // If high-accuracy timed out (code 3) or failed as unavailable (code 2), retry with standard accuracy
           if (!isFallback && (err.code === 3 || err.code === 2 || err.code === err.TIMEOUT || err.code === err.POSITION_UNAVAILABLE)) {
-            console.warn(`[GPS] High accuracy request failed (${err.message}). Retrying with standard accuracy...`);
             tryPosition(false, 10000, 300000, true);
             return;
           }
@@ -97,13 +91,7 @@ export function getGPSPosition(preferHighAccuracy = true) {
 }
 
 /**
- * useGPSPosition hook.
- *
- * Resolves a single GPS position on demand.
- * Returns { position, error, loading, refresh }.
- *
- * position: { latitude, longitude, accuracy } or null
- * error: structured error object or null
+ * useGPSPosition hook for one-shot coordinate resolution.
  */
 export function useGPSPosition() {
   const [position, setPosition] = useState(null);
@@ -133,9 +121,6 @@ export function useGPSPosition() {
 /**
  * Location Adapter Abstraction (Mobile & Web Architecture)
  */
-/**
- * Location Adapter Abstraction (Mobile & Web Architecture)
- */
 export class WebGeolocationAdapter {
   watch(onSuccess, onError, options) {
     if (typeof window === 'undefined' || !navigator.geolocation) {
@@ -145,9 +130,7 @@ export class WebGeolocationAdapter {
     return navigator.geolocation.watchPosition(
       onSuccess,
       (err) => {
-        // If high accuracy failed/timed out, try watching with standard accuracy
         if (options?.enableHighAccuracy && (err.code === 2 || err.code === 3)) {
-          console.warn('[GPS] watchPosition high accuracy failed, falling back to standard accuracy.');
           try {
             navigator.geolocation.clearWatch(this._watchId);
           } catch (_) {}
@@ -181,7 +164,6 @@ export class WebGeolocationAdapter {
       onSuccess,
       (err) => {
         if (options?.enableHighAccuracy && (err.code === 2 || err.code === 3)) {
-          console.warn('[GPS] getCurrentPosition high accuracy failed, retrying with standard accuracy.');
           navigator.geolocation.getCurrentPosition(onSuccess, onError, {
             enableHighAccuracy: false,
             timeout: 15000,
@@ -202,23 +184,25 @@ const defaultLocationAdapter = new WebGeolocationAdapter();
  * useLocationTracker hook.
  *
  * Single centralized continuous GPS watcher for employee session.
- * Starts live GPS tracking automatically when `active` is true (e.g. employee is ONLINE).
- * Calls `onPositionChange({ latitude, longitude, accuracy, speed, heading, captured_at })`
- * on every valid fix (movement > MOVEMENT_THRESHOLD_METRES or periodic interval).
- *
- * @param {boolean} active  - Start tracking when true, stop when false.
- * @param {Function} onPositionChange - Callback with position data.
- * @param {Function} [onError]  - Optional callback for structured errors.
- * @param {Object} [adapter]  - Optional location adapter (defaults to WebGeolocationAdapter).
+ * Starts live GPS tracking automatically when `active` is true (e.g. employee is ONLINE & authenticated).
+ * Incorporates an authentication circuit breaker so unauthenticated or expired states do NOT spam location requests.
  */
 export function useLocationTracker(active, onPositionChange, onError, adapter = defaultLocationAdapter) {
   const lastPositionRef = useRef(null);
   const lastReportedTimeRef = useRef(0);
   const watchIdRef = useRef(null);
   const intervalRef = useRef(null);
+  const isAuthValidRef = useRef(true);
 
   const handlePosition = useCallback(
     (pos) => {
+      // Circuit breaker: check token presence
+      const token = getAccessToken();
+      if (!token) {
+        isAuthValidRef.current = false;
+        return;
+      }
+
       const { latitude, longitude, accuracy, speed, heading } = pos.coords;
       const now = Date.now();
       const last = lastPositionRef.current;
@@ -264,6 +248,7 @@ export function useLocationTracker(active, onPositionChange, onError, adapter = 
 
   // Force-poll on interval in case watcher is idle
   const forcePoll = useCallback(() => {
+    if (!getAccessToken()) return;
     adapter.getCurrentPosition(handlePosition, handleError, {
       enableHighAccuracy: true,
       timeout: 10_000,
@@ -272,8 +257,9 @@ export function useLocationTracker(active, onPositionChange, onError, adapter = 
   }, [handlePosition, handleError, adapter]);
 
   useEffect(() => {
-    if (!active) {
-      // Stop tracking when offline/inactive
+    const hasToken = Boolean(getAccessToken());
+    if (!active || !hasToken) {
+      // Stop tracking when offline, inactive, or unauthenticated
       if (watchIdRef.current !== null) {
         adapter.clearWatch(watchIdRef.current);
         watchIdRef.current = null;
@@ -287,7 +273,7 @@ export function useLocationTracker(active, onPositionChange, onError, adapter = 
       return;
     }
 
-    // Start single continuous watch when active (ONLINE)
+    // Start single continuous watch when active and authenticated
     watchIdRef.current = adapter.watch(handlePosition, handleError, {
       enableHighAccuracy: true,
       timeout: 10_000,
@@ -312,4 +298,3 @@ export function useLocationTracker(active, onPositionChange, onError, adapter = 
     };
   }, [active, handlePosition, handleError, forcePoll, adapter]);
 }
-

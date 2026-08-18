@@ -42,6 +42,7 @@ import { Modal } from '../../components/enterprise/Modal.jsx';
 import { ErrorState } from '../../components/enterprise/ErrorState.jsx';
 import { LiveCameraCaptureModal } from '../../components/common/LiveCameraCaptureModal.jsx';
 import { useLocationTracker, getGPSPosition } from '../../hooks/useGPSPosition.js';
+import { useRealtimeStream } from '../../hooks/useRealtimeStream.js';
 import { apiUpdateLocationFull } from '../../api/workforceService.js';
 import {
   Wrench,
@@ -75,7 +76,7 @@ import {
 } from 'lucide-react';
 
 export function EmployeeDashboardPage() {
-  const { user, employee, togglePresence } = useAuth();
+  const { user, employee, togglePresence, logout, isAuthenticated } = useAuth();
   const location = useLocation();
   const pathname = location.pathname;
   const hash = location.hash;
@@ -101,10 +102,20 @@ export function EmployeeDashboardPage() {
     (j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired
   );
   const activeJobs = allJobs.filter(
-    (j) => !['completed', 'cancelled'].includes((j.status || '').toLowerCase()) && j.active_offer?.status !== 'OFFERED'
+    (j) =>
+      ['accepted', 'on_the_way', 'arrived', 'in_progress', 'follow_up_required'].includes((j.status || '').toLowerCase()) &&
+      j.active_offer?.status !== 'OFFERED'
   );
   const completedJobs = allJobs.filter((j) => (j.status || '').toLowerCase() === 'completed');
-  const displayedJobs = jobQueueTab === 'completed' ? completedJobs : (jobQueueTab === 'all' ? allJobs : activeJobs);
+  const displayedJobs = jobQueueTab === 'completed'
+    ? completedJobs
+    : (jobQueueTab === 'all'
+        ? allJobs.filter(
+            (j) =>
+              ['accepted', 'on_the_way', 'arrived', 'in_progress', 'follow_up_required', 'completed'].includes((j.status || '').toLowerCase()) ||
+              (j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired)
+          )
+        : activeJobs);
 
   const isOnline = Boolean(user?.isOnline || employee?.is_online);
   const isClockedIn = Boolean(timeTracking?.is_clocked_in);
@@ -407,10 +418,17 @@ export function EmployeeDashboardPage() {
       setProfile(profileData || employee);
       setTimeTracking(timeData);
 
-      const active = safeJobs.filter((j) => !['completed', 'cancelled'].includes((j.status || '').toLowerCase()));
+      const active = safeJobs.filter(
+        (j) =>
+          ['accepted', 'on_the_way', 'arrived', 'in_progress', 'follow_up_required'].includes((j.status || '').toLowerCase()) &&
+          j.active_offer?.status !== 'OFFERED'
+      );
       const completed = safeJobs.filter((j) => (j.status || '').toLowerCase() === 'completed');
+      const incoming = safeJobs.filter((j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired);
 
-      if (jobQueueTab === 'completed') {
+      if (incoming.length > 0) {
+        setSelectedJob((prev) => (prev && incoming.some((j) => j.id === prev.id) ? prev : incoming[0]));
+      } else if (jobQueueTab === 'completed') {
         if (completed.length > 0) {
           setSelectedJob((prev) => (prev ? completed.find((j) => j.id === prev.id) || completed[0] : completed[0]));
         } else {
@@ -464,31 +482,23 @@ export function EmployeeDashboardPage() {
     return () => window.removeEventListener('workforce:location-updated', handleLocationUpdate);
   }, []);
 
-  // Realtime Event Stream Integration (SSE): instantaneous job offer delivery
-  useEffect(() => {
-    if (!isOnline) return;
-    let eventSource = null;
-    try {
-      const token = localStorage.getItem('token') || localStorage.getItem('access_token') || sessionStorage.getItem('token') || '';
-      const streamUrl = token ? `/api/workforce/realtime/stream/?token=${encodeURIComponent(token)}` : '/api/workforce/realtime/stream/';
-      eventSource = new EventSource(streamUrl);
-      eventSource.addEventListener('workforce_event', (e) => {
-        try {
-          const data = JSON.parse(e.data);
-          if (['OFFER_CREATED', 'JOB_OFFER', 'JOB_ASSIGNED', 'ARRIVAL_DETECTED'].includes(data.event_type)) {
-            loadDashboard();
-          }
-        } catch (_) {}
-      });
-      eventSource.onerror = () => {
-        if (eventSource) eventSource.close();
-      };
-    } catch (_) {}
+  // Realtime Event Stream Integration (SSE): instantaneous job offer delivery with backoff & auto-recovery
+  const handleRealtimeEvent = useCallback((eventData) => {
+    if (['OFFER_CREATED', 'JOB_OFFER', 'JOB_ASSIGNED', 'ARRIVAL_DETECTED', 'JOB_COMPLETED', 'JOB_LOCATION_UPDATE'].includes(eventData.event_type)) {
+      loadDashboard();
+    }
+  }, [loadDashboard]);
 
-    return () => {
-      if (eventSource) eventSource.close();
-    };
-  }, [isOnline, loadDashboard]);
+  const handleAuthFailure = useCallback(() => {
+    logout();
+  }, [logout]);
+
+  useRealtimeStream({
+    enabled: Boolean(isOnline && isAuthenticated),
+    onEvent: handleRealtimeEvent,
+    onReconcile: loadDashboard,
+    onAuthFailure: handleAuthFailure,
+  });
 
   // Silent background job queue safety-net polling when technician is ONLINE (12s interval)
   useEffect(() => {
@@ -500,11 +510,16 @@ export function EmployeeDashboardPage() {
           setAllJobs(jobsData);
           setJobs(jobsData);
           const active = jobsData.filter(
-            (j) => !['completed', 'cancelled'].includes((j.status || '').toLowerCase()) && j.active_offer?.status !== 'OFFERED'
+            (j) =>
+              ['accepted', 'on_the_way', 'arrived', 'in_progress', 'follow_up_required'].includes((j.status || '').toLowerCase()) &&
+              j.active_offer?.status !== 'OFFERED'
           );
           const completed = jobsData.filter((j) => (j.status || '').toLowerCase() === 'completed');
+          const incoming = jobsData.filter((j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired);
 
-          if (jobQueueTab === 'active') {
+          if (incoming.length > 0) {
+            setSelectedJob((prev) => (prev && incoming.some((j) => j.id === prev.id) ? prev : incoming[0]));
+          } else if (jobQueueTab === 'active') {
             if (active.length === 0) setSelectedJob(null);
             else setSelectedJob((prev) => (prev ? active.find((j) => j.id === prev.id) || active[0] : active[0]));
           } else if (jobQueueTab === 'completed') {
@@ -513,9 +528,9 @@ export function EmployeeDashboardPage() {
           }
 
           // If a new offer is available, auto-focus it in the workspace
-          const offeredJob = jobsData.find((j) => j.active_offer?.status === 'OFFERED' || j.offer_status === 'OFFERED');
+          const offeredJob = jobsData.find((j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired);
           if (offeredJob) {
-            setSelectedJob((prev) => (!prev || (prev.active_offer?.status !== 'OFFERED' && prev.offer_status !== 'OFFERED') ? offeredJob : prev));
+            setSelectedJob((prev) => (!prev || (prev.active_offer?.status !== 'OFFERED') ? offeredJob : prev));
             if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
               try {
                 new Notification('⚡ New Exclusive Job Offer!', {
@@ -697,15 +712,19 @@ export function EmployeeDashboardPage() {
   const handleConfirmDeclineOffer = async (e) => {
     if (e) e.preventDefault();
     if (!declineModalJob) return;
+    const decliningId = declineModalJob.id;
     const finalReason = selectedDeclineReason === 'Other'
       ? (customDeclineReason.trim() || 'Other reason')
       : selectedDeclineReason;
 
     try {
       setIsDecliningOffer(true);
-      setActionLoading(declineModalJob.id);
-      await apiRejectJobOffer(declineModalJob.id, finalReason);
+      setActionLoading(decliningId);
+      await apiRejectJobOffer(decliningId, finalReason);
       setDeclineModalJob(null);
+      setAllJobs((prev) => prev.filter((j) => j.id !== decliningId));
+      setJobs((prev) => prev.filter((j) => j.id !== decliningId));
+      setSelectedJob((prev) => (prev?.id === decliningId ? null : prev));
       setSuccessMsg('Job offer declined.');
       await loadDashboard();
       setTimeout(() => setSuccessMsg(''), 4000);
@@ -1586,7 +1605,7 @@ export function EmployeeDashboardPage() {
                               <span>{job.preferred_time || ''}</span>
                             </div>
 
-                            {(job.active_offer?.status === 'OFFERED' || job.status === 'job_offered') && (
+                            {(job.active_offer?.status === 'OFFERED' && !job.active_offer?.is_expired) && (
                               <div className="mt-2.5 p-2.5 rounded bg-amber-50 border border-amber-200 text-amber-900 space-y-2">
                                 <div className="flex items-center justify-between">
                                   <span className="font-bold text-[10px] text-amber-800 uppercase tracking-wider flex items-center gap-1">
@@ -1757,7 +1776,7 @@ export function EmployeeDashboardPage() {
                           Action Steps
                         </h3>
                         <div className="flex flex-wrap gap-2">
-                          {(selectedJob.status === 'assigned' || selectedJob.active_offer?.status === 'OFFERED' || selectedJob.status === 'job_offered') && (
+                          {(selectedJob.active_offer?.status === 'OFFERED' && !selectedJob.active_offer?.is_expired) && (
                             <div className="flex items-center gap-2">
                               <button
                                 type="button"

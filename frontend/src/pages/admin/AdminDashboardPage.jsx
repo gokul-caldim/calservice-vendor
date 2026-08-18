@@ -38,14 +38,16 @@ export function AdminDashboardPage() {
   const loadData = async () => {
     try {
       setIsLoading(true);
-      const [appsData, jobsData, leavesData] = await Promise.all([
+      const [appsData, jobsData, leavesData, fleetData] = await Promise.all([
         apiGetAdminApplications().catch(() => []),
         apiGetWorkforceJobs().catch(() => []),
         apiGetLeaves().catch(() => []),
+        apiGetFleetMap().catch(() => []),
       ]);
       setApplications(appsData || []);
       setJobs(jobsData || []);
       setLeaves(leavesData || []);
+      setFleet(fleetData || []);
     } catch (_) {
     } finally {
       setIsLoading(false);
