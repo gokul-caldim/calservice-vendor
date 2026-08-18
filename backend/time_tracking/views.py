@@ -86,6 +86,9 @@ class TimeLogViewSet(viewsets.ReadOnlyModelViewSet):
         emp = getattr(self.request.user, "employee_profile", None)
         if not emp:
             if getattr(self.request.user, "is_staff", False):
+                company = getattr(self.request.user, "company", None)
+                if company:
+                    return TimeLog.objects.filter(employee__company=company).prefetch_related("breaks", "photos").order_by("-clock_in")
                 return TimeLog.objects.all().prefetch_related("breaks", "photos").order_by("-clock_in")
             return TimeLog.objects.none()
 

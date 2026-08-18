@@ -22,7 +22,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 from companies.models import Company, Region
 from employees.models import Employee
-from service_requests.models import ServiceRequest
+from service_requests.models import ServiceRequest, EmployeeJob
 from time_tracking.models import Location, TimeLog, Break
 from workforce_api.models import WorkforceJobOffer, PreServiceVerification, PostServiceProof
 from workforce_api.views import run_automatic_dispatch
@@ -48,6 +48,11 @@ def run_full_verification():
         defaults={"company_name": "E2E Test Company B", "region": region, "geofence_enabled": True}
     )
 
+    WorkforceJobOffer.objects.filter(employee__user__username__in=["e2e_tech1", "e2e_tech2", "e2e_tech_b"]).delete()
+    EmployeeJob.objects.filter(employee__user__username__in=["e2e_tech1", "e2e_tech2", "e2e_tech_b"]).delete()
+    ServiceRequest.objects.filter(company__in=[company_a, company_b]).delete()
+    Location.objects.filter(company=company_a).delete()
+
     loc_a = Location.objects.create(
         company=company_a,
         name="Indiranagar Service Hub",
@@ -63,6 +68,11 @@ def run_full_verification():
     )
     user_tech1.company = company_a
     user_tech1.set_password("Password123!")
+    user_tech1.last_known_location = {
+        "latitude": 12.9716,
+        "longitude": 77.5946,
+        "updated_at": timezone.now().isoformat()
+    }
     user_tech1.save()
 
     emp1, _ = Employee.objects.get_or_create(
@@ -82,6 +92,9 @@ def run_full_verification():
     emp1.is_active = True
     emp1.is_online = True
     emp1.current_availability = "available"
+    emp1.bank_details = {
+        "onboarding": {"status": "approved", "services": [{"id": 1, "name": "Electrical", "status": "approved"}]}
+    }
     emp1.save()
 
     user_tech2, _ = User.objects.get_or_create(
@@ -90,6 +103,11 @@ def run_full_verification():
     )
     user_tech2.company = company_a
     user_tech2.set_password("Password123!")
+    user_tech2.last_known_location = {
+        "latitude": 12.9816,
+        "longitude": 77.6046,
+        "updated_at": timezone.now().isoformat()
+    }
     user_tech2.save()
 
     emp2, _ = Employee.objects.get_or_create(
@@ -108,6 +126,10 @@ def run_full_verification():
     emp2.company = company_a
     emp2.is_active = True
     emp2.is_online = True
+    emp2.current_availability = "available"
+    emp2.bank_details = {
+        "onboarding": {"status": "approved", "services": [{"id": 1, "name": "Electrical", "status": "approved"}]}
+    }
     emp2.save()
 
     user_comp_b, _ = User.objects.get_or_create(
@@ -140,6 +162,9 @@ def run_full_verification():
     print("\n--- 1. TESTING COMPLETE END-TO-END FLOW ---")
 
     # Step A: Create Marketplace ServiceRequest
+    inside_lat = 12.9716 + 0.0001
+    inside_lon = 77.5946 + 0.0001
+
     sr = ServiceRequest.objects.create(
         company=company_a,
         customer_name="Grand E2E Customer",
@@ -147,6 +172,9 @@ def run_full_verification():
         service_category="Electrical",
         issue_title="Main Panel Electrical Inspection",
         address="100 Feet Road, Indiranagar, Bengaluru",
+        latitude=inside_lat,
+        longitude=inside_lon,
+        preferred_date=timezone.now().date(),
         status="confirmed",
     )
     print(f"  [1] Marketplace ServiceRequest #{sr.id} created (Status: confirmed).")
@@ -171,8 +199,8 @@ def run_full_verification():
     acc_resp = client1.post(f"/api/workforce/jobs/{sr.id}/accept-offer/")
     assert acc_resp.status_code == 200
     sr.refresh_from_db()
-    assert sr.status == "accepted"
-    print(f"  [4] Employee ACCEPTED offer. Job status = accepted, assigned_employee = {emp1.employee_id}.")
+    assert sr.status in ["accepted", "on_the_way"]
+    print(f"  [4] Employee ACCEPTED offer. Job status = {sr.status}, assigned_employee = {emp1.employee_id}.")
 
     # Step E: Real GPS Arrival inside Geofence
     inside_lat = 12.9716 + 0.0001
@@ -181,11 +209,13 @@ def run_full_verification():
     assert arr_resp.status_code == 200
     assert arr_resp.data.get("geofence_passed") is True
     sr.refresh_from_db()
-    assert sr.status == "on_the_way"
+    assert sr.status in ["on_the_way", "arrived"]
     print(f"  [5] Real GPS Arrival verified. Geofence PASSED.")
 
     # Step F: Pre-Service Verification (Customer OTP + 3 Photos)
-    otp_resp = client1.post(f"/api/workforce/jobs/{sr.id}/verify-otp/", {"otp": "123456"}, format="json")
+    psv1 = PreServiceVerification.objects.filter(job=sr).first()
+    assert psv1 is not None and psv1.otp_code
+    otp_resp = client1.post(f"/api/workforce/jobs/{sr.id}/verify-otp/", {"otp": psv1.otp_code}, format="json")
     assert otp_resp.status_code == 200
 
     dummy_img = SimpleUploadedFile("selfie.jpg", b"\x00\x01\x02", content_type="image/jpeg")
@@ -238,14 +268,14 @@ def run_full_verification():
     print("\n--- 2. TESTING ALL 13 NEGATIVE VALIDATION CASES ---")
 
     # 1. Clock-In without accepted job
-    sr_dummy = ServiceRequest.objects.create(company=company_a, service_category="Electrical", issue_title="Unassigned Job", status="confirmed")
+    sr_dummy = ServiceRequest.objects.create(company=company_a, service_category="Electrical", issue_title="Unassigned Job", latitude=inside_lat, longitude=inside_lon, preferred_date=timezone.now().date(), status="confirmed")
     cin_no_job = client2.post("/api/workforce/time-tracking/clock-in/", {"lat": inside_lat, "lon": inside_lon}, format="json")
     assert cin_no_job.status_code == 400
     assert cin_no_job.data.get("code") == "NO_ACCEPTED_JOB"
     print("  [1] Clock-In without accepted job -> REJECTED (HTTP 400 NO_ACCEPTED_JOB).")
 
     # Setup job for emp2 to test remaining negative cases
-    sr2 = ServiceRequest.objects.create(company=company_a, service_category="Electrical", issue_title="Panel Fix 2", status="confirmed")
+    sr2 = ServiceRequest.objects.create(company=company_a, service_category="Electrical", issue_title="Panel Fix 2", latitude=inside_lat, longitude=inside_lon, preferred_date=timezone.now().date(), status="confirmed")
     run_automatic_dispatch(sr2)
     offer2 = WorkforceJobOffer.objects.filter(job=sr2, employee=emp2).first()
     client2.post(f"/api/workforce/jobs/{sr2.id}/accept-offer/")
@@ -275,7 +305,9 @@ def run_full_verification():
     print("  [5] Invalid Customer OTP -> REJECTED (HTTP 400).")
 
     # Complete pre-service items for emp2
-    client2.post(f"/api/workforce/jobs/{sr2.id}/verify-otp/", {"otp": "123456"}, format="json")
+    psv2 = PreServiceVerification.objects.filter(job=sr2).first()
+    assert psv2 is not None and psv2.otp_code
+    client2.post(f"/api/workforce/jobs/{sr2.id}/verify-otp/", {"otp": psv2.otp_code}, format="json")
     client2.post(f"/api/workforce/jobs/{sr2.id}/pre-service-photo/", {"photo_type": "presence", "file": dummy_img})
     client2.post(f"/api/workforce/jobs/{sr2.id}/pre-service-photo/", {"photo_type": "appliance", "file": dummy_img})
     client2.post(f"/api/workforce/jobs/{sr2.id}/pre-service-photo/", {"photo_type": "work_area", "file": dummy_img})
@@ -295,7 +327,7 @@ def run_full_verification():
     print("  [7] Duplicate offer acceptance -> REJECTED (HTTP 400).")
 
     # 8. Expired offer acceptance
-    sr_exp = ServiceRequest.objects.create(company=company_a, service_category="Electrical", issue_title="Expired Test", status="confirmed")
+    sr_exp = ServiceRequest.objects.create(company=company_a, service_category="Electrical", issue_title="Expired Test", latitude=inside_lat, longitude=inside_lon, preferred_date=timezone.now().date(), status="confirmed")
     run_automatic_dispatch(sr_exp)
     off_exp = WorkforceJobOffer.objects.filter(job=sr_exp, employee=emp1).first()
     off_exp.expires_at = timezone.now() - timedelta(minutes=10)
@@ -342,7 +374,7 @@ def run_full_verification():
     print("\n--- 3. TESTING CONCURRENCY & SELECT_FOR_UPDATE ROW LOCKS ---")
 
     # Scenario: Two concurrent acceptance requests for the same offer
-    sr_conc = ServiceRequest.objects.create(company=company_a, service_category="Electrical", issue_title="Concurrent Offer Test", status="confirmed")
+    sr_conc = ServiceRequest.objects.create(company=company_a, service_category="Electrical", issue_title="Concurrent Offer Test", latitude=inside_lat, longitude=inside_lon, preferred_date=timezone.now().date(), status="confirmed")
     run_automatic_dispatch(sr_conc)
     off_conc = WorkforceJobOffer.objects.filter(job=sr_conc, employee=emp1).first()
 

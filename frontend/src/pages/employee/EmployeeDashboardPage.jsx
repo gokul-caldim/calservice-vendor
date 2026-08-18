@@ -39,6 +39,7 @@ import { LiveCameraCaptureModal } from '../../components/common/LiveCameraCaptur
 import { classifyApiError } from '../../utils/apiErrorHandler.js';
 import { getEmployeeJobPresentation } from '../../utils/jobPresentation.js';
 import { useLocationTracker, getGPSPosition } from '../../hooks/useGPSPosition.js';
+import { useRealtimeStream } from '../../hooks/useRealtimeStream.js';
 import { apiUpdateLocationFull } from '../../api/workforceService.js';
 import {
   Wrench,
@@ -72,7 +73,7 @@ import {
 } from 'lucide-react';
 
 export function EmployeeDashboardPage() {
-  const { user, employee, togglePresence } = useAuth();
+  const { user, employee, togglePresence, logout, isAuthenticated } = useAuth();
   const location = useLocation();
   const pathname = location.pathname;
   const hash = location.hash;
@@ -537,10 +538,17 @@ export function EmployeeDashboardPage() {
       setProfile(profileData || employee);
       setTimeTracking(timeData);
 
-      const active = safeJobs.filter((j) => !['completed', 'cancelled'].includes((j.status || '').toLowerCase()));
+      const active = safeJobs.filter(
+        (j) =>
+          ['accepted', 'on_the_way', 'arrived', 'in_progress', 'follow_up_required'].includes((j.status || '').toLowerCase()) &&
+          j.active_offer?.status !== 'OFFERED'
+      );
       const completed = safeJobs.filter((j) => (j.status || '').toLowerCase() === 'completed');
+      const incoming = safeJobs.filter((j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired);
 
-      if (jobQueueTab === 'completed') {
+      if (incoming.length > 0) {
+        setSelectedJob((prev) => (prev && incoming.some((j) => j.id === prev.id) ? prev : incoming[0]));
+      } else if (jobQueueTab === 'completed') {
         if (completed.length > 0) {
           setSelectedJob((prev) => (prev ? completed.find((j) => j.id === prev.id) || completed[0] : completed[0]));
         } else {
@@ -703,7 +711,9 @@ export function EmployeeDashboardPage() {
             return p && (p.state === 'COMPLETED' || (j.status || '').toLowerCase() === 'completed');
           });
 
-          if (jobQueueTab === 'active') {
+          if (incoming.length > 0) {
+            setSelectedJob((prev) => (prev && incoming.some((j) => j.id === prev.id) ? prev : incoming[0]));
+          } else if (jobQueueTab === 'active') {
             if (active.length === 0) setSelectedJob(null);
             else setSelectedJob((prev) => (prev ? active.find((j) => j.id === prev.id) || active[0] : active[0]));
           } else if (jobQueueTab === 'completed') {
@@ -958,15 +968,19 @@ export function EmployeeDashboardPage() {
   const handleConfirmDeclineOffer = async (e) => {
     if (e) e.preventDefault();
     if (!declineModalJob) return;
+    const decliningId = declineModalJob.id;
     const finalReason = selectedDeclineReason === 'Other'
       ? (customDeclineReason.trim() || 'Other reason')
       : selectedDeclineReason;
 
     try {
       setIsDecliningOffer(true);
-      setActionLoading(declineModalJob.id);
-      await apiRejectJobOffer(declineModalJob.id, finalReason);
+      setActionLoading(decliningId);
+      await apiRejectJobOffer(decliningId, finalReason);
       setDeclineModalJob(null);
+      setAllJobs((prev) => prev.filter((j) => j.id !== decliningId));
+      setJobs((prev) => prev.filter((j) => j.id !== decliningId));
+      setSelectedJob((prev) => (prev?.id === decliningId ? null : prev));
       setSuccessMsg('Job offer declined.');
       await loadDashboard();
       setTimeout(() => setSuccessMsg(''), 4000);

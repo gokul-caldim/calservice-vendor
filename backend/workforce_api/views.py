@@ -24,6 +24,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.response import Response
+from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -459,7 +460,10 @@ class WorkforceAdminApplicationsListView(APIView):
 
     def get(self, request):
         status_filter = request.query_params.get("status", "").strip().lower()
+        company = getattr(request.user, "company", None)
         employees = Employee.objects.select_related("user", "company").order_by("-id")
+        if company:
+            employees = employees.filter(company=company)
 
         results = []
         for emp in employees:
@@ -1146,6 +1150,7 @@ class WorkforceJobListView(APIView):
             except Exception:
                 emp_job_sr_ids = []
 
+            # Only return jobs assigned to the employee or actively offered (unexpired)
             qs = ServiceRequest.objects.filter(
                 Q(assigned_employee=emp, status__in=ACTIVE_WORKLOAD_STATUSES + ["completed", "cancelled"]) |
                 Q(id__in=offered_job_ids) |
@@ -2361,23 +2366,59 @@ class WorkforceJobRejectOfferView(APIView):
 
         with transaction.atomic():
             job_obj = ServiceRequest.objects.select_for_update().filter(pk=pk).first()
+            if not job_obj:
+                return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+
+            from service_requests.models import EmployeeJob
+            from workforce_api.models import WorkforceEventLog
+
             offer = WorkforceJobOffer.objects.select_for_update().filter(
                 job=job_obj,
-                employee=emp,
-                status="OFFERED"
-            ).first()
+                employee=emp
+            ).order_by("-id").first()
 
             if offer:
                 offer.status = "REJECTED"
                 offer.rejection_reason = reason
-                offer.save()
+                offer.save(update_fields=["status", "rejection_reason"])
+            else:
+                WorkforceJobOffer.objects.create(
+                    job=job_obj,
+                    employee=emp,
+                    status="REJECTED",
+                    rejection_reason=reason,
+                    expires_at=timezone.now()
+                )
 
             if job_obj.assigned_employee == emp:
                 job_obj.assigned_employee = None
-                job_obj.save()
+                job_obj.save(update_fields=["assigned_employee"])
+
+            # Clean up / remove any uncompleted EmployeeJob records for this declining employee
+            EmployeeJob.objects.filter(
+                service_request=job_obj,
+                employee=emp
+            ).exclude(status="COMPLETED").delete()
+
+            WorkforceEventLog.objects.create(
+                user=emp.user,
+                event_type="OFFER_REJECTED",
+                payload={"job_id": job_obj.id, "employee_id": emp.id, "reason": reason}
+            )
 
             # Trigger immediate dispatch to next ranked technician
             success, msg = run_automatic_dispatch(job_obj)
+
+            # Ensure job is properly marked unassigned if no other candidate received it
+            job_obj.refresh_from_db()
+            has_new_offer = WorkforceJobOffer.objects.filter(
+                job=job_obj,
+                status="OFFERED",
+                expires_at__gt=timezone.now()
+            ).exists()
+            if not has_new_offer and job_obj.assigned_employee is None and job_obj.status == "assigned":
+                job_obj.status = "unassigned"
+                job_obj.save(update_fields=["status"])
 
             return Response({
                 "message": f"Job offer declined. Next candidate dispatch status: {msg}",
@@ -3489,8 +3530,12 @@ class WorkforceLeaveListView(APIView):
         emp = getattr(user, "employee_profile", None)
 
         if is_admin_role(user):
-            # Admin sees ALL leave applications across the workforce
-            all_employees = Employee.objects.filter(is_active=True).select_related("user")
+            # Admin sees leave applications for their company workforce
+            company = getattr(user, "company", None)
+            emp_qs = Employee.objects.filter(is_active=True)
+            if company:
+                emp_qs = emp_qs.filter(company=company)
+            all_employees = emp_qs.select_related("user")
             all_leaves = []
             for e in all_employees:
                 e_leaves = (e.bank_details or {}).get("leaves", [])
@@ -4058,7 +4103,6 @@ class WorkforceJobLiveTrackingView(APIView):
                 "updated_at": now.isoformat(),
             }, status=status.HTTP_200_OK)
 
-        tech = job.assigned_employee
         tech_loc = None
         age_seconds = None
         freshness_state = "LOCATION_LOST"
@@ -4159,8 +4203,13 @@ class WorkforceJobLiveTrackingView(APIView):
                 "id": tech.id if tech else None,
                 "name": (tech.user.get_full_name() or tech.user.username) if tech and tech.user else None,
                 "phone": tech.phone if tech else "",
+                "title": (tech.title or "Service Partner") if tech else "",
+                "photo": tech_photo,
+                "rating": tech_rating,
                 "location": tech_loc,
             } if tech else None,
+            "technician_photo": tech_photo,
+            "technician_rating": tech_rating,
             "distance_m": distance_m,
             "geofence_passed": geofence_passed,
             "geofence_radius_meters": 300.0,
@@ -4709,18 +4758,31 @@ class WorkforceRealtimeStreamView(APIView):
                 logger.warning("WorkforceRealtimeStream token validation error: %s", str(e))
                 user = None
 
-        if not user or not user.is_authenticated:
+        if not user or not user.is_authenticated or not getattr(user, "is_active", True):
             return Response({"error": "Authentication required for realtime stream."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        user_company_id = getattr(user, "company_id", None)
+        is_admin = is_admin_role(user)
 
         def event_stream():
             last_id = 0
             yield f"event: ping\ndata: {json.dumps({'status': 'connected', 'timestamp': timezone.now().isoformat()})}\n\n"
 
             for _ in range(15):
-                events = WorkforceEventLog.objects.filter(id__gt=last_id).order_by("id")[:10]
+                events = WorkforceEventLog.objects.filter(id__gt=last_id).select_related("user").order_by("id")[:10]
                 for ev in events:
                     last_id = ev.id
-                    if ev.user is None or ev.user == user or is_admin_role(user):
+                    if ev.user_id == user.id:
+                        is_authorized = True
+                    elif is_admin:
+                        is_authorized = (ev.user is None) or (getattr(ev.user, "company_id", None) == user_company_id) or user.is_superuser
+                    elif ev.user is None:
+                        ev_company_id = ev.payload.get("company_id") if isinstance(ev.payload, dict) else None
+                        is_authorized = (ev_company_id is None or ev_company_id == user_company_id)
+                    else:
+                        is_authorized = False
+
+                    if is_authorized:
                         event_data = {
                             "id": ev.id,
                             "event_type": ev.event_type,

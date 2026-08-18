@@ -169,6 +169,12 @@ class ServiceRequest(models.Model):
         null=True, blank=True,
         related_name="assigned_service_requests",
     )
+    technician_name = models.CharField(max_length=200, blank=True, default="")
+    technician_phone = models.CharField(max_length=50, blank=True, default="")
+    technician_photo = models.CharField(max_length=500, blank=True, default="")
+    payment_collected_by_name = models.CharField(max_length=200, blank=True, default="")
+    collection_method = models.CharField(max_length=50, blank=True, default="")
+    collection_reference = models.CharField(max_length=100, blank=True, default="")
 
     workforce_job_id = models.CharField(max_length=100, blank=True, default="")
     external_assignment_id = models.CharField(max_length=100, blank=True, default="")
