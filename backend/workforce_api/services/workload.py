@@ -6,8 +6,8 @@ Enforces the core business rule: ONE EMPLOYEE = ONE ACTIVE JOB AT A TIME.
 
 Active Workload Lifecycle:
     AVAILABLE -> OFFERED -> ACCEPTED -> BUSY -> ON_THE_WAY -> ARRIVED ->
-    IN_PROGRESS -> PROOF_SUBMITTED -> SERVICE_COMPLETED -> PAYMENT_PENDING / CASH_PENDING ->
-    COMPLETED / CLOSED -> AVAILABLE
+    IN_PROGRESS -> PROOF_SUBMITTED -> (JobPayment PAID Gate) ->
+    COMPLETED -> AVAILABLE
 """
 import logging
 from typing import Optional, List, Tuple
@@ -17,22 +17,21 @@ from django.utils import timezone
 logger = logging.getLogger("workforce.workload")
 
 # Authoritative definition of all statuses where an employee is actively responsible for a job
+# Strictly contains valid ServiceRequest.Status lifecycle values (Payment states are separated)
 ACTIVE_WORKLOAD_STATUSES: List[str] = [
     "accepted",
     "on_the_way",
+    "en_route",
     "arrived",
     "in_progress",
     "proof_submitted",
-    "service_completed",
-    "payment_pending",
-    "cash_pending",
 ]
 
 # Terminal statuses where an assignment has fully ended
 TERMINAL_WORKLOAD_STATUSES: List[str] = [
     "completed",
-    "closed",
     "cancelled",
+    "unable_to_complete",
     "redispatching",
     "unassigned",
 ]

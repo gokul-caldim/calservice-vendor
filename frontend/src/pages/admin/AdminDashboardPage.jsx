@@ -3,7 +3,6 @@ import { Link } from 'react-router-dom';
 import {
   apiGetAdminApplications,
   apiGetWorkforceJobs,
-  apiGetLeaves,
   apiGetFleetMap,
 } from '../../api/workforceService.js';
 import { AppShell } from '../../components/common/AppShell.jsx';
@@ -29,7 +28,6 @@ import {
 export function AdminDashboardPage() {
   const [applications, setApplications] = useState([]);
   const [jobs, setJobs] = useState([]);
-  const [leaves, setLeaves] = useState([]);
   const [fleet, setFleet] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -38,14 +36,12 @@ export function AdminDashboardPage() {
   const loadData = async () => {
     try {
       setIsLoading(true);
-      const [appsData, jobsData, leavesData] = await Promise.all([
+      const [appsData, jobsData] = await Promise.all([
         apiGetAdminApplications().catch(() => []),
         apiGetWorkforceJobs().catch(() => []),
-        apiGetLeaves().catch(() => []),
       ]);
       setApplications(appsData || []);
       setJobs(jobsData || []);
-      setLeaves(leavesData || []);
     } catch (_) {
     } finally {
       setIsLoading(false);

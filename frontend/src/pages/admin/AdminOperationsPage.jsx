@@ -18,8 +18,6 @@ import {
   apiTriggerAutoDispatch,
   apiGetWorkforceJobs,
   apiGetFleetMap,
-  apiGetLeaves,
-  apiAdminDecideLeave,
   apiGetAdminPendingServices,
   apiDecideService,
   apiGetAdminPendingExtensions,
@@ -415,7 +413,6 @@ export function AdminOperationsPage() {
   const [technicians, setTechnicians] = useState([]);
   const [eligibleFleet, setEligibleFleet] = useState([]);
   const [fleetMap, setFleetMap] = useState([]);
-  const [leaves, setLeaves] = useState([]);
   const [pendingServices, setPendingServices] = useState([]);
   const [pendingExtensions, setPendingExtensions] = useState([]);
   const [locations, setLocations] = useState([]);
@@ -436,12 +433,11 @@ export function AdminOperationsPage() {
   const loadData = async () => {
     try {
       setIsLoading(true);
-      const [techs, jobsList, eligible, leavesData, locsData, fleetData, pendingSvcData, pendingExtData] =
+      const [techs, jobsList, eligible, locsData, fleetData, pendingSvcData, pendingExtData] =
         await Promise.all([
           apiGetAdminApplications('approved').catch(() => []),
           apiGetWorkforceJobs().catch(() => []),
           apiGetEligibleTechnicians().catch(() => []),
-          apiGetLeaves().catch(() => []),
           apiGetLocations().catch(() => []),
           apiGetFleetMap().catch(() => []),
           apiGetAdminPendingServices().catch(() => []),
@@ -452,7 +448,6 @@ export function AdminOperationsPage() {
       setTechnicians(safe(techs));
       setJobs(safe(jobsList));
       setEligibleFleet(safe(eligible));
-      setLeaves(safe(leavesData));
       setLocations(safe(locsData));
       setFleetMap(safe(fleetData));
       setPendingServices(safe(pendingSvcData));
@@ -520,22 +515,6 @@ export function AdminOperationsPage() {
       setTimelineData({ error: err.message || 'Failed to load timeline.' });
     } finally {
       setTimelineLoading(false);
-    }
-  };
-
-  const handleDecideLeave = async (empId, leaveId, action) => {
-    try {
-      setStatusMsg({ type: '', text: '' });
-      let reason = '';
-      if (action === 'reject') {
-        reason = prompt('Enter rejection reason:') || 'Administrative decision';
-      }
-      await apiAdminDecideLeave(empId, leaveId, action, reason);
-      setStatusMsg({ type: 'success', text: `Leave application ${action}d successfully.` });
-      await loadData();
-      setTimeout(() => setStatusMsg({ type: '', text: '' }), 4000);
-    } catch (err) {
-      setStatusMsg({ type: 'error', text: err.message || 'Action failed.' });
     }
   };
 
@@ -637,11 +616,6 @@ export function AdminOperationsPage() {
       label: `Work Locations (${Array.isArray(locations) ? locations.length : 0})`,
       icon: MapPin,
     },
-    {
-      id: 'leaves',
-      label: `Leave Schedule (${Array.isArray(leaves) ? leaves.length : 0})`,
-      icon: Calendar,
-    },
   ];
 
   return (
@@ -650,7 +624,7 @@ export function AdminOperationsPage() {
         {/* Header */}
         <PageHeader
           title="Dynamic Dispatch & Fleet Operations"
-          subtitle="Skill-based technician matching, real-time GPS telemetry radar, and leave management"
+          subtitle="Skill-based technician matching and real-time GPS telemetry radar"
           actions={
             <button
               onClick={loadData}
@@ -1014,82 +988,6 @@ export function AdminOperationsPage() {
                         <tr>
                           <td colSpan={6} className="px-4 py-8 text-center text-slate-500">
                             No fleet units reporting GPS coordinates.
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-
-            {/* ── TAB 3: LEAVE SCHEDULE ── */}
-            {activeTab === 'leaves' && (
-              <div className="space-y-4">
-                <div>
-                  <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                    Technician Leave & Absence Schedule
-                  </h3>
-                  <p className="text-[11px] text-slate-500">
-                    Personnel on approved leave are excluded from dynamic dispatch availability.
-                  </p>
-                </div>
-
-                <div className="border border-slate-200 rounded overflow-hidden">
-                  <table className="w-full text-left text-xs">
-                    <thead className="bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-600 uppercase">
-                      <tr>
-                        <th className="px-4 py-2.5">Technician</th>
-                        <th className="px-4 py-2.5">Leave Type</th>
-                        <th className="px-4 py-2.5">Start Date</th>
-                        <th className="px-4 py-2.5">End Date</th>
-                        <th className="px-4 py-2.5">Reason</th>
-                        <th className="px-4 py-2.5 text-right">Status / Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {leaves.length > 0 ? (
-                        leaves.map((l) => (
-                          <tr key={`${l.employee_pk || l.employee_id}_${l.id}`} className="hover:bg-slate-50/50">
-                            <td className="px-4 py-3 font-bold text-slate-900">
-                              {l.employee_name || l.employee_id}
-                              <span className="block text-[10px] text-slate-500 font-mono font-normal">
-                                {l.employee_id}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3 font-medium text-slate-800">{l.leave_type}</td>
-                            <td className="px-4 py-3 font-mono text-slate-700">{l.start_date}</td>
-                            <td className="px-4 py-3 font-mono text-slate-700">{l.end_date}</td>
-                            <td className="px-4 py-3 text-slate-600">{l.reason || '—'}</td>
-                            <td className="px-4 py-3 text-right">
-                              <div className="flex items-center justify-end gap-1.5">
-                                <StatusBadge status={l.status || 'submitted'} size="xs" />
-                                {l.status === 'submitted' && l.employee_pk && (
-                                  <>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleDecideLeave(l.employee_pk, l.id, 'approve')}
-                                      className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[10px]"
-                                    >
-                                      Approve
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleDecideLeave(l.employee_pk, l.id, 'reject')}
-                                      className="px-2 py-0.5 rounded bg-rose-600 hover:bg-rose-700 text-white font-bold text-[10px]"
-                                    >
-                                      Reject
-                                    </button>
-                                  </>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        ))
-                      ) : (
-                        <tr>
-                          <td colSpan={6} className="px-4 py-8 text-center text-slate-500">
-                            No planned leaves registered in schedule.
                           </td>
                         </tr>
                       )}

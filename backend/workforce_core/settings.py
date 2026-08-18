@@ -15,8 +15,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Load .env file
 load_dotenv(BASE_DIR / ".env")
 
-SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("DJANGO_SECRET_KEY") or "workforce-secret-key-caltrack-2026-prod-mode"
+_raw_secret = os.getenv("SECRET_KEY") or os.getenv("DJANGO_SECRET_KEY")
 DEBUG = (os.getenv("DEBUG") or os.getenv("DJANGO_DEBUG") or "True").lower() in ("true", "1", "t")
+
+if not _raw_secret:
+    if DEBUG:
+        SECRET_KEY = "dev-insecure-workforce-secret-key-caltrack-local-testing-only"
+    else:
+        raise ValueError("CRITICAL SECURITY ERROR: SECRET_KEY environment variable is mandatory in production (DEBUG=False).")
+else:
+    SECRET_KEY = _raw_secret
 
 _allowed_hosts_env = os.getenv("ALLOWED_HOSTS")
 if _allowed_hosts_env:

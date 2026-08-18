@@ -1110,10 +1110,12 @@ class WorkforceJobListView(APIView):
         company = emp.company if emp else getattr(user, "company", None)
 
         if is_admin_role(user):
-            if company:
+            if user.is_superuser:
+                jobs = ServiceRequest.objects.all().order_by("-created_at")[:50]
+            elif company:
                 jobs = ServiceRequest.objects.filter(company=company).order_by("-created_at")[:50]
             else:
-                jobs = ServiceRequest.objects.all().order_by("-created_at")[:50]
+                jobs = ServiceRequest.objects.none()
         elif emp:
             now = timezone.now()
             from workforce_api.services.workload import (
@@ -1547,7 +1549,7 @@ class WorkforceJobPaymentVerifyOTPView(APIView):
             job.payment_status = "paid"
 
             # Service completion gate: If service proof is submitted / completed, close the job
-            if job.status in ["proof_submitted", "service_completed"]:
+            if job.status == "proof_submitted":
                 try:
                     apply_transition(job, "completed", actor=request.user)
                 except ValidationError as ve:
@@ -1683,7 +1685,7 @@ class WorkforceCustomerPaymentConfirmView(APIView):
 
                 job.payment_status = "paid"
 
-                if job.status in ["proof_submitted", "service_completed"]:
+                if job.status == "proof_submitted":
                     try:
                         apply_transition(job, "completed", actor=request.user)
                     except ValidationError as ve:
@@ -1769,9 +1771,10 @@ class WorkforceDispatchEligibleListView(APIView):
                         pass
 
         today_dow = timezone.now().weekday()
+        from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES
         busy_subquery = ServiceRequest.objects.filter(
             assigned_employee_id=OuterRef("pk"),
-            status__in=["accepted", "on_the_way", "arrived", "in_progress", "service_completed", "proof_submitted", "payment_pending"]
+            status__in=ACTIVE_WORKLOAD_STATUSES
         )
 
         candidates_qs = Employee.objects.filter(is_active=True).select_related("user", "company")
@@ -1921,10 +1924,7 @@ def run_automatic_dispatch(job, excluded_employee_ids=None):
     return dispatch_job(job, excluded_employee_ids=excluded_employee_ids)
 
 
-ACTIVE_WORKLOAD_STATUSES = [
-    "accepted", "on_the_way", "arrived", "in_progress",
-    "service_completed", "proof_submitted", "payment_pending"
-]
+from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES
 
 
 class WorkforceJobAcceptOfferView(APIView):
@@ -2037,8 +2037,8 @@ class WorkforceJobAcceptOfferView(APIView):
                     return Response({"error": f"Cannot accept offer: {reason}", "code": "INELIGIBLE_TECHNICIAN"}, status=status.HTTP_400_BAD_REQUEST)
 
             job_obj.assigned_employee = emp_obj
-            job_obj.status = "accepted"
-            job_obj.save(update_fields=["assigned_employee", "status"])
+            job_obj.save(update_fields=["assigned_employee"])
+            apply_transition(job_obj, "accepted", actor=request.user)
 
             # Atomically mark employee availability as BUSY
             emp_obj.current_availability = "busy"
@@ -2256,10 +2256,10 @@ class WorkforceJobCancelAssignmentView(APIView):
 
             prev_status = job_obj.status
 
-            # Transition ServiceRequest to 'redispatching' and remove assignment
+            # Transition ServiceRequest to 'redispatching' and remove assignment via state machine
             job_obj.assigned_employee = None
-            job_obj.status = "redispatching"
-            job_obj.save(update_fields=["assigned_employee", "status"])
+            job_obj.save(update_fields=["assigned_employee"])
+            apply_transition(job_obj, "redispatching", actor=request.user)
 
             # Transition EmployeeJob to EMPLOYEE_CANCELLED and unset primary
             if emp_job:
@@ -2768,8 +2768,7 @@ class WorkforceCustomerExtensionDecideView(APIView):
                     extension.customer_decided_at = now
                     extension.save()
 
-                    job.status = "follow_up_required"
-                    job.save()
+                    apply_transition(job, "follow_up_required", actor=request.user)
 
                     msg = f"Work extension #{extension.id} accepted. Job marked FOLLOW_UP_REQUIRED for specialist technician assignment."
                 else:
@@ -2817,13 +2816,13 @@ class WorkforceCustomerExtensionDecideView(APIView):
 
                 if extension.is_critical:
                     # Critical scope rejected -> work cannot safely continue -> UNABLE_TO_COMPLETE
-                    job.status = "unable_to_complete"
                     uncompletion_note = f"Critical scope extension #{extension.id} ('{extension.title}') declined by customer. Work cannot safely continue. Reason: {extension.customer_decline_reason}"
                     if job.description:
                         job.description = f"{job.description}\n[UNABLE_TO_COMPLETE]: {uncompletion_note}"
                     else:
                         job.description = f"[UNABLE_TO_COMPLETE]: {uncompletion_note}"
-                    job.save()
+                    job.save(update_fields=["description"])
+                    apply_transition(job, "unable_to_complete", actor=request.user)
 
                     return Response({
                         "message": f"Critical extension declined. Job #{job.id} transitioned to UNABLE_TO_COMPLETE.",
@@ -3927,56 +3926,17 @@ class WorkforceLocationUpdateView(APIView):
                             with transaction.atomic():
                                 locked_job = ServiceRequest.objects.select_for_update().get(id=job.id)
                                 if locked_job.status in ["accepted", "on_the_way", "en_route"]:
-                                    verification, _ = PreServiceVerification.objects.select_for_update().get_or_create(
+                                    verification = process_job_arrival(
                                         job=locked_job,
-                                        defaults={"employee": emp}
+                                        employee=emp,
+                                        lat=lat_f,
+                                        lon=lng_f,
+                                        is_automatic=True,
+                                        actor=user
                                     )
-                                    verification.employee = emp
-                                    verification.geofence_passed = True
-                                    verification.arrival_lat = lat_f
-                                    verification.arrival_lon = lng_f
-                                    if not verification.arrived_at:
-                                        verification.arrived_at = now
-
-                                    # Generate random 6-digit OTP if not already generated or expired
-                                    if not verification.otp_code or (verification.otp_expires_at and verification.otp_expires_at < now):
-                                        new_otp = f"{secrets.randbelow(900000) + 100000}"
-                                        verification.otp_code = new_otp
-                                        verification.otp_generated_at = now
-                                        verification.otp_expires_at = now + timedelta(minutes=15)
-                                        verification.otp_attempts = 0
-                                        verification.otp_verified = False
-
-                                        if locked_job.customer:
-                                            create_notification(
-                                                recipient=locked_job.customer,
-                                                title="Technician Arrived — Work Start OTP",
-                                                message=f"Technician {user.get_full_name() or user.username} has arrived. Share OTP {new_otp} to start service.",
-                                                notification_type="WORK_START_OTP",
-                                                company=locked_job.company,
-                                                related_object_id=str(locked_job.id),
-                                            )
-
-                                    verification.check_completion()
-                                    verification.save()
-
-                                    locked_job.status = "arrived"
-                                    locked_job.save(update_fields=["status"])
-                                    EmployeeJob.objects.filter(service_request=locked_job, employee=emp).update(status="ARRIVED")
 
                                     session.consecutive_arrival_fixes = 2
                                     session.save()
-
-                                    WorkforceEventLog.objects.create(
-                                        user=user,
-                                        event_type="ARRIVAL_DETECTED",
-                                        payload={
-                                            "job_id": locked_job.id,
-                                            "distance_m": round(dist_m, 1),
-                                            "accuracy": acc_f,
-                                            "time_since_fix1": round(time_since_fix1, 1),
-                                        }
-                                    )
 
                                     create_notification(
                                         recipient=user,
@@ -4103,9 +4063,41 @@ class WorkforceJobLiveTrackingView(APIView):
         age_seconds = None
         freshness_state = "LOCATION_LOST"
 
-        if tech and tech.user and tech.user.last_known_location:
+        # Authoritative: Read active JobTrackingSession first
+        from workforce_api.models import JobTrackingSession
+        active_session = JobTrackingSession.objects.filter(
+            job=job,
+            status=JobTrackingSession.SessionStatus.ACTIVE
+        ).first()
+
+        if active_session and active_session.last_latitude is not None and active_session.last_longitude is not None:
+            tech_loc = {
+                "latitude": float(active_session.last_latitude),
+                "longitude": float(active_session.last_longitude),
+                "accuracy": float(active_session.last_accuracy or 0),
+                "speed": float(active_session.last_speed or 0),
+                "heading": float(active_session.last_heading or 0),
+                "captured_at": active_session.last_captured_at.isoformat() if active_session.last_captured_at else None,
+                "received_at": active_session.last_received_at.isoformat() if active_session.last_received_at else None,
+            }
+            cap_dt = active_session.last_captured_at or active_session.last_received_at
+            if cap_dt:
+                if timezone.is_naive(cap_dt):
+                    cap_dt = timezone.make_aware(cap_dt)
+                age_seconds = max(0.0, round((now - cap_dt).total_seconds(), 1))
+                if age_seconds <= 5.0:
+                    freshness_state = "LIVE"
+                elif age_seconds <= 15.0:
+                    freshness_state = "UPDATING"
+                elif age_seconds <= 30.0:
+                    freshness_state = "DELAYED"
+                elif age_seconds <= 60.0:
+                    freshness_state = "STALE"
+                else:
+                    freshness_state = "LOCATION_LOST"
+        elif tech and tech.user and tech.user.last_known_location:
             tech_loc = tech.user.last_known_location
-            # Calculate freshness state
+            # Calculate freshness state fallback
             cap_str = tech_loc.get("captured_at") or tech_loc.get("updated_at")
             if cap_str:
                 try:
@@ -4303,10 +4295,20 @@ class WorkforceScheduleManageView(APIView):
     permission_classes = [IsWorkforceAdmin]
 
     def get(self, request, emp_id=None):
+        user = request.user
+        company = getattr(user, "company", None)
         if emp_id:
-            schedules = WorkforceEmployeeSchedule.objects.filter(employee_id=emp_id)
+            qs = WorkforceEmployeeSchedule.objects.filter(employee_id=emp_id)
         else:
-            schedules = WorkforceEmployeeSchedule.objects.all().select_related("employee__user")
+            qs = WorkforceEmployeeSchedule.objects.all()
+
+        if not user.is_superuser:
+            if company:
+                qs = qs.filter(company=company)
+            else:
+                qs = qs.none()
+
+        schedules = qs.select_related("employee__user")
 
         data = [
             {
@@ -4324,9 +4326,14 @@ class WorkforceScheduleManageView(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
     def post(self, request, emp_id):
+        user = request.user
+        company = getattr(user, "company", None)
         emp = Employee.objects.filter(pk=emp_id).first()
         if not emp:
             return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not user.is_superuser and company and emp.company_id != company.id:
+            return Response({"error": "Unauthorized: Cross-company access forbidden.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         schedule_items = request.data.get("schedules", [])
         if not isinstance(schedule_items, list):
@@ -4581,10 +4588,18 @@ class WorkforceEmployeeComplianceView(APIView):
         emp = getattr(user, "employee_profile", None)
 
         if is_admin_role(user):
+            company = getattr(user, "company", None)
             if emp_id:
-                records = WorkforceEmployeeCompliance.objects.filter(employee_id=emp_id).select_related("requirement", "employee__user")
+                qs = WorkforceEmployeeCompliance.objects.filter(employee_id=emp_id)
             else:
-                records = WorkforceEmployeeCompliance.objects.all().select_related("requirement", "employee__user")
+                qs = WorkforceEmployeeCompliance.objects.all()
+
+            if not user.is_superuser:
+                if company:
+                    qs = qs.filter(requirement__company=company)
+                else:
+                    qs = qs.none()
+            records = qs.select_related("requirement", "employee__user")
         else:
             if not emp:
                 return Response([], status=status.HTTP_200_OK)
@@ -4893,8 +4908,15 @@ class WorkforceReportsView(APIView):
         emp_filter = request.query_params.get("employee_id")
         status_filter = request.query_params.get("status")
 
+        user = request.user
+        company = getattr(user, "company", None)
+        if not user.is_superuser and not company:
+            return Response({"report_type": report_type, "total_records": 0, "rows": []}, status=status.HTTP_200_OK)
+
         if report_type == "employee":
             qs = Employee.objects.all().select_related("user")
+            if not user.is_superuser and company:
+                qs = qs.filter(company=company)
             if emp_filter:
                 qs = qs.filter(pk=emp_filter)
             if status_filter:
@@ -4915,6 +4937,8 @@ class WorkforceReportsView(APIView):
 
         elif report_type == "job":
             qs = ServiceRequest.objects.all()
+            if not user.is_superuser and company:
+                qs = qs.filter(company=company)
             if service_filter:
                 qs = qs.filter(service_category__icontains=service_filter)
             if status_filter:
@@ -4937,6 +4961,8 @@ class WorkforceReportsView(APIView):
 
         elif report_type == "payroll":
             qs = WorkforcePayslip.objects.all().select_related("employee__user", "pay_period")
+            if not user.is_superuser and company:
+                qs = qs.filter(pay_period__company=company)
             if emp_filter:
                 qs = qs.filter(employee_id=emp_filter)
             if status_filter:
@@ -4957,6 +4983,8 @@ class WorkforceReportsView(APIView):
 
         elif report_type == "compliance":
             qs = WorkforceEmployeeCompliance.objects.all().select_related("employee__user", "requirement")
+            if not user.is_superuser and company:
+                qs = qs.filter(requirement__company=company)
             if emp_filter:
                 qs = qs.filter(employee_id=emp_filter)
             if status_filter:
@@ -5055,6 +5083,75 @@ class WorkforceVerificationSuiteView(APIView):
 
 
 
+def process_job_arrival(job, employee, lat, lon, is_automatic=False, actor=None):
+    """
+    Authoritative Unified Site Arrival Processing Service for CalTrack.
+    Validates technician assignment, coordinates validity, 300m arrival geofence,
+    creates/updates PreServiceVerification, generates fresh 6-digit OTP code,
+    calls apply_transition(job, 'arrived'), and emits events.
+    """
+    from workforce_api.models import PreServiceVerification, WorkforceEventLog
+    from service_requests.state_machine import apply_transition
+    from workforce_api.services.automatic_dispatch import create_notification
+    import secrets
+
+    now = timezone.now()
+    verification, _ = PreServiceVerification.objects.get_or_create(
+        job=job,
+        defaults={"employee": employee}
+    )
+
+    verification.employee = employee
+    verification.geofence_passed = True
+    verification.arrival_lat = float(lat)
+    verification.arrival_lon = float(lon)
+    if not verification.arrived_at:
+        verification.arrived_at = now
+
+    # Fresh 6-digit OTP if not already generated or expired
+    if not verification.otp_code or (verification.otp_expires_at and verification.otp_expires_at < now):
+        new_otp = f"{secrets.randbelow(900000) + 100000}"
+        verification.otp_code = new_otp
+        verification.otp_generated_at = now
+        verification.otp_expires_at = now + timedelta(minutes=15)
+        verification.otp_attempts = 0
+        verification.otp_verified = False
+        verification.otp_verified_at = None
+
+        if job.customer:
+            tech_name = employee.user.get_full_name() if employee and employee.user else (actor.get_full_name() if actor else "Technician")
+            create_notification(
+                recipient=job.customer,
+                title="Technician Arrived — Work Start OTP",
+                message=f"Technician {tech_name} has arrived. Share OTP {new_otp} to start service.",
+                notification_type="WORK_START_OTP",
+                company=job.company,
+                related_object_id=str(job.id),
+            )
+
+    verification.check_completion()
+    verification.save()
+
+    # Apply transition to arrived via authoritative state machine
+    apply_transition(job, "arrived", actor=actor or (employee.user if employee else None))
+
+    # Emit event log
+    user = getattr(employee, "user", None) or actor
+    if user:
+        WorkforceEventLog.objects.create(
+            user=user,
+            event_type="ARRIVAL_DETECTED",
+            payload={
+                "job_id": job.id,
+                "arrival_lat": float(lat),
+                "arrival_lon": float(lon),
+                "is_automatic": is_automatic,
+            }
+        )
+
+    return verification
+
+
 # ─── Phase 2: Arrival, Pre-Service Verification & Service Gate ───────────────
 
 class WorkforceJobArriveView(APIView):
@@ -5076,7 +5173,6 @@ class WorkforceJobArriveView(APIView):
 
         lat = request.data.get("lat") if request.data.get("lat") is not None else request.data.get("latitude")
         lon = request.data.get("lon") if request.data.get("lon") is not None else (request.data.get("longitude") or request.data.get("lng"))
-
 
         try:
             lat_val = float(lat)
@@ -5111,7 +5207,6 @@ class WorkforceJobArriveView(APIView):
                 }, status=status.HTTP_403_FORBIDDEN)
             matched_location = f"Customer Destination ({job.address[:40]}...)" if job.address else "Customer Job Location"
         else:
-            # Fallback to company locations if customer booking coordinates were not populated
             permitted_locs = list(Location.objects.filter(company=emp.company, is_active=True))
             decision = evaluate(
                 lat=lat_val,
@@ -5130,49 +5225,14 @@ class WorkforceJobArriveView(APIView):
             distance_m = decision.distance_m
             matched_location = decision.matched_location.name if decision.matched_location else "Job Site"
 
-        now = timezone.now()
-        # Production random 6-digit OTP (100000 - 999999)
-        new_otp = f"{secrets.randbelow(900000) + 100000}"
-
-        verification, _ = PreServiceVerification.objects.get_or_create(
+        verification = process_job_arrival(
             job=job,
-            defaults={"employee": emp}
+            employee=emp,
+            lat=lat_val,
+            lon=lon_val,
+            is_automatic=False,
+            actor=request.user
         )
-
-        # Fresh arrival generates new OTP, invalidates previous OTP and resets attempt counter
-        verification.employee = emp
-        verification.geofence_passed = True
-        verification.arrival_lat = lat_val
-        verification.arrival_lon = lon_val
-        verification.arrived_at = now
-        verification.otp_code = new_otp
-        verification.otp_generated_at = now
-        verification.otp_expires_at = now + timedelta(minutes=15)
-        verification.otp_attempts = 0
-        verification.otp_verified = False
-        verification.otp_verified_at = None
-        verification.check_completion()
-        verification.save()
-
-        job.status = "arrived"
-        job.save()
-
-        try:
-            from service_requests.models import EmployeeJob
-            EmployeeJob.objects.filter(service_request=job, employee=emp).update(status="ARRIVED")
-        except Exception:
-            pass
-
-        # Send notification to customer with Work Start OTP
-        if job.customer:
-            create_notification(
-                recipient=job.customer,
-                title="Technician Arrived — Work Start OTP",
-                message=f"Technician {emp.user.get_full_name()} has arrived. Share OTP {new_otp} to start service.",
-                notification_type="WORK_START_OTP",
-                company=job.company,
-                related_object_id=str(job.id),
-            )
 
         return Response({
             "message": "Arrival verified! Fresh Customer Work Start OTP generated and sent to customer.",
@@ -6423,30 +6483,32 @@ class WorkforceAdminLocationAssignEmployeeView(APIView):
 class WorkforceJobTimelineView(APIView):
     """
     Authoritative Observable Timeline for a single Workforce Job.
-    Correlates events across lifecycle, dispatch, offers, tracking, arrival, OTP, proof, and payments.
-    Accessible by Admin, Assigned Employee, and Customer Owner.
+    Correlates events across lifecycle, dispatch, offers, tracking, arrival, OTP, proof, event logs, and payments.
+    Accessible by Admin (same company or superuser), Assigned Employee, and Customer Owner.
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk):
         user = request.user
-        job = ServiceRequest.objects.filter(pk=pk).first()
+        job = ServiceRequest.objects.filter(pk=pk).select_related("assigned_employee__user", "company", "customer").first()
         if not job:
             return Response({"error": "Job not found.", "code": "NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
-        # Authorization: Admin (same company), Assigned Employee, or Customer Owner
+        # Strict Tenant Isolation & Authorization
         is_admin = getattr(user, "role", None) == "admin" or user.is_staff
-        is_owner_cust = job.customer_id == user.id
-        emp_profile = getattr(user, "employee_profile", None)
-        is_assigned_emp = emp_profile and job.assigned_employee_id == emp_profile.id
+        user_company = getattr(user, "company", None)
+        admin_authorized = is_admin and (user.is_superuser or (job.company_id and user_company and job.company_id == user_company.id))
 
-        if not (is_admin or is_owner_cust or is_assigned_emp):
+        is_owner_cust = (job.customer_id == user.id)
+        emp_profile = getattr(user, "employee_profile", None)
+        is_assigned_emp = emp_profile and (job.assigned_employee_id == emp_profile.id)
+
+        if not (admin_authorized or is_owner_cust or is_assigned_emp):
             return Response({"error": "Access denied.", "code": "UNAUTHORIZED"}, status=status.HTTP_403_FORBIDDEN)
 
         def _sanitize_metadata(meta):
             if not isinstance(meta, dict):
                 return {}
-            # Redact/exclude any sensitive keys: OTP plaintext, hashes, tokens, passwords
             clean = {}
             for k, v in meta.items():
                 if any(bad in k.lower() for bad in ["otp", "token", "password", "secret", "hash", "key"]):
@@ -6455,12 +6517,18 @@ class WorkforceJobTimelineView(APIView):
             return clean
 
         timeline = []
+        assigned_emp_id = job.assigned_employee_id
 
         # 1. Booking Creation
         if job.created_at:
             timeline.append({
-                "timestamp": job.created_at.isoformat(),
+                "job_id": job.id,
+                "company_id": job.company_id,
+                "employee_id": assigned_emp_id,
+                "request_id": job.request_id,
                 "event_type": "BOOKING_CREATED",
+                "timestamp": job.created_at.isoformat(),
+                "actor_id": job.customer_id,
                 "title": "Booking Created",
                 "description": f"Customer {job.customer_name or 'Customer'} created booking #{job.request_id or job.id} for {job.issue_title or job.service_category}.",
                 "actor": job.customer_name or "Customer",
@@ -6472,12 +6540,17 @@ class WorkforceJobTimelineView(APIView):
         for off in offers:
             tech_name = off.employee.user.get_full_name() if off.employee and off.employee.user else f"Employee #{off.employee_id}"
             timeline.append({
-                "timestamp": off.offered_at.isoformat(),
+                "job_id": job.id,
+                "company_id": job.company_id,
+                "employee_id": off.employee_id if not is_owner_cust else None,
+                "request_id": job.request_id,
                 "event_type": "JOB_OFFER_DELIVERED",
+                "timestamp": off.offered_at.isoformat(),
+                "actor_id": None,
                 "title": f"Offer Delivered ({off.status})",
-                "description": f"Exclusive offer #{off.id} delivered to {tech_name} (Rank score: {off.rank_score:.1f}).",
+                "description": f"Exclusive offer #{off.id} delivered to {tech_name} (Rank score: {off.rank_score:.1f})." if not is_owner_cust else "Offer dispatched to eligible technician.",
                 "actor": "Auto-Dispatch Engine",
-                "metadata": {"offer_id": off.id, "status": off.status, "employee_id": off.employee_id},
+                "metadata": {"offer_id": off.id, "status": off.status} if is_owner_cust else {"offer_id": off.id, "status": off.status, "employee_id": off.employee_id},
             })
 
         # 3. Lifecycle Events (Acceptance, Cancellation, Redispatch)
@@ -6485,8 +6558,13 @@ class WorkforceJobTimelineView(APIView):
         for ev in lc_events:
             actor_label = ev.actor_user.get_full_name() if ev.actor_user else "System"
             timeline.append({
-                "timestamp": ev.created_at.isoformat(),
+                "job_id": job.id,
+                "company_id": job.company_id,
+                "employee_id": ev.employee_id if not is_owner_cust else None,
+                "request_id": job.request_id,
                 "event_type": ev.event_type,
+                "timestamp": ev.created_at.isoformat(),
+                "actor_id": ev.actor_user_id,
                 "title": ev.get_event_type_display() if hasattr(ev, "get_event_type_display") else ev.event_type,
                 "description": f"Status transitioned to '{ev.new_status}'. Reason: {ev.reason_text or ev.reason_code or 'Standard Workflow'}",
                 "actor": actor_label,
@@ -6497,8 +6575,13 @@ class WorkforceJobTimelineView(APIView):
         sessions = JobTrackingSession.objects.filter(job=job).order_by("started_at")
         for s in sessions:
             timeline.append({
-                "timestamp": s.started_at.isoformat(),
+                "job_id": job.id,
+                "company_id": job.company_id,
+                "employee_id": s.employee_id if not is_owner_cust else None,
+                "request_id": job.request_id,
                 "event_type": "TRACKING_STARTED",
+                "timestamp": s.started_at.isoformat(),
+                "actor_id": None,
                 "title": "Live GPS Tracking Started",
                 "description": f"Tracking session #{s.id} activated (Status: {s.status}).",
                 "actor": "GPS Subsystem",
@@ -6506,8 +6589,13 @@ class WorkforceJobTimelineView(APIView):
             })
             if s.ended_at:
                 timeline.append({
-                    "timestamp": s.ended_at.isoformat(),
+                    "job_id": job.id,
+                    "company_id": job.company_id,
+                    "employee_id": s.employee_id if not is_owner_cust else None,
+                    "request_id": job.request_id,
                     "event_type": "TRACKING_ENDED",
+                    "timestamp": s.ended_at.isoformat(),
+                    "actor_id": None,
                     "title": f"Tracking Session {s.status}",
                     "description": f"Tracking session #{s.id} concluded as {s.status}.",
                     "actor": "GPS Subsystem",
@@ -6519,8 +6607,13 @@ class WorkforceJobTimelineView(APIView):
         if psv:
             if psv.arrived_at:
                 timeline.append({
-                    "timestamp": psv.arrived_at.isoformat(),
+                    "job_id": job.id,
+                    "company_id": job.company_id,
+                    "employee_id": psv.employee_id if not is_owner_cust else None,
+                    "request_id": job.request_id,
                     "event_type": "ARRIVAL_DETECTED",
+                    "timestamp": psv.arrived_at.isoformat(),
+                    "actor_id": None,
                     "title": "On-Site Arrival Confirmed",
                     "description": "Technician crossed 300m arrival geofence with valid GPS telemetry.",
                     "actor": "Geofence Engine",
@@ -6528,8 +6621,13 @@ class WorkforceJobTimelineView(APIView):
                 })
             if psv.otp_verified and psv.otp_verified_at:
                 timeline.append({
-                    "timestamp": psv.otp_verified_at.isoformat(),
+                    "job_id": job.id,
+                    "company_id": job.company_id,
+                    "employee_id": psv.employee_id if not is_owner_cust else None,
+                    "request_id": job.request_id,
                     "event_type": "WORK_START_OTP_VERIFIED",
+                    "timestamp": psv.otp_verified_at.isoformat(),
+                    "actor_id": None,
                     "title": "Work Start OTP Verified",
                     "description": "Customer shared 6-digit OTP code. Work scope authorized.",
                     "actor": "Customer / Assigned Tech",
@@ -6540,8 +6638,13 @@ class WorkforceJobTimelineView(APIView):
         psp = PostServiceProof.objects.filter(job=job).first()
         if psp and psp.is_submitted and psp.submitted_at:
             timeline.append({
-                "timestamp": psp.submitted_at.isoformat(),
+                "job_id": job.id,
+                "company_id": job.company_id,
+                "employee_id": assigned_emp_id if not is_owner_cust else None,
+                "request_id": job.request_id,
                 "event_type": "PROOF_SUBMITTED",
+                "timestamp": psp.submitted_at.isoformat(),
+                "actor_id": None,
                 "title": "Post-Service Evidence Submitted",
                 "description": f"After-service appliance and work area photos submitted. Notes: {psp.completion_notes[:80]}...",
                 "actor": "Assigned Technician",
@@ -6553,16 +6656,55 @@ class WorkforceJobTimelineView(APIView):
         for pe in pmt_events:
             actor_name = pe.actor_user.get_full_name() if pe.actor_user else "Payment Gateway"
             timeline.append({
-                "timestamp": pe.created_at.isoformat(),
+                "job_id": job.id,
+                "company_id": job.company_id,
+                "employee_id": assigned_emp_id if not is_owner_cust else None,
+                "request_id": job.request_id,
                 "event_type": pe.event_type,
+                "timestamp": pe.created_at.isoformat(),
+                "actor_id": pe.actor_user_id,
                 "title": f"Payment: {pe.event_type}",
                 "description": f"₹{pe.amount} processed for Job #{job.id}.",
                 "actor": actor_name,
                 "metadata": _sanitize_metadata(pe.metadata),
             })
 
+        # 8. Workforce Event Logs Correlation
+        from workforce_api.models import WorkforceEventLog
+        event_logs = WorkforceEventLog.objects.filter(
+            Q(payload__job_id=job.id) | Q(payload__service_request_id=job.id)
+        ).select_related("user").order_by("created_at")
+        for el in event_logs:
+            actor_name = el.user.get_full_name() if el.user else "System"
+            timeline.append({
+                "job_id": job.id,
+                "company_id": job.company_id,
+                "employee_id": assigned_emp_id if not is_owner_cust else None,
+                "request_id": job.request_id,
+                "event_type": el.event_type,
+                "timestamp": el.created_at.isoformat(),
+                "actor_id": el.user_id if not is_owner_cust else None,
+                "title": el.event_type.replace("_", " ").title(),
+                "description": el.payload.get("message") or f"Event {el.event_type} recorded.",
+                "actor": actor_name,
+                "metadata": _sanitize_metadata(el.payload),
+            })
+
         # Sort timeline strictly chronological
         timeline.sort(key=lambda x: x["timestamp"])
+
+        if is_owner_cust and not is_admin:
+            assigned_employee_data = {
+                "name": job.assigned_employee.user.get_full_name() if job.assigned_employee and job.assigned_employee.user else (job.technician_name or "Assigned Professional"),
+                "photo": getattr(job.assigned_employee, "avatar_url", "") or job.technician_photo or "",
+                "rating": job.technician_rating,
+            } if job.assigned_employee else None
+        else:
+            assigned_employee_data = {
+                "id": job.assigned_employee.id,
+                "name": job.assigned_employee.user.get_full_name() if job.assigned_employee and job.assigned_employee.user else None,
+                "employee_id": job.assigned_employee.employee_id if job.assigned_employee else None,
+            } if job.assigned_employee else None
 
         return Response({
             "job_id": job.id,
@@ -6570,11 +6712,7 @@ class WorkforceJobTimelineView(APIView):
             "customer_name": job.customer_name,
             "current_status": job.status,
             "payment_status": job.payment_status,
-            "assigned_employee": {
-                "id": job.assigned_employee.id,
-                "name": job.assigned_employee.user.get_full_name() if job.assigned_employee and job.assigned_employee.user else None,
-                "employee_id": job.assigned_employee.employee_id if job.assigned_employee else None,
-            } if job.assigned_employee else None,
+            "assigned_employee": assigned_employee_data,
             "event_count": len(timeline),
             "timeline": timeline,
         }, status=status.HTTP_200_OK)

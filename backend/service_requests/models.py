@@ -203,8 +203,11 @@ class ServiceRequest(models.Model):
             try:
                 from workforce_api.services.automatic_dispatch import dispatch_job
                 dispatch_job(self)
-            except Exception:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger("workforce.dispatch").exception(
+                    f"[AUTO_DISPATCH_TRIGGER_FAILED] Failed to trigger automatic dispatch for Job #{self.id}: {e}"
+                )
 
 
 

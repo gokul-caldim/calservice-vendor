@@ -2,19 +2,25 @@
 workforce-app/backend/service_requests/state_machine.py
 State machine logic for Service Request status transitions.
 """
+import logging
 from rest_framework.exceptions import ValidationError
+from django.utils import timezone
+
+logger = logging.getLogger("workforce.state_machine")
 
 ALLOWED_TRANSITIONS = {
-    "unassigned": ["offering", "assigned", "accepted", "redispatching", "cancelled"],
+    "draft": ["new_request", "confirmed", "offering", "dispatching", "assigned", "unassigned", "cancelled"],
+    "new_request": ["confirmed", "offering", "dispatching", "assigned", "unassigned", "cancelled"],
+    "unassigned": ["offering", "dispatching", "assigned", "accepted", "redispatching", "cancelled"],
     "offering": ["accepted", "unassigned", "redispatching", "cancelled"],
-    "redispatching": ["offering", "unassigned", "accepted", "cancelled"],
-    "new_request": ["confirmed", "cancelled"],
-    "confirmed": ["assigned", "cancelled"],
-    "assigned": ["received", "accepted", "reassigned", "cancelled"],
-    "received": ["accepted", "reassigned", "cancelled"],
-    "accepted": ["on_the_way", "en_route", "arrived", "cancelled", "unable_to_complete"],
-    "on_the_way": ["arrived", "cancelled", "unable_to_complete"],
-    "en_route": ["arrived", "cancelled", "unable_to_complete"],
+    "dispatching": ["offering", "accepted", "unassigned", "redispatching", "cancelled"],
+    "redispatching": ["offering", "dispatching", "unassigned", "accepted", "cancelled"],
+    "confirmed": ["offering", "dispatching", "assigned", "unassigned", "accepted", "cancelled"],
+    "assigned": ["received", "accepted", "reassigned", "redispatching", "cancelled"],
+    "received": ["accepted", "reassigned", "redispatching", "cancelled"],
+    "accepted": ["on_the_way", "en_route", "arrived", "redispatching", "cancelled", "unable_to_complete"],
+    "on_the_way": ["arrived", "redispatching", "cancelled", "unable_to_complete"],
+    "en_route": ["arrived", "redispatching", "cancelled", "unable_to_complete"],
     "arrived": ["service_started", "in_progress", "cancelled", "unable_to_complete"],
     "service_started": ["in_progress", "cancelled", "unable_to_complete"],
     "in_progress": ["proof_submitted", "cancelled", "unable_to_complete", "follow_up_required"],
@@ -37,7 +43,11 @@ def can_transition(current_status: str, target_status: str) -> bool:
 
 
 def apply_transition(service_request, target_status: str, actor=None) -> str:
-
+    """
+    Authoritative state machine transition executor for ServiceRequest.
+    Validates state transitions, enforces business invariants/gates, persists changes,
+    and coordinates downstream side effects (EmployeeJob, JobTrackingSession, Availability).
+    """
     current = str(service_request.status).lower()
     target = str(target_status).lower()
 
@@ -46,7 +56,9 @@ def apply_transition(service_request, target_status: str, actor=None) -> str:
 
     allowed = ALLOWED_TRANSITIONS.get(current, [])
     if target not in allowed and not getattr(actor, "is_superuser", False):
-        raise ValidationError(f"Invalid transition from '{current.upper()}' to '{target.upper()}'. Next valid state: {allowed}.")
+        raise ValidationError(
+            f"Invalid transition from '{current.upper()}' to '{target.upper()}'. Valid next states: {allowed}."
+        )
 
     emp = getattr(actor, "employee_profile", None) if actor else None
     if not getattr(actor, "is_superuser", False):
@@ -60,11 +72,11 @@ def apply_transition(service_request, target_status: str, actor=None) -> str:
         # 2. Gate: IN_PROGRESS requires active TimeLog clock-in
         if target == "in_progress":
             from time_tracking.models import TimeLog
-            if not emp:
-                raise ValidationError("Transition rejected: Authenticated employee profile required.")
-            is_clocked_in = TimeLog.objects.filter(employee=emp, clock_out__isnull=True).exists()
-            if not is_clocked_in:
-                raise ValidationError("Transition rejected: Active shift TimeLog clock-in is required before IN_PROGRESS.")
+            eval_emp = emp or service_request.assigned_employee
+            if eval_emp:
+                is_clocked_in = TimeLog.objects.filter(employee=eval_emp, clock_out__isnull=True).exists()
+                if not is_clocked_in:
+                    raise ValidationError("Transition rejected: Active shift TimeLog clock-in is required before IN_PROGRESS.")
 
         # 3. Gate: COMPLETED requires Authoritative Completion Aggregation check
         if target == "completed":
@@ -78,20 +90,26 @@ def apply_transition(service_request, target_status: str, actor=None) -> str:
                 raise ValidationError("Transition rejected: After-service proof (photos and notes) required before PROOF_SUBMITTED.")
 
     service_request.status = target
-    service_request.save()
+    service_request.save(update_fields=["status"])
 
     # Sync EmployeeJob status and timestamps
     try:
-        from service_requests.models import EmployeeJob, ServiceRequest as SR
-        from django.utils import timezone
+        from service_requests.models import EmployeeJob
+        now = timezone.now()
         emp_job_updates = {"status": target.upper()}
         if target == "completed":
-            emp_job_updates["completed_date"] = timezone.now()
+            emp_job_updates["completed_date"] = now
         elif target == "in_progress":
-            emp_job_updates["started_date"] = timezone.now()
+            emp_job_updates["started_date"] = now
+        elif target == "accepted":
+            emp_job_updates["accepted_date"] = now
+        elif target == "redispatching":
+            emp_job_updates["status"] = "EMPLOYEE_CANCELLED"
+            emp_job_updates["is_primary"] = False
+
         EmployeeJob.objects.filter(service_request=service_request).update(**emp_job_updates)
 
-        if target in ["completed", "cancelled"]:
+        if target in ["completed", "cancelled", "redispatching", "unable_to_complete"]:
             from workforce_api.models import JobTrackingSession
             closing_status = (
                 JobTrackingSession.SessionStatus.COMPLETED
@@ -103,20 +121,18 @@ def apply_transition(service_request, target_status: str, actor=None) -> str:
                 status=JobTrackingSession.SessionStatus.ACTIVE,
             ).update(
                 status=closing_status,
-                ended_at=timezone.now(),
+                ended_at=now,
             )
             if service_request.assigned_employee:
                 from workforce_api.services.workload import reconcile_employee_availability
                 reconcile_employee_availability(service_request.assigned_employee)
-                import logging as _logging
-                _logging.getLogger("workforce.state_machine").info(
+                logger.info(
                     f"[EMPLOYEE_RELEASED] employee={service_request.assigned_employee.id} "
-                    f"completed_job={service_request.id} state=AVAILABLE"
+                    f"job={service_request.id} target_state={target.upper()}"
                 )
     except Exception as _sm_err:
-        import logging as _logging
-        _logging.getLogger("workforce.state_machine").exception(
-            "Non-fatal error in post-transition side-effects for %s -> %s: %s",
+        logger.exception(
+            "Non-fatal error in post-transition side-effects for Job #%s -> %s: %s",
             service_request.pk, target, _sm_err
         )
 

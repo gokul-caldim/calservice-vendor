@@ -103,7 +103,7 @@ class LoginView(APIView):
         except Exception as e:
             logger.error("Error in LoginView: %s", str(e), exc_info=True)
             return Response(
-                {"error": f"Login failed: {str(e)}", "details": str(e), "code": "LOGIN_ERROR"},
+                {"error": "Unable to complete sign-in. Please try again later.", "code": "LOGIN_ERROR"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
@@ -167,7 +167,7 @@ class MeView(APIView):
         except Exception as e:
             logger.error("Unhandled exception in MeView: %s", str(e), exc_info=True)
             return Response(
-                {"error": "Failed to retrieve user profile.", "details": str(e), "code": "AUTH_ME_ERROR"},
+                {"error": "Failed to retrieve user profile.", "code": "AUTH_ME_ERROR"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 

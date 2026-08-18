@@ -317,27 +317,22 @@ class ClockInView(APIView):
                 status="draft",
             )
 
-            # Transition ServiceRequest to in_progress
-            locked_job.status = "in_progress"
-            locked_job.assigned_employee = emp
-            locked_job.save(update_fields=["status", "assigned_employee"])
-
-            # Transition or create EmployeeJob to IN_PROGRESS
+            # Transition or create EmployeeJob to ensure assignment record exists
             emp_job = EmployeeJob.objects.select_for_update().filter(service_request=locked_job, employee=emp).first()
-            if emp_job:
-                emp_job.status = "IN_PROGRESS"
-                if not emp_job.started_date:
-                    emp_job.started_date = now
-                emp_job.save(update_fields=["status", "started_date"])
-            else:
+            if not emp_job:
                 EmployeeJob.objects.create(
                     service_request=locked_job,
                     employee=emp,
-                    status="IN_PROGRESS",
+                    status="ARRIVED",
                     is_primary=True,
-                    started_date=now,
                     accepted_date=now,
                 )
+
+            # Transition ServiceRequest to IN_PROGRESS through authoritative state machine
+            locked_job.assigned_employee = emp
+            locked_job.save(update_fields=["assigned_employee"])
+            from service_requests.state_machine import apply_transition
+            apply_transition(locked_job, "in_progress", actor=request.user)
 
             # Update User.last_known_location
             user_loc = {

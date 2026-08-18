@@ -73,8 +73,6 @@ export function AdminReportsPage() {
             {[
               { id: 'employee', label: 'Employee Roster' },
               { id: 'job', label: 'Field Jobs' },
-              { id: 'payroll', label: 'Payroll Summaries' },
-              { id: 'compliance', label: 'Compliance Audit' },
             ].map((t) => (
               <button
                 key={t.id}

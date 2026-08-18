@@ -460,16 +460,16 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         emp = self._get_context_emp()
         if not emp:
             return False
-        active_statuses = [
-            "accepted", "on_the_way", "arrived", "in_progress",
-            "service_completed", "proof_submitted", "payment_pending", "completed"
-        ]
+        from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES
         is_assigned = (obj.assigned_employee_id == emp.id)
-        is_active_or_done = obj.status in active_statuses
-        return bool(is_assigned and is_active_or_done)
+        is_active = str(obj.status).lower() in ACTIVE_WORKLOAD_STATUSES
+        return bool(is_assigned and is_active)
 
     def get_is_assigned_to_current_employee(self, obj):
-        return self.get_is_accepted_by_current_employee(obj)
+        emp = self._get_context_emp()
+        if not emp:
+            return False
+        return bool(obj.assigned_employee_id == emp.id)
 
     def get_is_offer(self, obj):
         if self.get_is_accepted_by_current_employee(obj):

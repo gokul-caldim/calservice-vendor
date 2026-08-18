@@ -608,17 +608,42 @@ def run_full_state_machine_audit_suite():
     assert resp_cash.data.get("change_returned") == "300.00"
     assert "payment_otp" not in resp_cash.data, "Payment OTP MUST NEVER be leaked in technician response"
 
-    # Verify payment status is PAID and change correctly stored
+    # Verify payment status is CASH_PENDING and change correctly stored
     job_pmt = JobPayment.objects.get(job=booking_cod)
+    booking_cod.refresh_from_db()
+
+    assert job_pmt.payment_status == JobPayment.PaymentStatus.CASH_PENDING
+    assert job_pmt.change_returned == Decimal("300.00")
+    print("  ✓ Cash collection verified: change Rs. 300.00 calculated, Payment marked CASH_PENDING.")
+
+    # Retrieve Customer Payment OTP
+    from workforce_api.models import WorkforceNotification
+    notif = WorkforceNotification.objects.filter(recipient=booking_cod.customer, notification_type="PAYMENT_CONFIRMATION_OTP").latest("created_at")
+    import re
+    otp_match = re.search(r"\b(\d{6})\b", notif.message)
+    assert otp_match, f"OTP not found in notification: {notif.message}"
+    cust_payment_otp = otp_match.group(1)
+
+    # Verify OTP via WorkforceJobPaymentVerifyOTPView
+    from workforce_api.views import WorkforceJobPaymentVerifyOTPView
+    req_v_otp = factory.post(
+        f"/api/workforce/jobs/{booking_cod.id}/payment/verify-otp/",
+        {"otp": cust_payment_otp},
+        format="json"
+    )
+    force_authenticate(req_v_otp, user=winner_emp.user)
+    resp_v_otp = WorkforceJobPaymentVerifyOTPView.as_view()(req_v_otp, pk=booking_cod.id)
+    assert resp_v_otp.status_code == 200
+
+    job_pmt.refresh_from_db()
     booking_cod.refresh_from_db()
     winner_emp.refresh_from_db()
 
     assert job_pmt.payment_status == JobPayment.PaymentStatus.PAID
     assert job_pmt.amount_paid == Decimal("1200.00")
-    assert job_pmt.change_returned == Decimal("300.00")
     assert booking_cod.status == "completed"
     assert winner_emp.current_availability == "available"
-    print("  ✓ Cash collection verified: change ₹300.00 calculated, Payment marked PAID, Job completed, Tech reset to AVAILABLE.")
+    print("  ✓ Customer OTP verified: Payment marked PAID, Job completed, Tech reset to AVAILABLE.")
 
     # ==========================================================================
     # 16. MULTI-ACTOR AUTHORIZATION MATRIX (7 Personas)

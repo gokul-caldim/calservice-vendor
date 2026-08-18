@@ -13,13 +13,7 @@ import {
   apiCustomerDecideExtension,
   apiProgressExtension,
   apiRequestPartsPurchase,
-  apiTimeTrackingAction,
   apiGetTimeTracking,
-  apiApplyLeave,
-  apiGetMySchedule,
-  apiGetLeaves,
-  apiGetMyPayslips,
-  apiGetComplianceRecords,
   apiGetMySkills,
   apiAcceptJobOffer,
   apiCancelJobAssignment,
@@ -35,7 +29,6 @@ import {
   apiVerifyArrival,
 } from '../../api/workforceService.js';
 import { apiClockIn } from '../../api/clockInApi.js';
-import { ClockInCard } from '../../components/employee/ClockInCard.jsx';
 import { JobTrackingMap } from '../../components/employee/JobTrackingMap.jsx';
 
 import { AppShell } from '../../components/common/AppShell.jsx';
@@ -89,10 +82,6 @@ export function EmployeeDashboardPage() {
   const [jobQueueTab, setJobQueueTab] = useState('active'); // 'active' | 'completed' | 'all'
   const [profile, setProfile] = useState(null);
   const [timeTracking, setTimeTracking] = useState(null);
-  const [schedules, setSchedules] = useState([]);
-  const [leaves, setLeaves] = useState([]);
-  const [payslips, setPayslips] = useState([]);
-  const [complianceRecords, setComplianceRecords] = useState([]);
   const [skills, setSkills] = useState([]);
   const [selectedServiceIds, setSelectedServiceIds] = useState([]);
 
@@ -531,13 +520,6 @@ export function EmployeeDashboardPage() {
   const [partVendor, setPartVendor] = useState('');
   const [isSubmittingPart, setIsSubmittingPart] = useState(false);
 
-  const [showLeaveModal, setShowLeaveModal] = useState(false);
-  const [leaveType, setLeaveType] = useState('Casual Leave');
-  const [leaveStart, setLeaveStart] = useState('');
-  const [leaveEnd, setLeaveEnd] = useState('');
-  const [leaveReason, setLeaveReason] = useState('');
-  const [isSubmittingLeave, setIsSubmittingLeave] = useState(false);
-
   const [catalogCategories, setCatalogCategories] = useState([]);
   const [serviceActionLoading, setServiceActionLoading] = useState(null);
 
@@ -758,20 +740,12 @@ export function EmployeeDashboardPage() {
 
   // Fetch module specific data depending on active path
   useEffect(() => {
-    if (pathname.includes('/schedule')) {
-      apiGetMySchedule().then(setSchedules).catch(() => setSchedules([]));
-    } else if (pathname.includes('/earnings')) {
-      apiGetMyPayslips().then(setPayslips).catch(() => setPayslips([]));
-    } else if (pathname.includes('/documents')) {
-      apiGetComplianceRecords().then(setComplianceRecords).catch(() => setComplianceRecords([]));
-    } else if (pathname.includes('/services')) {
+    if (pathname.includes('/services') || pathname.includes('/documents')) {
       apiGetMySkills().then(setSkills).catch(() => setSkills([]));
       apiGetCatalog().then(setCatalogCategories).catch(() => setCatalogCategories([]));
       apiGetOnboardingProfile().then(setProfile).catch(() => {});
-    } else if (pathname.includes('/leave') || hash === '#leave') {
-      apiGetLeaves().then(setLeaves).catch(() => setLeaves([]));
     }
-  }, [pathname, hash]);
+  }, [pathname]);
 
   const handleRequestService = async (serviceId, name) => {
     try {
@@ -1092,31 +1066,6 @@ export function EmployeeDashboardPage() {
     }
   };
 
-  const handleApplyLeaveSubmit = async (e) => {
-    e.preventDefault();
-    try {
-      setIsSubmittingLeave(true);
-      await apiApplyLeave({
-        leave_type: leaveType,
-        start_date: leaveStart,
-        end_date: leaveEnd,
-        reason: leaveReason,
-      });
-      setShowLeaveModal(false);
-      setLeaveStart('');
-      setLeaveEnd('');
-      setLeaveReason('');
-      setSuccessMsg('Leave application submitted for Admin approval.');
-      const updated = await apiGetLeaves().catch(() => []);
-      setLeaves(updated);
-      setTimeout(() => setSuccessMsg(''), 4000);
-    } catch (err) {
-      setError(err.message || 'Failed to submit leave application.');
-    } finally {
-      setIsSubmittingLeave(false);
-    }
-  };
-
   return (
     <AppShell breadcrumbs={[{ label: 'Home' }, { label: 'Technician Hub' }]}>
       <div className="space-y-4">
@@ -1161,38 +1110,8 @@ export function EmployeeDashboardPage() {
             >
               {isOnline ? 'GO OFFLINE' : 'GO ONLINE'}
             </button>
-
-            <button
-              type="button"
-              onClick={() => setShowLeaveModal(true)}
-              className="px-2.5 py-1.5 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold transition-colors inline-flex items-center gap-1"
-            >
-              <Calendar className="w-3.5 h-3.5 text-slate-500" />
-              <span>Apply Leave</span>
-            </button>
           </div>
         </div>
-
-        {/* Geofenced Clock-In & Shift Attendance Card: Render ONLY on Main Dashboard */}
-        {!pathname.includes('/schedule') &&
-          !pathname.includes('/attendance') &&
-          !pathname.includes('/leave') &&
-          !hash.includes('#attendance') &&
-          !hash.includes('#leave') &&
-          !pathname.includes('/earnings') &&
-          !pathname.includes('/documents') &&
-          !pathname.includes('/services') &&
-          !pathname.includes('/settings') && (
-            <ClockInCard
-              onStatusChange={loadDashboard}
-              activeJob={jobs.find((j) => ['accepted', 'on_the_way', 'arrived', 'in_progress'].includes((j.status || '').toLowerCase()))}
-              hasActiveJob={jobs.some((j) => ['accepted', 'on_the_way', 'arrived', 'in_progress'].includes((j.status || '').toLowerCase()))}
-              isOnline={isOnline}
-              currentLocation={currentLocation}
-              onLocationUpdate={handleGPSPosition}
-              gpsError={gpsErrorState}
-            />
-          )}
 
         {/* Notifications */}
         {error && <ErrorState message={error} onDismiss={() => setError('')} />}
@@ -1205,231 +1124,51 @@ export function EmployeeDashboardPage() {
 
         {/* ── ROUTE SPECIFIC VIEWS ── */}
 
-        {/* 1. SCHEDULE TAB */}
-        {pathname.includes('/schedule') && (
-          <div className="bg-white border border-slate-200 rounded overflow-hidden shadow-sm">
-            <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-              <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
-                <Calendar className="w-4 h-4 text-blue-600" />
-                Work Schedule & Shift Timings
-              </h2>
-            </div>
-            <div className="p-4">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 text-slate-600 font-semibold uppercase text-[11px] border-b border-slate-200">
-                  <tr>
-                    <th className="px-4 py-2.5">Day of Week</th>
-                    <th className="px-4 py-2.5">Working Day</th>
-                    <th className="px-4 py-2.5">Start Time</th>
-                    <th className="px-4 py-2.5">End Time</th>
-                    <th className="px-4 py-2.5">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].map((day, idx) => {
-                    const sch = schedules.find((s) => s.day_of_week === idx);
-                    const isWorkDay = sch ? sch.is_working_day : idx < 5;
-                    return (
-                      <tr key={day} className="hover:bg-slate-50">
-                        <td className="px-4 py-3 font-semibold text-slate-800">{day}</td>
-                        <td className="px-4 py-3">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${isWorkDay ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-500'}`}>
-                            {isWorkDay ? 'WORK DAY' : 'OFF DAY'}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 font-mono text-slate-700">{sch?.start_time || '09:00:00'}</td>
-                        <td className="px-4 py-3 font-mono text-slate-700">{sch?.end_time || '18:00:00'}</td>
-                        <td className="px-4 py-3 text-slate-500">Active Schedule</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {/* 2. ATTENDANCE TAB */}
-        {(pathname.includes('/attendance') || hash === '#attendance') && (
-          <div className="bg-white border border-slate-200 rounded overflow-hidden shadow-sm">
-            <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-              <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
-                <Clock className="w-4 h-4 text-blue-600" />
-                Shift Attendance & Action Logs
-              </h2>
-            </div>
-            <div className="p-4">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 text-slate-600 font-semibold uppercase text-[11px] border-b border-slate-200">
-                  <tr>
-                    <th className="px-4 py-2.5">Log ID</th>
-                    <th className="px-4 py-2.5">Timestamp</th>
-                    <th className="px-4 py-2.5">Action Executed</th>
-                    <th className="px-4 py-2.5">Shift Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {timeTracking?.logs && timeTracking.logs.length > 0 ? (
-                    timeTracking.logs.map((log) => (
-                      <tr key={log.id} className="hover:bg-slate-50">
-                        <td className="px-4 py-3 font-mono text-slate-500">#{log.id}</td>
-                        <td className="px-4 py-3 text-slate-800">{new Date(log.timestamp).toLocaleString()}</td>
-                        <td className="px-4 py-3 font-semibold text-blue-700 capitalize">{log.action.replace('_', ' ')}</td>
-                        <td className="px-4 py-3">
-                          <StatusBadge status={log.shift_status} size="xs" />
-                        </td>
-                      </tr>
-                    ))
-                  ) : (
-                    <tr>
-                      <td colSpan={4} className="px-4 py-8 text-center text-slate-500">
-                        No shift attendance logs recorded for today.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {/* 3. LEAVE TAB */}
-        {(pathname.includes('/leave') || hash === '#leave') && (
-          <div className="bg-white border border-slate-200 rounded overflow-hidden shadow-sm">
-            <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-              <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
-                <Calendar className="w-4 h-4 text-blue-600" />
-                My Leaves & Absence Applications ({leaves.length})
-              </h2>
-              <button
-                type="button"
-                onClick={() => setShowLeaveModal(true)}
-                className="px-3 py-1 bg-blue-600 text-white font-bold rounded text-xs hover:bg-blue-700"
-              >
-                + New Application
-              </button>
-            </div>
-            <div className="p-4">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 text-slate-600 font-semibold uppercase text-[11px] border-b border-slate-200">
-                  <tr>
-                    <th className="px-4 py-2.5">Leave Type</th>
-                    <th className="px-4 py-2.5">Start Date</th>
-                    <th className="px-4 py-2.5">End Date</th>
-                    <th className="px-4 py-2.5">Reason</th>
-                    <th className="px-4 py-2.5">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {leaves.length > 0 ? (
-                    leaves.map((l, idx) => (
-                      <tr key={l.id ? `leave-${l.id}` : `leave-idx-${idx}`} className="hover:bg-slate-50">
-                        <td className="px-4 py-3 font-semibold text-slate-800">{l.leave_type}</td>
-                        <td className="px-4 py-3 text-slate-700">{l.start_date}</td>
-                        <td className="px-4 py-3 text-slate-700">{l.end_date}</td>
-                        <td className="px-4 py-3 text-slate-500 max-w-xs truncate">{l.reason}</td>
-                        <td className="px-4 py-3">
-                          <StatusBadge status={l.status} size="xs" />
-                        </td>
-                      </tr>
-                    ))
-                  ) : (
-                    <tr>
-                      <td colSpan={5} className="px-4 py-8 text-center text-slate-500">
-                        No leave applications submitted.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {/* 4. EARNINGS TAB */}
-        {pathname.includes('/earnings') && (
-          <div className="bg-white border border-slate-200 rounded overflow-hidden shadow-sm">
-            <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-              <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
-                <CreditCard className="w-4 h-4 text-emerald-600" />
-                Earnings & Issued Payslips ({payslips.length})
-              </h2>
-            </div>
-            <div className="p-4">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 text-slate-600 font-semibold uppercase text-[11px] border-b border-slate-200">
-                  <tr>
-                    <th className="px-4 py-2.5">Pay Period</th>
-                    <th className="px-4 py-2.5">Base Earnings</th>
-                    <th className="px-4 py-2.5">Job Share</th>
-                    <th className="px-4 py-2.5">Net Pay</th>
-                    <th className="px-4 py-2.5">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {payslips.length > 0 ? (
-                    payslips.map((p) => (
-                      <tr key={p.id} className="hover:bg-slate-50">
-                        <td className="px-4 py-3 font-semibold text-slate-800">{p.pay_period_name || `Period #${p.pay_period}`}</td>
-                        <td className="px-4 py-3 font-mono text-slate-700">₹{p.base_earnings}</td>
-                        <td className="px-4 py-3 font-mono text-slate-700">₹{p.job_earnings}</td>
-                        <td className="px-4 py-3 font-mono font-bold text-emerald-700">₹{p.net_pay}</td>
-                        <td className="px-4 py-3">
-                          <StatusBadge status={p.status} size="xs" />
-                        </td>
-                      </tr>
-                    ))
-                  ) : (
-                    <tr>
-                      <td colSpan={5} className="px-4 py-8 text-center text-slate-500">
-                        No issued payslips found for current billing cycle.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {/* 5. DOCUMENTS TAB */}
+        {/* 1. DOCUMENTS TAB */}
         {pathname.includes('/documents') && (
           <div className="bg-white border border-slate-200 rounded overflow-hidden shadow-sm">
             <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center justify-between">
               <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
                 <ShieldCheck className="w-4 h-4 text-blue-600" />
-                Compliance & Dossier Documents ({complianceRecords.length})
+                Verified Identification & Dossier Documents
               </h2>
             </div>
             <div className="p-4">
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50 text-slate-600 font-semibold uppercase text-[11px] border-b border-slate-200">
                   <tr>
-                    <th className="px-4 py-2.5">Requirement</th>
-                    <th className="px-4 py-2.5">Document #</th>
-                    <th className="px-4 py-2.5">Expiry Date</th>
-                    <th className="px-4 py-2.5">Status</th>
+                    <th className="px-4 py-2.5">Document Type</th>
+                    <th className="px-4 py-2.5">Document Number</th>
+                    <th className="px-4 py-2.5">Verification Status</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {complianceRecords.length > 0 ? (
-                    complianceRecords.map((c) => (
-                      <tr key={c.id} className="hover:bg-slate-50">
-                        <td className="px-4 py-3 font-semibold text-slate-800">{c.requirement_title}</td>
-                        <td className="px-4 py-3 font-mono text-slate-700">{c.document_number || '—'}</td>
-                        <td className="px-4 py-3 text-slate-700">{c.expiry_date || 'N/A'}</td>
+                  {(() => {
+                    const docs = profile?.documents_status || profile?.onboarding_data?.documents || profile?.bank_details?.onboarding?.documents || {};
+                    const entries = Object.entries(docs);
+                    if (entries.length === 0) {
+                      return (
+                        <tr>
+                          <td colSpan={3} className="px-4 py-8 text-center text-slate-500">
+                            No onboarding dossier documents on file.
+                          </td>
+                        </tr>
+                      );
+                    }
+                    return entries.map(([docKey, docVal]) => (
+                      <tr key={docKey} className="hover:bg-slate-50">
+                        <td className="px-4 py-3 font-semibold text-slate-800 capitalize">
+                          {docKey.replace(/_/g, ' ')}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-slate-700">
+                          {docVal?.document_number || '—'}
+                        </td>
                         <td className="px-4 py-3">
-                          <StatusBadge status={c.status} size="xs" />
+                          <StatusBadge status={docVal?.status || 'approved'} size="xs" />
                         </td>
                       </tr>
-                    ))
-                  ) : (
-                    <tr>
-                      <td colSpan={4} className="px-4 py-8 text-center text-slate-500">
-                        No compliance records required.
-                      </td>
-                    </tr>
-                  )}
+                    ));
+                  })()}
                 </tbody>
               </table>
             </div>
@@ -1750,13 +1489,7 @@ export function EmployeeDashboardPage() {
         )}
 
         {/* 8. DEFAULT: ACTIVE JOBS WORKSPACE */}
-        {!pathname.includes('/schedule') &&
-          !pathname.includes('/attendance') &&
-          !pathname.includes('/leave') &&
-          !hash.includes('#attendance') &&
-          !hash.includes('#leave') &&
-          !pathname.includes('/earnings') &&
-          !pathname.includes('/documents') &&
+        {!pathname.includes('/documents') &&
           !pathname.includes('/services') &&
           !pathname.includes('/settings') && (
             <>
@@ -2805,76 +2538,7 @@ export function EmployeeDashboardPage() {
             </>
           )}
 
-        {/* Modal: Apply Leave */}
-        <Modal
-          isOpen={showLeaveModal}
-          onClose={() => setShowLeaveModal(false)}
-          title="Apply for Absence / Leave"
-        >
-          <form onSubmit={handleApplyLeaveSubmit} className="space-y-4 text-xs">
-            <div>
-              <label className="block text-slate-700 font-semibold mb-1">Leave Type</label>
-              <select
-                value={leaveType}
-                onChange={(e) => setLeaveType(e.target.value)}
-                className="w-full border border-slate-300 rounded px-3 py-2 text-slate-800"
-              >
-                <option value="Casual Leave">Casual Leave</option>
-                <option value="Sick Leave">Sick Leave</option>
-                <option value="Emergency Leave">Emergency Leave</option>
-              </select>
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-slate-700 font-semibold mb-1">Start Date</label>
-                <input
-                  type="date"
-                  required
-                  value={leaveStart}
-                  onChange={(e) => setLeaveStart(e.target.value)}
-                  className="w-full border border-slate-300 rounded px-3 py-2 text-slate-800"
-                />
-              </div>
-              <div>
-                <label className="block text-slate-700 font-semibold mb-1">End Date</label>
-                <input
-                  type="date"
-                  required
-                  value={leaveEnd}
-                  onChange={(e) => setLeaveEnd(e.target.value)}
-                  className="w-full border border-slate-300 rounded px-3 py-2 text-slate-800"
-                />
-              </div>
-            </div>
-            <div>
-              <label className="block text-slate-700 font-semibold mb-1">Reason</label>
-              <textarea
-                required
-                rows={3}
-                value={leaveReason}
-                onChange={(e) => setLeaveReason(e.target.value)}
-                placeholder="State your reason..."
-                className="w-full border border-slate-300 rounded px-3 py-2 text-slate-800"
-              />
-            </div>
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
-              <button
-                type="button"
-                onClick={() => setShowLeaveModal(false)}
-                className="px-3 py-1.5 rounded border border-slate-300 text-slate-700 hover:bg-slate-50 font-semibold"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={isSubmittingLeave}
-                className="px-4 py-1.5 rounded bg-blue-600 text-white font-bold hover:bg-blue-700"
-              >
-                {isSubmittingLeave ? 'Submitting...' : 'Submit Application'}
-              </button>
-            </div>
-          </form>
-        </Modal>
+
 
         {/* Modal: Proof of Work */}
         <Modal

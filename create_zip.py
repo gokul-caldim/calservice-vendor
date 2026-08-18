@@ -21,7 +21,8 @@ EXCLUDE_DIRS = {
 }
 
 # Files to exclude
-EXCLUDE_EXTENSIONS = {".zip", ".pyc"}
+EXCLUDE_EXTENSIONS = {".zip", ".pyc", ".pyo"}
+EXCLUDE_FILES = {".env", ".env.local", ".env.production", ".env.development", "secrets.json"}
 
 def create_zip():
     print("==================================================")
@@ -39,7 +40,7 @@ def create_zip():
             
             for file in files:
                 file_path = Path(root) / file
-                if file_path.suffix in EXCLUDE_EXTENSIONS or file == "workforce-app.zip":
+                if file_path.name in EXCLUDE_FILES or file_path.suffix in EXCLUDE_EXTENSIONS or file == "workforce-app.zip":
                     continue
                 
                 # Maintain relative path inside zip

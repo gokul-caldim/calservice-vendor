@@ -11,13 +11,13 @@
 export function getEmployeeJobPresentation(job, hasActiveJob = false) {
   if (!job) return null;
 
-  // 1. Authoritative Backend Acceptance Verification
+  // 1. Authoritative Backend Acceptance Verification (active in-flight jobs only)
   const isAcceptedByMe = Boolean(
-    job.is_accepted_by_current_employee ||
-    (job.offer_status === 'ACCEPTED' && job.is_assigned_to_current_employee) ||
+    (job.is_accepted_by_current_employee && !['completed', 'cancelled'].includes((job.status || '').toLowerCase())) ||
+    (job.offer_status === 'ACCEPTED' && job.is_assigned_to_current_employee && !['completed', 'cancelled'].includes((job.status || '').toLowerCase())) ||
     (job.is_assigned_to_current_employee && [
-      'accepted', 'on_the_way', 'arrived', 'in_progress',
-      'service_completed', 'proof_submitted', 'payment_pending', 'completed'
+      'accepted', 'on_the_way', 'en_route', 'arrived', 'in_progress',
+      'proof_submitted'
     ].includes((job.status || '').toLowerCase()))
   );
 
