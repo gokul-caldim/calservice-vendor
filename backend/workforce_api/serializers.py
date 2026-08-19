@@ -128,7 +128,30 @@ class WorkforceEmployeeProfileSerializer(serializers.ModelSerializer):
 
     def get_documents_status(self, obj):
         ob = (obj.bank_details or {}).get("onboarding", {})
-        return ob.get("documents", {})
+        docs_dict = dict(ob.get("documents", {}))
+
+        # Include relational WorkforceEmployeeDocument models if present
+        try:
+            from workforce_api.models import WorkforceEmployeeDocument
+            emp_docs = WorkforceEmployeeDocument.objects.filter(employee=obj).select_related("requirement")
+            for ed in emp_docs:
+                cat = ed.requirement.category or ed.requirement.title.lower().replace(" ", "_")
+                existing = docs_dict.get(cat, {})
+                docs_dict[cat] = {
+                    "category": cat,
+                    "title": ed.requirement.title or existing.get("title", cat.replace("_", " ").title()),
+                    "document_number": ed.document_number or existing.get("document_number", ""),
+                    "file_url": ed.file_url or existing.get("file_url", ""),
+                    "status": ed.status.lower() if ed.status else existing.get("status", "approved"),
+                    "issue_date": str(ed.issue_date) if ed.issue_date else existing.get("issue_date"),
+                    "expiry_date": str(ed.expiry_date) if ed.expiry_date else existing.get("expiry_date"),
+                    "uploaded_at": ed.created_at.isoformat() if ed.created_at else existing.get("uploaded_at"),
+                    "rejection_reason": ed.rejection_reason or existing.get("rejection_reason", ""),
+                }
+        except Exception:
+            pass
+
+        return docs_dict
 
     def get_controlled_fields(self, obj):
         # Fields that are locked once registration is submitted/approved
@@ -415,12 +438,125 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "payment",
             "customer_display_name",
             "active_offer",
+            "cancellation_info",
             "extensions",
             "active_extension",
             "cancellation_info",
             "created_at",
             "updated_at",
+            # Authoritative fields
+            "job_status",
+            "offer_status",
+            "is_offer",
+            "is_accepted_by_current_employee",
+            "is_assigned_to_current_employee",
+            "accepted_at",
+            "cancellation_deadline",
+            "offer_expires_at",
         ]
+
+    def _get_context_emp(self):
+        request = self.context.get("request")
+        if not request or not getattr(request, "user", None):
+            return None
+        return getattr(request.user, "employee_profile", None)
+
+    def _get_emp_offer(self, obj, emp):
+        if not emp:
+            return None
+        from .models import WorkforceJobOffer
+        return WorkforceJobOffer.objects.filter(job=obj, employee=emp).order_by("-offered_at").first()
+
+    def get_job_status(self, obj):
+        return obj.status
+
+    def get_is_accepted_by_current_employee(self, obj):
+        emp = self._get_context_emp()
+        if not emp:
+            return False
+        from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES
+        is_assigned = (obj.assigned_employee_id == emp.id)
+        is_active = str(obj.status).lower() in ACTIVE_WORKLOAD_STATUSES
+        return bool(is_assigned and is_active)
+
+    def get_is_assigned_to_current_employee(self, obj):
+        emp = self._get_context_emp()
+        if not emp:
+            return False
+        return bool(obj.assigned_employee_id == emp.id)
+
+    def get_is_offer(self, obj):
+        if self.get_is_accepted_by_current_employee(obj):
+            return False
+        emp = self._get_context_emp()
+        if not emp:
+            return False
+        offer = self._get_emp_offer(obj, emp)
+        from django.utils import timezone
+        if offer and offer.status == "OFFERED" and offer.expires_at > timezone.now():
+            return True
+        return False
+
+    def get_offer_status(self, obj):
+        emp = self._get_context_emp()
+        if not emp:
+            return None
+        if self.get_is_accepted_by_current_employee(obj):
+            return "ACCEPTED"
+        offer = self._get_emp_offer(obj, emp)
+        if not offer:
+            return None
+        from django.utils import timezone
+        if offer.status == "OFFERED" and offer.expires_at <= timezone.now():
+            return "EXPIRED"
+        return offer.status
+
+    def get_offer_expires_at(self, obj):
+        if not self.get_is_offer(obj):
+            return None
+        emp = self._get_context_emp()
+        offer = self._get_emp_offer(obj, emp)
+        from django.utils import timezone
+        if offer and offer.status == "OFFERED" and offer.expires_at > timezone.now():
+            return offer.expires_at.isoformat()
+        return None
+
+    def get_accepted_at(self, obj):
+        if not self.get_is_accepted_by_current_employee(obj):
+            return None
+        emp = self._get_context_emp()
+        from .models import WorkforceJobLifecycleEvent
+        accept_event = WorkforceJobLifecycleEvent.objects.filter(
+            job=obj,
+            employee=emp,
+            event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
+        ).order_by("-created_at").first()
+        if accept_event and accept_event.accepted_at:
+            return accept_event.accepted_at.isoformat()
+        return (obj.updated_at or obj.created_at).isoformat() if (obj.updated_at or obj.created_at) else None
+
+    def get_cancellation_deadline(self, obj):
+        if not self.get_is_accepted_by_current_employee(obj):
+            return None
+        if obj.status not in ["accepted", "on_the_way"]:
+            return None
+        emp = self._get_context_emp()
+        from .models import WorkforceJobLifecycleEvent
+        accept_event = WorkforceJobLifecycleEvent.objects.filter(
+            job=obj,
+            employee=emp,
+            event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
+        ).order_by("-created_at").first()
+        if accept_event and accept_event.cancellation_deadline:
+            return accept_event.cancellation_deadline.isoformat()
+        from datetime import timedelta
+        from django.utils import timezone
+        accepted_at = accept_event.accepted_at if accept_event else (obj.updated_at or obj.created_at)
+        if accepted_at:
+            deadline = accepted_at + timedelta(minutes=5)
+            if deadline > timezone.now():
+                return deadline.isoformat()
+        return None
 
     def get_distance_km(self, obj):
         request = self.context.get("request")
@@ -449,10 +585,9 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         return obj.issue_title or obj.service_category
 
     def get_active_offer(self, obj):
-        request = self.context.get("request")
-        if not request or not getattr(request, "user", None):
+        if self.get_is_accepted_by_current_employee(obj):
             return None
-        emp = getattr(request.user, "employee_profile", None)
+        emp = self._get_context_emp()
         if not emp:
             return None
         from .models import WorkforceJobOffer
@@ -460,13 +595,14 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         offer = WorkforceJobOffer.objects.filter(job=obj, employee=emp, status="OFFERED").first()
         if not offer:
             return None
-        is_expired = offer.expires_at < timezone.now()
+        if offer.expires_at <= timezone.now():
+            return None
         return {
             "id": offer.id,
-            "status": "EXPIRED" if is_expired else offer.status,
+            "status": "OFFERED",
             "offered_at": offer.offered_at.isoformat(),
             "expires_at": offer.expires_at.isoformat(),
-            "is_expired": is_expired,
+            "is_expired": False,
         }
 
     def get_extensions(self, obj):

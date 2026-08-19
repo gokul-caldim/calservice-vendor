@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from datetime import timedelta, time
 import uuid
+import secrets
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
@@ -88,7 +89,12 @@ def run_9gate_and_gps_states_tests():
     def create_test_tech(username, emp_id_str, company, is_online=True, availability="available", lat=12.9750, lon=77.6440, gps_age_s=0, active=True):
         user, _ = User.objects.get_or_create(
             username=username,
-            defaults={"email": f"{username}@test.com", "role": "employee", "first_name": username}
+            defaults={
+                "email": f"{username}@test.com",
+                "phone": f"+9198{secrets.randbelow(89999999)+10000000}",
+                "role": "employee",
+                "first_name": username
+            }
         )
         user.set_password("Pass1234!")
         user.is_active = active
@@ -159,7 +165,11 @@ def run_9gate_and_gps_states_tests():
 
     cust_user, _ = User.objects.get_or_create(
         username=f"cust_9gate_{test_id}",
-        defaults={"email": f"cust_9gate_{test_id}@test.com", "role": "customer"}
+        defaults={
+            "email": f"cust_9gate_{test_id}@test.com",
+            "phone": f"+9198{secrets.randbelow(89999999)+10000000}",
+            "role": "customer"
+        }
     )
     cust_user.company = comp_a
     cust_user.save()
@@ -356,7 +366,7 @@ def run_9gate_and_gps_states_tests():
     
     # Gate 1: Account Inactive
     g1_tech = create_test_tech(f"g1_{test_id}", f"EMP_G1_{test_id}", comp_a, active=False)
-    is_ok, reason = check_candidate_eligibility(g1_tech, f"HVAC & AC Service ({test_id})")
+    is_ok, reason, _ = check_candidate_eligibility(g1_tech, f"HVAC & AC Service ({test_id})")
     assert is_ok is False and "GATE 1" in reason.upper(), f"Gate 1 failed: {reason}"
     print("[PASS] Gate 1 Fail-Closed: Inactive account rejected.")
 
@@ -364,7 +374,7 @@ def run_9gate_and_gps_states_tests():
     g2_tech = create_test_tech(f"g2_{test_id}", f"EMP_G2_{test_id}", comp_a)
     g2_tech.bank_details["onboarding"]["status"] = "pending"
     g2_tech.save()
-    is_ok, reason = check_candidate_eligibility(g2_tech, f"HVAC & AC Service ({test_id})")
+    is_ok, reason, _ = check_candidate_eligibility(g2_tech, f"HVAC & AC Service ({test_id})")
     assert is_ok is False and "GATE 2" in reason.upper(), f"Gate 2 failed: {reason}"
     print("[PASS] Gate 2 Fail-Closed: Unapproved onboarding rejected.")
 
@@ -372,33 +382,33 @@ def run_9gate_and_gps_states_tests():
     g3_tech = create_test_tech(f"g3_{test_id}", f"EMP_G3_{test_id}", comp_a)
     g3_tech.bank_details["onboarding"]["documents"]["id_proof"]["status"] = "rejected"
     g3_tech.save()
-    is_ok, reason = check_candidate_eligibility(g3_tech, f"HVAC & AC Service ({test_id})")
+    is_ok, reason, _ = check_candidate_eligibility(g3_tech, f"HVAC & AC Service ({test_id})")
     assert is_ok is False and "GATE 3" in reason.upper(), f"Gate 3 failed: {reason}"
     print("[PASS] Gate 3 Fail-Closed: Rejected/missing documents rejected.")
 
     # Gate 4: Compliance Invalid
     g4_tech = create_test_tech(f"g4_{test_id}", f"EMP_G4_{test_id}", comp_a)
     WorkforceEmployeeCompliance.objects.filter(employee=g4_tech).update(status="EXPIRED")
-    is_ok, reason = check_candidate_eligibility(g4_tech, f"HVAC & AC Service ({test_id})")
+    is_ok, reason, _ = check_candidate_eligibility(g4_tech, f"HVAC & AC Service ({test_id})")
     assert is_ok is False and "GATE 4" in reason.upper(), f"Gate 4 failed: {reason}"
     print("[PASS] Gate 4 Fail-Closed: Expired mandatory compliance rejected.")
 
     # Gate 5: Working Schedule Outside Hours
     g5_tech = create_test_tech(f"g5_{test_id}", f"EMP_G5_{test_id}", comp_a)
     WorkforceEmployeeSchedule.objects.filter(employee=g5_tech).update(is_working_day=False)
-    is_ok, reason = check_candidate_eligibility(g5_tech, f"HVAC & AC Service ({test_id})")
+    is_ok, reason, _ = check_candidate_eligibility(g5_tech, f"HVAC & AC Service ({test_id})")
     assert is_ok is False and "GATE 5" in reason.upper(), f"Gate 5 failed: {reason}"
     print("[PASS] Gate 5 Fail-Closed: Scheduled off today rejected.")
 
     # Gate 6: Service / Skill Mismatch
     g6_tech = create_test_tech(f"g6_{test_id}", f"EMP_G6_{test_id}", comp_a)
-    is_ok, reason = check_candidate_eligibility(g6_tech, "Unrelated Plumbing Specialty")
+    is_ok, reason, _ = check_candidate_eligibility(g6_tech, "Unrelated Plumbing Specialty")
     assert is_ok is False and "GATE 6" in reason.upper(), f"Gate 6 failed: {reason}"
     print("[PASS] Gate 6 Fail-Closed: Service/skill mismatch rejected.")
 
     # Gate 7: Live Presence (Offline/Unavailable)
     g7_tech = create_test_tech(f"g7_{test_id}", f"EMP_G7_{test_id}", comp_a, is_online=True, availability="busy")
-    is_ok, reason = check_candidate_eligibility(g7_tech, f"HVAC & AC Service ({test_id})")
+    is_ok, reason, _ = check_candidate_eligibility(g7_tech, f"HVAC & AC Service ({test_id})")
     assert is_ok is False and "GATE 7" in reason.upper(), f"Gate 7 failed: {reason}"
     print("[PASS] Gate 7 Fail-Closed: Unavailable presence rejected.")
 
@@ -410,7 +420,7 @@ def run_9gate_and_gps_states_tests():
         "end_date": (timezone.now() + timedelta(days=1)).date().isoformat(),
     }]
     g8_tech.save()
-    is_ok, reason = check_candidate_eligibility(g8_tech, f"HVAC & AC Service ({test_id})")
+    is_ok, reason, _ = check_candidate_eligibility(g8_tech, f"HVAC & AC Service ({test_id})")
     assert is_ok is False and "GATE 8" in reason.upper(), f"Gate 8 failed: {reason}"
     print("[PASS] Gate 8 Fail-Closed: Active approved leave rejected.")
 
@@ -424,7 +434,7 @@ def run_9gate_and_gps_states_tests():
         assigned_employee=g9_tech,
         preferred_date=now.date(),
     )
-    is_ok, reason = check_candidate_eligibility(g9_tech, f"HVAC & AC Service ({test_id})")
+    is_ok, reason, _ = check_candidate_eligibility(g9_tech, f"HVAC & AC Service ({test_id})")
     assert is_ok is False and "GATE 9" in reason.upper(), f"Gate 9 failed: {reason}"
     print("[PASS] Gate 9 Fail-Closed: Active busy job workload rejected.")
 

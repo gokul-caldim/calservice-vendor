@@ -122,6 +122,13 @@ export async function apiAcceptJobOffer(jobId) {
   });
 }
 
+export async function apiCancelJobAssignment(jobId, reasonCode, reasonText = '') {
+  return await apiRequest(`/workforce/jobs/${jobId}/cancel-assignment/`, {
+    method: 'POST',
+    json: { reason_code: reasonCode, reason_text: reasonText },
+  });
+}
+
 export async function apiRejectJobOffer(jobId, reason = '') {
   return await apiRequest(`/workforce/jobs/${jobId}/reject-offer/`, {
     method: 'POST',
@@ -327,6 +334,13 @@ export async function apiRequestService(serviceId, name = '') {
   });
 }
 
+export async function apiBulkRequestServices(serviceIds) {
+  return await apiRequest('/workforce/services/request/', {
+    method: 'POST',
+    json: { service_ids: serviceIds },
+  });
+}
+
 export async function apiRemoveService(serviceId) {
   return await apiRequest('/workforce/services/remove/', {
     method: 'POST',
@@ -399,9 +413,33 @@ export async function apiGetNotifications() {
   return await apiRequest('/workforce/notifications/');
 }
 
-export async function apiMarkNotificationRead(id = null) {
-  const path = id ? `/workforce/notifications/${id}/mark-read/` : '/workforce/notifications/mark-read/';
-  return await apiRequest(path, { method: 'POST' });
+export async function apiMarkNotificationRead(id = null, ids = null) {
+  if (id) {
+    return await apiRequest(`/workforce/notifications/${id}/mark-read/`, { method: 'POST' });
+  }
+  if (ids && ids.length > 0) {
+    return await apiRequest('/workforce/notifications/mark-read/', {
+      method: 'POST',
+      json: { ids },
+    });
+  }
+  return await apiRequest('/workforce/notifications/mark-read/', { method: 'POST' });
+}
+
+export async function apiClearNotifications(id = null, ids = null, clearAll = false) {
+  if (id) {
+    return await apiRequest(`/workforce/notifications/${id}/clear/`, { method: 'POST' });
+  }
+  if (ids && ids.length > 0) {
+    return await apiRequest('/workforce/notifications/clear/', {
+      method: 'POST',
+      json: { ids },
+    });
+  }
+  return await apiRequest('/workforce/notifications/clear/', {
+    method: 'POST',
+    json: { all: true },
+  });
 }
 
 // ── Scheduling (Phase 22) ────────────────────────────────────────────────────
@@ -772,6 +810,23 @@ export async function apiRemoveEmployeeFromLocation(locationId, employeeId) {
     json: { employee_id: employeeId },
   });
 }
+
+// ── Job Lifecycle Timeline Observability (Phase 2) ───────────────────────────
+
+export async function apiGetJobTimeline(jobId) {
+  return await apiRequest(`/workforce/jobs/${jobId}/timeline/`);
+}
+
+// ── Live Road Tracking & Telemetry (CalTrack Live Tracking) ───────────────────
+
+export async function apiGetJobLiveTracking(jobId) {
+  return await apiRequest(`/workforce/jobs/${jobId}/live-tracking/`);
+}
+
+export async function apiGetCustomerJobTracking(jobId) {
+  return await apiRequest(`/workforce/customer/jobs/${jobId}/tracking/`);
+}
+
 
 
 

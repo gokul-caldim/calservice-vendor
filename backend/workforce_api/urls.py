@@ -57,6 +57,7 @@ from .views import (
     WorkforceLocationUpdateView,
     WorkforceNotificationListView,
     WorkforceNotificationMarkReadView,
+    WorkforceNotificationClearView,
     WorkforceScheduleManageView,
     WorkforceMyScheduleView,
     WorkforceSkillManageView,
@@ -69,6 +70,7 @@ from .views import (
     WorkforceAdminPayrollProcessView,
     WorkforceMyPayslipsView,
     WorkforceJobAcceptOfferView,
+    WorkforceJobCancelAssignmentView,
     WorkforceJobRejectOfferView,
     WorkforceJobTechnicianCancelView,
     WorkforceAutoDispatchTriggerView,
@@ -79,6 +81,7 @@ from .views import (
     WorkforceJobPreServicePhotoView,
     WorkforceJobPreServiceStatusView,
     WorkforceJobLiveTrackingView,
+    WorkforceJobTimelineView,
     WorkforceReportsView,
     WorkforceLatencyAuditView,
     WorkforceVerificationSuiteView,
@@ -152,6 +155,7 @@ urlpatterns = [
     path("dispatch/assign/", WorkforceDispatchAssignView.as_view(), name="workforce-dispatch-assign"),
     path("dispatch/auto-dispatch/<int:pk>/", WorkforceAutoDispatchTriggerView.as_view(), name="workforce-auto-dispatch-trigger"),
     path("jobs/<int:pk>/accept-offer/", WorkforceJobAcceptOfferView.as_view(), name="workforce-job-accept-offer"),
+    path("jobs/<int:pk>/cancel-assignment/", WorkforceJobCancelAssignmentView.as_view(), name="workforce-job-cancel-assignment"),
     path("jobs/<int:pk>/reject-offer/", WorkforceJobRejectOfferView.as_view(), name="workforce-job-reject-offer"),
     path("jobs/<int:pk>/cancel/", WorkforceJobTechnicianCancelView.as_view(), name="workforce-job-technician-cancel"),
     path("jobs/<int:pk>/arrive/", WorkforceJobArriveView.as_view(), name="workforce-job-arrive"),
@@ -161,6 +165,7 @@ urlpatterns = [
     path("jobs/<int:pk>/pre-service-photo/", WorkforceJobPreServicePhotoView.as_view(), name="workforce-job-pre-service-photo"),
     path("jobs/<int:pk>/pre-service-status/", WorkforceJobPreServiceStatusView.as_view(), name="workforce-job-pre-service-status"),
     path("jobs/<int:pk>/live-tracking/", WorkforceJobLiveTrackingView.as_view(), name="workforce-job-live-tracking"),
+    path("jobs/<int:pk>/timeline/", WorkforceJobTimelineView.as_view(), name="workforce-job-timeline"),
     path("customer/jobs/<int:pk>/tracking/", WorkforceJobLiveTrackingView.as_view(), name="workforce-customer-job-tracking"),
 
     # Work Extensions & Scope Approvals
@@ -208,6 +213,8 @@ urlpatterns = [
     path("notifications/", WorkforceNotificationListView.as_view(), name="workforce-notifications"),
     path("notifications/mark-read/", WorkforceNotificationMarkReadView.as_view(), name="workforce-notifications-mark-read-all"),
     path("notifications/<int:pk>/mark-read/", WorkforceNotificationMarkReadView.as_view(), name="workforce-notifications-mark-read"),
+    path("notifications/clear/", WorkforceNotificationClearView.as_view(), name="workforce-notifications-clear-all"),
+    path("notifications/<int:pk>/clear/", WorkforceNotificationClearView.as_view(), name="workforce-notifications-clear"),
 
     # Workforce Scheduling (Phase 22)
     path("schedules/manage/", WorkforceScheduleManageView.as_view(), name="workforce-schedules-manage-all"),

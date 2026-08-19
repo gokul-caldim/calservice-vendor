@@ -58,6 +58,10 @@ function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
   return Math.round(R * c);
 }
 
+export const ROUTE_MIN_MOVEMENT_METERS = 50;
+export const ROUTE_MIN_REFRESH_SECONDS = 30;
+export const ROUTE_REQUEST_TIMEOUT_MS = 8000;
+
 export function JobTrackingMap({
   job,
   technicianLocation,
@@ -87,6 +91,7 @@ export function JobTrackingMap({
   const infoWindowRef = useRef(null);
   const lastDirectionsTimeRef = useRef(0);
   const lastRoutedCoordsRef = useRef({ lat: null, lng: null });
+  const lastDestCoordsRef = useRef({ lat: null, lng: null });
 
   const [apiLoaded, setApiLoaded] = useState(false);
   const [apiError, setApiError] = useState(null);
@@ -157,11 +162,44 @@ export function JobTrackingMap({
 
   const animFrameRef = useRef(null);
   const currentPosRef = useRef({ lat: null, lng: null });
+  const isRoutePendingRef = useRef(false);
+  const cachedRouteRef = useRef(null);
   const [directionsFailed, setDirectionsFailed] = useState(false);
+
+  // Generates high-contrast vehicle marker with dynamic movement heading rotation
+  const getVehicleMarkerIcon = useCallback((heading = null) => {
+    if (!window.google?.maps) return null;
+    const hasValidHeading = heading != null && !isNaN(heading) && heading >= 0;
+    const rotationTransform = hasValidHeading ? `transform="rotate(${heading} 27 27)"` : '';
+    return {
+      url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`
+        <svg xmlns="http://www.w3.org/2000/svg" width="54" height="54" viewBox="0 0 54 54">
+          <defs>
+            <filter id="carShadow" x="-20%" y="-20%" width="140%" height="140%">
+              <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#1E3A8A" flood-opacity="0.45"/>
+            </filter>
+          </defs>
+          <circle cx="27" cy="27" r="25" fill="#3B82F6" fill-opacity="0.2"/>
+          <circle cx="27" cy="27" r="18" fill="#2563EB" stroke="#FFFFFF" stroke-width="3" filter="url(#carShadow)"/>
+          <g ${rotationTransform}>
+            <path d="M20 29a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm14 0a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm-17-7l2-5h16l2 5h2a2 2 0 0 1 2 2v6h-2a3 3 0 0 1-6 0h-8a3 3 0 0 1-6 0h-2v-6a2 2 0 0 1 2-2h2zm2-1l-1.5 4h19l-1.5-4H21z" fill="#FFFFFF"/>
+          </g>
+        </svg>
+      `)}`,
+      scaledSize: new window.google.maps.Size(48, 48),
+      anchor: new window.google.maps.Point(24, 24),
+    };
+  }, []);
 
   // Smooth UI Marker Interpolation Engine (Rapido/Swiggy style smooth movement)
   const animateVehicleMarker = useCallback((targetLat, targetLng, heading = null) => {
     if (!techMarkerRef.current || !window.google?.maps) return;
+
+    // Update marker heading rotation
+    if (heading != null && !isNaN(heading) && heading >= 0) {
+      const icon = getVehicleMarkerIcon(heading);
+      if (icon) techMarkerRef.current.setIcon(icon);
+    }
 
     if (currentPosRef.current.lat == null || currentPosRef.current.lng == null) {
       currentPosRef.current = { lat: targetLat, lng: targetLng };
@@ -200,33 +238,53 @@ export function JobTrackingMap({
     };
 
     animFrameRef.current = requestAnimationFrame(step);
-  }, []);
+  }, [getVehicleMarkerIcon]);
 
-  // Request road directions and ETA via Google Maps Directions API
+  // Request road directions and ETA via Google Maps Directions API with strict cost controls & in-flight deduplication
   const updateRoadRoute = useCallback((originLat, originLng, destLat, destLng, force = false) => {
     if (!window.google?.maps || !directionsServiceRef.current || !directionsRendererRef.current) return;
 
-    const now = Date.now();
-    // Debounce & throttle directions requests: at most once every 4 seconds or >30m movement
-    if (!force && now - lastDirectionsTimeRef.current < 4000) return;
+    // Active-job-only routing: do not route if job is completed or cancelled
+    if (job?.status && ['completed', 'cancelled'].includes(job.status.toLowerCase())) {
+      return;
+    }
 
-    if (!force && lastRoutedCoordsRef.current.lat != null && lastRoutedCoordsRef.current.lng != null) {
+    // Deduplicate in-flight requests
+    if (isRoutePendingRef.current) return;
+
+    const now = Date.now();
+    const destChanged =
+      lastDestCoordsRef.current.lat !== destLat ||
+      lastDestCoordsRef.current.lng !== destLng;
+
+    // Debounce & throttle directions requests:
+    // Only call Google Directions if forced, destination changed, or technician moved >= 50m and >= 30s elapsed
+    if (!force && !destChanged && lastRoutedCoordsRef.current.lat != null && lastRoutedCoordsRef.current.lng != null) {
       const movedDist = calculateDistanceMeters(
         originLat,
         originLng,
         lastRoutedCoordsRef.current.lat,
         lastRoutedCoordsRef.current.lng
       );
-      if (movedDist != null && movedDist < 30 && now - lastDirectionsTimeRef.current < 30000) {
-        return;
+      if (
+        movedDist != null &&
+        movedDist < ROUTE_MIN_MOVEMENT_METERS &&
+        now - lastDirectionsTimeRef.current < ROUTE_MIN_REFRESH_SECONDS * 1000
+      ) {
+        return; // Reuse cached road route
       }
     }
 
     lastDirectionsTimeRef.current = now;
     lastRoutedCoordsRef.current = { lat: originLat, lng: originLng };
+    lastDestCoordsRef.current = { lat: destLat, lng: destLng };
 
     const origin = new window.google.maps.LatLng(originLat, originLng);
     const dest = new window.google.maps.LatLng(destLat, destLng);
+
+    isRoutePendingRef.current = true;
+    const reqStartTime = performance.now();
+    console.info(`[MAP_ROUTE_REQUEST] job_id=${job?.id || 'active'} origin=(${originLat},${originLng}) destination=(${destLat},${destLng})`);
 
     directionsServiceRef.current.route(
       {
@@ -236,18 +294,24 @@ export function JobTrackingMap({
         avoidTolls: false,
       },
       (result, status) => {
+        isRoutePendingRef.current = false;
+        const durationMs = Math.round(performance.now() - reqStartTime);
+
         if (status === window.google.maps.DirectionsStatus.OK && result) {
+          cachedRouteRef.current = result;
+          const route = result.routes[0]?.legs[0];
+          console.info(`[MAP_ROUTE_SUCCESS] job_id=${job?.id || 'active'} duration_ms=${durationMs} distance_m=${route?.distance?.value || 0} provider=GoogleDirections`);
           directionsRendererRef.current.setDirections(result);
           setDirectionsFailed(false);
           if (fallbackPolylineRef.current) {
             fallbackPolylineRef.current.setMap(null);
           }
-          const route = result.routes[0]?.legs[0];
           if (route) {
             setRoadEtaText(route.duration?.text || null);
             setRoadDistanceText(route.distance?.text || null);
           }
         } else {
+          console.warn(`[MAP_ROUTE_FAILURE] job_id=${job?.id || 'active'} error=${status}`);
           // Failure: Clean fallback without drawing a fake straight road route
           setDirectionsFailed(true);
           if (fallbackPolylineRef.current) {
@@ -258,7 +322,7 @@ export function JobTrackingMap({
         }
       }
     );
-  }, []);
+  }, [job?.id, job?.status]);
 
   // Listen to live GPS location updates from single global watcher
   useEffect(() => {
@@ -281,32 +345,17 @@ export function JobTrackingMap({
             const latLng = new google.maps.LatLng(newCoords.latitude, newCoords.longitude);
 
             if (!techMarkerRef.current) {
-              const technicianVehicleSvg = {
-                url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`
-                  <svg xmlns="http://www.w3.org/2000/svg" width="54" height="54" viewBox="0 0 54 54">
-                    <defs>
-                      <filter id="carShadow" x="-20%" y="-20%" width="140%" height="140%">
-                        <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#1E3A8A" flood-opacity="0.45"/>
-                      </filter>
-                    </defs>
-                    <circle cx="27" cy="27" r="25" fill="#3B82F6" fill-opacity="0.2"/>
-                    <circle cx="27" cy="27" r="18" fill="#2563EB" stroke="#FFFFFF" stroke-width="3" filter="url(#carShadow)"/>
-                    <path d="M20 29a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm14 0a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm-17-7l2-5h16l2 5h2a2 2 0 0 1 2 2v6h-2a3 3 0 0 1-6 0h-8a3 3 0 0 1-6 0h-2v-6a2 2 0 0 1 2-2h2zm2-1l-1.5 4h19l-1.5-4H21z" fill="#FFFFFF"/>
-                  </svg>
-                `)}`,
-                scaledSize: new google.maps.Size(48, 48),
-                anchor: new google.maps.Point(24, 24),
-              };
+              const icon = getVehicleMarkerIcon(newCoords.heading);
               techMarkerRef.current = new google.maps.Marker({
                 position: latLng,
                 map: mapRef.current,
                 title: viewRole === 'customer' ? 'Technician Live Location' : 'You (Technician)',
-                icon: technicianVehicleSvg,
+                icon: icon,
                 zIndex: 200,
               });
               currentPosRef.current = { lat: newCoords.latitude, lng: newCoords.longitude };
             } else {
-              // Smooth vehicle marker interpolation
+              // Smooth vehicle marker interpolation & heading rotation
               animateVehicleMarker(newCoords.latitude, newCoords.longitude, newCoords.heading);
             }
 
@@ -331,12 +380,12 @@ export function JobTrackingMap({
         cancelAnimationFrame(animFrameRef.current);
       }
     };
-  }, [animateVehicleMarker, custLat, custLon, isFollowMe, updateRoadRoute, viewRole]);
+  }, [animateVehicleMarker, custLat, custLon, getVehicleMarkerIcon, isFollowMe, updateRoadRoute, viewRole]);
 
   // Initialize interactive Google Map with custom high-visibility SVG pins
   useEffect(() => {
     if (!apiLoaded || !mapContainerRef.current) return;
-    if (!window.google?.maps?.Map || typeof window.google.maps.Map !== 'function') return;
+    if (!window.google?.maps?.Map || typeof window.google.maps.Map !== 'function' || !window.google?.maps?.ControlPosition) return;
 
     try {
       const google = window.google;

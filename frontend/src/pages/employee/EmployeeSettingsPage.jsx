@@ -77,10 +77,7 @@ export function EmployeeSettingsPage() {
   const [notifications, setNotifications] = useState({
     security_alerts: true,
     login_alerts: true,
-    leave_updates: true,
     job_assignments: true,
-    shift_reminders: true,
-    payroll_notifications: true,
     weekly_digest: true,
     product_updates: false,
     workspace_announcements: true,
@@ -649,9 +646,6 @@ export function EmployeeSettingsPage() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {[
                     { key: 'job_assignments', label: 'Field Job Offers & Automatic Assignments', desc: 'Alert immediately when new service requests match your skills' },
-                    { key: 'shift_reminders', label: 'Shift Timings & Attendance Reminders', desc: 'Clock-in / Clock-out reminders for your scheduled working days' },
-                    { key: 'leave_updates', label: 'Leave Decisions & Approvals', desc: 'Status updates when an Admin reviews your absence request' },
-                    { key: 'payroll_notifications', label: 'Payroll & Issued Payslips', desc: 'Notice when new pay period payslips are published' },
                     { key: 'security_alerts', label: 'Security & Critical Account Alerts', desc: 'Notices on new logins, password changes, or 2FA updates' },
                     { key: 'workspace_announcements', label: 'Company & Operations Announcements', desc: 'Broad organizational updates from your workforce administrator' },
                     { key: 'weekly_digest', label: 'Weekly Summary & Performance Digest', desc: 'Weekly roundup of completed jobs and customer CSAT metrics' },
@@ -699,7 +693,7 @@ export function EmployeeSettingsPage() {
                     <h3 className="font-bold text-slate-900 text-xs">Export My Data & Records</h3>
                   </div>
                   <p className="text-[11px] text-slate-500 max-w-xl">
-                    Download a structured export of your profile, attendance logs, shift history, completed jobs, and payslips.
+                    Download a structured export of your verified profile, skills, territory locations, and completed jobs history.
                   </p>
                 </div>
                 <button

@@ -11,23 +11,15 @@ import {
   Briefcase,
   Send,
   Navigation,
-  Calendar,
-  Clock,
-  FileSpreadsheet,
-  CalendarDays,
-  CreditCard,
-  ShieldCheck,
   BarChart3,
   Settings,
   ChevronDown,
   ChevronRight,
-  Activity,
-  Layers,
+  ShieldCheck,
   User,
   Star,
   MapPin,
 } from 'lucide-react';
-
 
 export function Sidebar({ onCloseMobile = () => {} }) {
   const { user, isAdmin, isEmployee, registrationStatus } = useAuth();
@@ -37,7 +29,6 @@ export function Sidebar({ onCloseMobile = () => {} }) {
   const [collapsed, setCollapsed] = useState({
     workforce: false,
     operations: false,
-    time: false,
     myWork: false,
     profile: false,
   });
@@ -118,14 +109,6 @@ export function Sidebar({ onCloseMobile = () => {} }) {
                   <Award className="w-3.5 h-3.5 text-slate-400" />
                   <span>Skills</span>
                 </NavLink>
-                <NavLink
-                  to="/workforce/admin/documents"
-                  onClick={onCloseMobile}
-                  className={navItemClass}
-                >
-                  <FileText className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Documents</span>
-                </NavLink>
               </div>
             )}
           </div>
@@ -170,80 +153,12 @@ export function Sidebar({ onCloseMobile = () => {} }) {
                   <Navigation className="w-3.5 h-3.5 text-slate-400" />
                   <span>Live Workforce</span>
                 </NavLink>
-                <NavLink
-                  to="/workforce/admin/scheduling"
-                  onClick={onCloseMobile}
-                  className={navItemClass}
-                >
-                  <Calendar className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Scheduling</span>
-                </NavLink>
               </div>
             )}
           </div>
 
-          {/* Group 3: TIME */}
-          <div>
-            <button
-              type="button"
-              onClick={() => toggleSection('time')}
-              className="w-full flex items-center justify-between px-2 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider hover:text-slate-600 transition-colors"
-            >
-              <span>Time</span>
-              {collapsed.time ? (
-                <ChevronRight className="w-3 h-3" />
-              ) : (
-                <ChevronDown className="w-3 h-3" />
-              )}
-            </button>
-            {!collapsed.time && (
-              <div className="mt-1 space-y-0.5 pl-1">
-                <NavLink
-                  to="/workforce/admin/attendance"
-                  onClick={onCloseMobile}
-                  className={navItemClass}
-                >
-                  <Clock className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Attendance</span>
-                </NavLink>
-                <NavLink
-                  to="/workforce/admin/timesheets"
-                  onClick={onCloseMobile}
-                  className={navItemClass}
-                >
-                  <FileSpreadsheet className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Timesheets</span>
-                </NavLink>
-                <NavLink
-                  to="/workforce/admin/leave"
-                  onClick={onCloseMobile}
-                  className={navItemClass}
-                >
-                  <CalendarDays className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Leave</span>
-                </NavLink>
-              </div>
-            )}
-          </div>
-
-          {/* Standalone Modules */}
+          {/* Reports & Settings */}
           <div className="space-y-0.5 pt-2 border-t border-slate-100">
-            <NavLink
-              to="/workforce/admin/payroll"
-              onClick={onCloseMobile}
-              className={navItemClass}
-            >
-              <CreditCard className="w-3.5 h-3.5 text-slate-400" />
-              <span>Payroll</span>
-            </NavLink>
-            <NavLink
-              to="/workforce/admin/compliance"
-              onClick={onCloseMobile}
-              className={navItemClass}
-            >
-              <ShieldCheck className="w-3.5 h-3.5 text-slate-400" />
-              <span>Compliance</span>
-            </NavLink>
             <NavLink
               to="/workforce/admin/reports"
               onClick={onCloseMobile}
@@ -377,20 +292,12 @@ export function Sidebar({ onCloseMobile = () => {} }) {
           {!collapsed.myWork && (
             <div className="mt-1 space-y-0.5 pl-1">
               <NavLink
-                to="/workforce/employee/dashboard"
+                to="/workforce/employee/jobs"
                 onClick={onCloseMobile}
                 className={navItemClass}
               >
                 <Briefcase className="w-3.5 h-3.5 text-blue-500" />
                 <span>Jobs</span>
-              </NavLink>
-              <NavLink
-                to="/workforce/employee/schedule"
-                onClick={onCloseMobile}
-                className={navItemClass}
-              >
-                <Calendar className="w-3.5 h-3.5 text-slate-400" />
-                <span>Schedule</span>
               </NavLink>
               <NavLink
                 to="/workforce/employee/performance"
@@ -402,54 +309,6 @@ export function Sidebar({ onCloseMobile = () => {} }) {
               </NavLink>
             </div>
           )}
-        </div>
-
-        {/* Group: TIME */}
-        <div>
-          <button
-            type="button"
-            onClick={() => toggleSection('time')}
-            className="w-full flex items-center justify-between px-2 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider hover:text-slate-600 transition-colors"
-          >
-            <span>Time</span>
-            {collapsed.time ? (
-              <ChevronRight className="w-3 h-3" />
-            ) : (
-              <ChevronDown className="w-3 h-3" />
-            )}
-          </button>
-          {!collapsed.time && (
-            <div className="mt-1 space-y-0.5 pl-1">
-              <NavLink
-                to="/workforce/employee/attendance"
-                onClick={onCloseMobile}
-                className={navItemClass}
-              >
-                <Clock className="w-3.5 h-3.5 text-slate-400" />
-                <span>Attendance</span>
-              </NavLink>
-              <NavLink
-                to="/workforce/employee/leave"
-                onClick={onCloseMobile}
-                className={navItemClass}
-              >
-                <CalendarDays className="w-3.5 h-3.5 text-slate-400" />
-                <span>Leave</span>
-              </NavLink>
-            </div>
-          )}
-        </div>
-
-        {/* Standalone: Earnings */}
-        <div>
-          <NavLink
-            to="/workforce/employee/earnings"
-            onClick={onCloseMobile}
-            className={navItemClass}
-          >
-            <CreditCard className="w-3.5 h-3.5 text-slate-400" />
-            <span>Earnings</span>
-          </NavLink>
         </div>
 
         {/* Group: PROFILE */}

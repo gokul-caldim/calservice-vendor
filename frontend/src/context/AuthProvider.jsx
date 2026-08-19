@@ -48,17 +48,20 @@ export function AuthProvider({ children }) {
             }
           }
 
+          const isEmployee = Boolean(empData) || (me.role || '').toLowerCase() === 'employee';
+          const computedRole = isAdmin ? (me.role || 'admin').toLowerCase() : (isEmployee ? 'employee' : (me.role || 'employee').toLowerCase());
+
           const u = {
             id: me.id,
             username: me.username,
             email: me.email || '',
             firstName: me.first_name || '',
             lastName: me.last_name || '',
-            role: (me.role || 'employee').toLowerCase(),
+            role: computedRole,
             companyId: me.company,
             companyName: me.company_name || '',
             isAdmin: isAdmin,
-            isEmployee: (me.role || '').toLowerCase() === 'employee',
+            isEmployee: isEmployee,
             registrationStatus: empData ? (empData.registration_status || 'not_started') : (isAdmin ? 'approved' : 'not_started'),
             isOnline: empData ? Boolean(empData.is_online) : false,
             availability: empData ? (empData.live_availability || 'offline') : 'offline',
@@ -164,6 +167,18 @@ export function AuthProvider({ children }) {
 
     return () => {
       channel.close();
+    };
+  }, []);
+
+  // Handle unauthenticated event triggered from client.js on 401
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      setUser(null);
+      setEmployee(null);
+    };
+    window.addEventListener('workforce:auth-unauthorized', handleUnauthorized);
+    return () => {
+      window.removeEventListener('workforce:auth-unauthorized', handleUnauthorized);
     };
   }, []);
 

@@ -15,10 +15,22 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Load .env file
 load_dotenv(BASE_DIR / ".env")
 
-SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("DJANGO_SECRET_KEY") or "workforce-secret-key-caltrack-2026-prod-mode"
+_raw_secret = os.getenv("SECRET_KEY") or os.getenv("DJANGO_SECRET_KEY")
 DEBUG = (os.getenv("DEBUG") or os.getenv("DJANGO_DEBUG") or "True").lower() in ("true", "1", "t")
 
-ALLOWED_HOSTS = ["*"]
+if not _raw_secret:
+    if DEBUG:
+        SECRET_KEY = "dev-insecure-workforce-secret-key-caltrack-local-testing-only"
+    else:
+        raise ValueError("CRITICAL SECURITY ERROR: SECRET_KEY environment variable is mandatory in production (DEBUG=False).")
+else:
+    SECRET_KEY = _raw_secret
+
+_allowed_hosts_env = os.getenv("ALLOWED_HOSTS")
+if _allowed_hosts_env:
+    ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_env.split(",") if h.strip()]
+else:
+    ALLOWED_HOSTS = ["*"] if DEBUG else ["localhost", "127.0.0.1"]
 
 # Application definition
 INSTALLED_APPS = [
@@ -208,9 +220,13 @@ CORS_ALLOW_HEADERS = [
     "x-requested-with",
 ]
 
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:5176",
-    "http://127.0.0.1:5176",
-    "http://localhost:8001",
-    "http://127.0.0.1:8001",
-]
+_csrf_env = os.getenv("CSRF_TRUSTED_ORIGINS")
+if _csrf_env:
+    CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in _csrf_env.split(",") if origin.strip()]
+else:
+    CSRF_TRUSTED_ORIGINS = [
+        "http://localhost:5176",
+        "http://127.0.0.1:5176",
+        "http://localhost:8001",
+        "http://127.0.0.1:8001",
+    ]

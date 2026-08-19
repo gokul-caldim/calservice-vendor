@@ -50,9 +50,14 @@ export function loadMapsApi(explicitKey) {
       }
 
       window.__initGoogleMapsWorkforce = () => {
-        if (isMapsReady()) {
-          resolve(window.google.maps);
-        }
+        const checkReady = () => {
+          if (isMapsReady()) {
+            resolve(window.google.maps);
+          } else {
+            setTimeout(checkReady, 50);
+          }
+        };
+        checkReady();
       };
 
       const script = document.createElement('script');

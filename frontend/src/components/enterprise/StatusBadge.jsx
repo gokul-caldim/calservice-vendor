@@ -22,6 +22,11 @@ const STATUS_CONFIGS = {
     bg: 'bg-emerald-50 text-emerald-800 border-emerald-200',
     dot: 'bg-emerald-500',
   },
+  busy: {
+    label: 'Busy (On Job)',
+    bg: 'bg-blue-50 text-blue-800 border-blue-200',
+    dot: 'bg-blue-500 animate-pulse',
+  },
   submitted: {
     label: 'Submitted',
     bg: 'bg-amber-50 text-amber-800 border-amber-200',

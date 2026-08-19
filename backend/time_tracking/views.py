@@ -34,17 +34,32 @@ class IsWorkforceAdminOrReadOnly(permissions.BasePermission):
 
 
 
+def _get_request_company(request):
+    user = getattr(request, "user", None)
+    if not user or not user.is_authenticated:
+        return None
+    if getattr(user, "company", None):
+        return user.company
+    emp = getattr(user, "employee_profile", None)
+    if emp and getattr(emp, "company", None):
+        return emp.company
+    return None
+
+
 class LocationViewSet(viewsets.ModelViewSet):
     queryset = Location.objects.all()
     serializer_class = LocationSerializer
     permission_classes = [IsWorkforceAdminOrReadOnly]
 
     def _get_company(self):
-        user = self.request.user
-        emp = getattr(user, "employee_profile", None)
-        return emp.company if emp else getattr(user, "company", None)
+        return _get_request_company(self.request)
 
     def get_queryset(self):
+        if getattr(self.request.user, "is_superuser", False):
+            company_id = self.request.query_params.get("company_id")
+            if company_id:
+                return Location.objects.filter(company_id=company_id)
+            return Location.objects.all()
         company = self._get_company()
         if not company:
             return Location.objects.none()
@@ -61,11 +76,14 @@ class JobSiteViewSet(viewsets.ModelViewSet):
     permission_classes = [IsWorkforceAdminOrReadOnly]
 
     def _get_company(self):
-        user = self.request.user
-        emp = getattr(user, "employee_profile", None)
-        return emp.company if emp else getattr(user, "company", None)
+        return _get_request_company(self.request)
 
     def get_queryset(self):
+        if getattr(self.request.user, "is_superuser", False):
+            company_id = self.request.query_params.get("company_id")
+            if company_id:
+                return JobSite.objects.filter(company_id=company_id)
+            return JobSite.objects.all()
         company = self._get_company()
         if not company:
             return JobSite.objects.none()
@@ -83,13 +101,19 @@ class TimeLogViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        emp = getattr(self.request.user, "employee_profile", None)
+        user = self.request.user
+        emp = getattr(user, "employee_profile", None)
         if not emp:
-            if getattr(self.request.user, "is_staff", False):
-                company = getattr(self.request.user, "company", None)
+            if getattr(user, "is_superuser", False):
+                company_id = self.request.query_params.get("company_id")
+                if company_id:
+                    return TimeLog.objects.filter(employee__company_id=company_id).prefetch_related("breaks", "photos").order_by("-clock_in")
+                return TimeLog.objects.all().prefetch_related("breaks", "photos").order_by("-clock_in")
+            elif is_admin_role(user):
+                company = _get_request_company(self.request)
                 if company:
                     return TimeLog.objects.filter(employee__company=company).prefetch_related("breaks", "photos").order_by("-clock_in")
-                return TimeLog.objects.all().prefetch_related("breaks", "photos").order_by("-clock_in")
+                return TimeLog.objects.none()
             return TimeLog.objects.none()
 
         qs = TimeLog.objects.filter(employee=emp).prefetch_related("breaks", "photos")
@@ -327,27 +351,22 @@ class ClockInView(APIView):
                 status="draft",
             )
 
-            # Transition ServiceRequest to in_progress
-            locked_job.status = "in_progress"
-            locked_job.assigned_employee = emp
-            locked_job.save(update_fields=["status", "assigned_employee"])
-
-            # Transition or create EmployeeJob to IN_PROGRESS
+            # Transition or create EmployeeJob to ensure assignment record exists
             emp_job = EmployeeJob.objects.select_for_update().filter(service_request=locked_job, employee=emp).first()
-            if emp_job:
-                emp_job.status = "IN_PROGRESS"
-                if not emp_job.started_date:
-                    emp_job.started_date = now
-                emp_job.save(update_fields=["status", "started_date"])
-            else:
+            if not emp_job:
                 EmployeeJob.objects.create(
                     service_request=locked_job,
                     employee=emp,
-                    status="IN_PROGRESS",
+                    status="ARRIVED",
                     is_primary=True,
-                    started_date=now,
                     accepted_date=now,
                 )
+
+            # Transition ServiceRequest to IN_PROGRESS through authoritative state machine
+            locked_job.assigned_employee = emp
+            locked_job.save(update_fields=["assigned_employee"])
+            from service_requests.state_machine import apply_transition
+            apply_transition(locked_job, "in_progress", actor=request.user)
 
             # Update User.last_known_location
             user_loc = {

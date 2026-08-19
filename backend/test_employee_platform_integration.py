@@ -216,8 +216,7 @@ def run_tests():
 
     # ── MODULE 8: Performance & Customer Feedback Metrics ──────────────────────
     print("\n--- MODULE 8: Feedback & Performance Metrics ---")
-    # Create test completed job and feedback
-    company = tech_emp.company or Company.objects.first()
+    company = tech_emp.company
     test_job, _ = ServiceRequest.objects.get_or_create(
 
         customer_name="John Sample",
