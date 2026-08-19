@@ -897,7 +897,7 @@ export function EmployeeDashboardPage() {
         const res = await apiCollectJobCash(cashModalJob.id, parseFloat(cashAmountReceived) || 0);
         setCashModalJob(null);
         setCashAmountReceived('');
-        setSuccessMsg(res.message || 'Cash collection recorded! Awaiting customer confirmation.');
+        setSuccessMsg(res.message || 'Cash payment collected & marked PAID!');
         await loadDashboard();
         setTimeout(() => setSuccessMsg(''), 4000);
       } catch (err) {
@@ -3050,70 +3050,20 @@ export function EmployeeDashboardPage() {
                               </span>
                             </div>
                           ) : (
-                            (selectedJob.payment?.payment_status === 'PAID' || selectedJob.payment_status === 'paid' || selectedJob.payment_status === 'collected') ? (
+                            (selectedJob.payment?.payment_status === 'PAID' || selectedJob.payment_status === 'paid' || selectedJob.payment_status === 'collected' || selectedJob.payment?.payment_status === 'CASH_PENDING' || selectedJob.payment_status === 'cash_pending') ? (
                               <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center justify-between">
                                 <div className="flex items-center gap-2">
                                   <CheckCircle2 className="w-4 h-4 text-emerald-600" />
                                   <div>
                                     <span className="text-xs font-bold text-emerald-900">Cash Payment Confirmed & Collected</span>
                                     <p className="text-[11px] text-emerald-700">
-                                      Amount: <strong className="font-mono">₹{selectedJob.payment?.amount_paid || selectedJob.payment?.amount_due || selectedJob.total_amount}</strong> • Received by Technician
+                                      Amount: <strong className="font-mono">₹{selectedJob.payment?.amount_paid || selectedJob.payment?.amount_received || selectedJob.payment?.amount_due || selectedJob.total_amount}</strong> • Received by Technician
                                     </p>
                                   </div>
                                 </div>
                                 <span className="px-2 py-0.5 bg-emerald-700 text-white text-[10px] font-bold rounded">
                                   PAID ✓
                                 </span>
-                              </div>
-                            ) : (selectedJob.payment?.payment_status === 'CASH_PENDING' || selectedJob.payment_status === 'cash_pending') ? (
-                              <div className="p-3.5 bg-amber-50/90 border border-amber-300 rounded-lg space-y-2.5">
-                                <div className="flex items-center justify-between">
-                                  <div className="flex items-center gap-2">
-                                    <DollarSign className="w-4 h-4 text-amber-700" />
-                                    <span className="text-xs font-bold text-amber-950">Cash Collection Reported — Awaiting Confirmation</span>
-                                  </div>
-                                  <span className="px-2 py-0.5 bg-amber-200 text-amber-900 text-[10px] font-bold rounded">
-                                    CASH PENDING
-                                  </span>
-                                </div>
-                                <p className="text-[11px] text-amber-800">
-                                  Amount Received: <strong className="font-mono">₹{selectedJob.payment?.amount_received || selectedJob.payment?.amount_due || selectedJob.total_amount}</strong>
-                                  {parseFloat(selectedJob.payment?.change_returned || 0) > 0 && (
-                                    <span> • Change: <strong className="font-mono">₹{selectedJob.payment?.change_returned}</strong></span>
-                                  )}
-                                </p>
-                                <p className="text-[11px] text-amber-800">
-                                  Customer can confirm in their dashboard, or share the 6-digit payment confirmation OTP with you:
-                                </p>
-                                <form onSubmit={handleVerifyPaymentOtpSubmit} className="flex gap-2">
-                                  <input
-                                    type="text"
-                                    maxLength={6}
-                                    placeholder="Enter Customer OTP"
-                                    value={paymentOtpInput}
-                                    onChange={(e) => setPaymentOtpInput(e.target.value.replace(/\D/g, ''))}
-                                    className="flex-1 px-3 py-1.5 border border-amber-300 rounded text-xs font-mono font-bold tracking-wider bg-white focus:outline-none focus:ring-2 focus:ring-amber-500"
-                                  />
-                                  <button
-                                    type="submit"
-                                    disabled={isVerifyingPaymentOtp || paymentOtpInput.length !== 6}
-                                    className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold rounded text-xs shadow-sm flex items-center gap-1 transition-colors cursor-pointer"
-                                  >
-                                    {isVerifyingPaymentOtp ? 'Verifying...' : 'Verify OTP'}
-                                  </button>
-                                </form>
-                                <div className="pt-1 flex justify-end">
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setCashModalJob(selectedJob);
-                                      setCashAmountReceived(String(selectedJob.payment?.amount_due || selectedJob.total_amount || ''));
-                                    }}
-                                    className="text-[11px] text-amber-800 hover:text-amber-950 underline font-medium cursor-pointer"
-                                  >
-                                    Re-record cash collection
-                                  </button>
-                                </div>
                               </div>
                             ) : (
                               <div className="p-3.5 bg-amber-50/90 border border-amber-300 rounded-lg space-y-2">
@@ -3127,7 +3077,7 @@ export function EmployeeDashboardPage() {
                                   </span>
                                 </div>
                                 <p className="text-[11px] text-amber-800">
-                                  Collect cash payment from the customer upon completing work. (No OTP required)
+                                  Collect cash payment from the customer upon completing work.
                                 </p>
                                 <button
                                   type="button"
@@ -3810,7 +3760,7 @@ export function EmployeeDashboardPage() {
               )}
 
               <p className="text-[11px] text-slate-500">
-                Submitting will generate a secure 6-digit confirmation code for the customer and notify them to confirm payment receipt.
+                Confirming cash collection will directly mark the job payment as PAID.
               </p>
 
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-200">

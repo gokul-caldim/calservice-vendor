@@ -1568,50 +1568,63 @@ class WorkforceJobCashCollectView(APIView):
             change_returned = amt_received - pmt.amount_due
             now = timezone.now()
 
-            # Authoritative State Transition: Transition to CASH_PENDING (never directly PAID)
+            # Authoritative State Transition: Direct Cash Collection to PAID (No OTP required)
             pmt.amount_received = amt_received
             pmt.change_returned = change_returned
             pmt.cash_collected_at = now
             pmt.cash_collected_by = emp
-            pmt.amount_paid = Decimal("0.00")
-
-            # Generate cryptographically secure 6-digit confirmation OTP
-            otp_raw = f"{secrets.randbelow(900000) + 100000}"
-            pmt.payment_confirmation_otp_hash = make_password(otp_raw)
-            pmt.otp_expires_at = now + timedelta(minutes=15)
-            pmt.otp_attempts = 0
-            pmt.otp_used_at = None
-            pmt.payment_status = JobPayment.PaymentStatus.CASH_PENDING
+            pmt.amount_paid = pmt.amount_due
+            pmt.customer_confirmed_at = now
+            pmt.customer_confirmation_method = "CASH_DIRECT"
+            pmt.payment_status = JobPayment.PaymentStatus.PAID
             pmt.save()
 
-            # Record immutable audit event
+            # Record immutable audit events
             PaymentCollectionEvent.objects.create(
                 job_payment=pmt,
                 employee=emp,
                 actor_user=request.user,
-                event_type="CASH_REPORTED",
+                event_type="CASH_COLLECTED",
                 amount=pmt.amount_due,
                 metadata={"amount_received": float(amt_received), "change_returned": float(change_returned)},
             )
+            PaymentCollectionEvent.objects.create(
+                job_payment=pmt,
+                employee=emp,
+                actor_user=request.user,
+                event_type="PAYMENT_PAID",
+                amount=pmt.amount_due,
+            )
 
-            # Sync ServiceRequest payment status
-            job.payment_status = "cash_pending"
-            job.save(update_fields=["payment_status"])
+            # Sync ServiceRequest payment status to paid
+            job.payment_status = "paid"
+
+            # Service completion gate: If service proof is already submitted, complete the job
+            if job.status == "proof_submitted":
+                try:
+                    apply_transition(job, "completed", actor=request.user)
+                except Exception as e:
+                    logger.warning("Could not complete job #%s after cash collection: %s", job.id, e)
+                    job.save(update_fields=["payment_status"])
+            else:
+                job.save(update_fields=["payment_status"])
 
             if job.customer:
                 create_notification(
                     recipient=job.customer,
-                    title="Payment Confirmation Required",
-                    message=f"Technician reported cash collection of ₹{pmt.amount_due} for Job #{job.id}. Share OTP {otp_raw} with technician or confirm in your dashboard.",
-                    notification_type="PAYMENT_CONFIRMATION_OTP",
+                    title="Payment Received",
+                    message=f"Cash payment of ₹{pmt.amount_due} for Job #{job.id} has been received by technician.",
+                    notification_type="PAYMENT_CONFIRMATION",
                     company=job.company,
                     related_object_id=str(job.id),
                 )
 
             return Response({
-                "message": f"Cash collection of ₹{pmt.amount_due} recorded. Confirmation OTP generated for customer (Received: ₹{amt_received}, Change: ₹{change_returned}).",
-                "payment_status": "CASH_PENDING",
+                "message": f"Cash collection of ₹{pmt.amount_due} recorded and marked PAID (Received: ₹{amt_received}, Change: ₹{change_returned}).",
+                "payment_status": "PAID",
+                "job_status": job.status,
                 "amount_due": str(pmt.amount_due),
+                "amount_paid": str(pmt.amount_paid),
                 "amount_received": str(amt_received),
                 "change_returned": str(change_returned),
             }, status=status.HTTP_200_OK)
@@ -2127,7 +2140,7 @@ def run_automatic_dispatch(job, excluded_employee_ids=None):
     return dispatch_job(job, excluded_employee_ids=excluded_employee_ids)
 
 
-from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES
+from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES, supersede_other_offers_for_employee
 
 
 class WorkforceJobAcceptOfferView(APIView):
