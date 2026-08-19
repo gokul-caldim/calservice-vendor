@@ -193,6 +193,7 @@ export function useLocationTracker(active, onPositionChange, onError, adapter = 
   const watchIdRef = useRef(null);
   const intervalRef = useRef(null);
   const offlineQueueRef = useRef([]);
+  const isAuthValidRef = useRef(true);
 
   const flushOfflineQueue = useCallback(() => {
     if (offlineQueueRef.current.length === 0) return;

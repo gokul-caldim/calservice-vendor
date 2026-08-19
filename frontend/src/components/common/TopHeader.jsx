@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useContext } from 'react';
 
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthProvider.jsx';
+import { EmployeeRuntimeContext } from '../../context/EmployeeRuntimeContext.jsx';
 import {
   Wrench,
   Search,
@@ -37,18 +38,22 @@ import { getGPSPosition } from '../../hooks/useGPSPosition.js';
 
 export function TopHeader({ onToggleSidebar = () => {} }) {
   const { user, logout, togglePresence, isAdmin, isEmployee, registrationStatus } = useAuth();
+  const employeeRuntime = useContext(EmployeeRuntimeContext);
   const navigate = useNavigate();
   const [isToggling, setIsToggling] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showHelpModal, setShowHelpModal] = useState(false);
   const [showNotifMenu, setShowNotifMenu] = useState(false);
-  const [notifications, setNotifications] = useState([]);
-  const [unreadCount, setUnreadCount] = useState(0);
+  const [localNotifications, setLocalNotifications] = useState([]);
+  const [localUnreadCount, setLocalUnreadCount] = useState(0);
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [selectedNotifIds, setSelectedNotifIds] = useState(new Set());
   const [isClearing, setIsClearing] = useState(false);
   const [globalSearch, setGlobalSearch] = useState('');
   const notifRef = useRef(null);
+
+  const notifications = employeeRuntime ? employeeRuntime.notifications : localNotifications;
+  const unreadCount = employeeRuntime ? employeeRuntime.unreadCount : localUnreadCount;
 
   // Close notifications dropdown when clicking outside
   useEffect(() => {
@@ -70,8 +75,8 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
   }, [showNotifMenu]);
 
   // Location Scan State
-  const [locState, setLocState] = useState('idle'); // 'idle' | 'locating' | 'success' | 'error'
-  const [locCoords, setLocCoords] = useState(() => {
+  const [localLocState, setLocalLocState] = useState('idle'); // 'idle' | 'locating' | 'success' | 'error'
+  const [localLocCoords, setLocalLocCoords] = useState(() => {
     const loc = user?.last_known_location;
     if (loc?.latitude && loc?.longitude) {
       return { latitude: Number(loc.latitude), longitude: Number(loc.longitude), accuracy: loc.accuracy || null };
@@ -79,21 +84,21 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
     return null;
   });
 
-  const handleScanCurrentLocation = async () => {
-    if (locState === 'locating') return;
-    setLocState('locating');
+  const localHandleScanCurrentLocation = async () => {
+    if (localLocState === 'locating') return;
+    setLocalLocState('locating');
     try {
       const pos = await getGPSPosition(true);
       const { latitude, longitude, accuracy, speed, heading } = pos.coords;
       const captured_at = new Date(pos.timestamp || Date.now()).toISOString();
       await apiUpdateLocationFull(latitude, longitude, accuracy, speed, heading, captured_at);
-      setLocCoords({
+      setLocalLocCoords({
         latitude,
         longitude,
         accuracy,
         timestamp: pos.timestamp || Date.now(),
       });
-      setLocState('success');
+      setLocalLocState('success');
       window.dispatchEvent(
         new CustomEvent('workforce:location-updated', {
           detail: {
@@ -108,15 +113,20 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
           },
         })
       );
-      setTimeout(() => setLocState('idle'), 2500);
+      setTimeout(() => setLocalLocState('idle'), 2500);
     } catch (_) {
-      setLocState('error');
-      setTimeout(() => setLocState('idle'), 3000);
+      setLocalLocState('error');
+      setTimeout(() => setLocalLocState('idle'), 3000);
     }
   };
 
-  // 10s silent background notification polling
+  const locCoords = employeeRuntime?.liveLocation || localLocCoords;
+  const locState = employeeRuntime?.locationState || localLocState;
+  const handleScanCurrentLocation = employeeRuntime ? employeeRuntime.scanCurrentLocation : localHandleScanCurrentLocation;
+
+  // Background notification polling for Admin users ONLY (Employee notifications are centralized in EmployeeRuntimeProvider)
   useEffect(() => {
+    if (employeeRuntime) return;
     const token = typeof window !== 'undefined'
       ? (sessionStorage.getItem('wf_token') || localStorage.getItem('wf_token'))
       : null;
@@ -128,8 +138,8 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
       try {
         const res = await apiGetNotifications();
         if (!isCancelled && res) {
-          setNotifications(res.notifications || []);
-          setUnreadCount(res.unread_count || 0);
+          setLocalNotifications(res.notifications || []);
+          setLocalUnreadCount(res.unread_count || 0);
         }
       } catch (err) {
         if (err?.status === 401 || err?.response?.status === 401) {
@@ -138,18 +148,22 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
       }
     };
     fetchNotifs();
-    pollInterval = setInterval(fetchNotifs, 10000);
+    pollInterval = setInterval(fetchNotifs, 15000);
     return () => {
       isCancelled = true;
       if (pollInterval) clearInterval(pollInterval);
     };
-  }, [user]);
+  }, [user, employeeRuntime]);
 
   const handleMarkAllRead = async () => {
+    if (employeeRuntime) {
+      await employeeRuntime.markNotificationAsRead();
+      return;
+    }
     try {
       await apiMarkNotificationRead();
-      setUnreadCount(0);
-      setNotifications((prev) => prev.map((n) => ({ ...n, is_read: true })));
+      setLocalUnreadCount(0);
+      setLocalNotifications((prev) => prev.map((n) => ({ ...n, is_read: true })));
     } catch (_) {}
   };
 
@@ -188,9 +202,13 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
     if (notifications.length === 0) return;
     try {
       setIsClearing(true);
-      await apiClearNotifications(null, null, true);
-      setNotifications([]);
-      setUnreadCount(0);
+      if (employeeRuntime) {
+        await employeeRuntime.clearAllNotifications([]);
+      } else {
+        await apiClearNotifications(null, null, true);
+        setLocalNotifications([]);
+        setLocalUnreadCount(0);
+      }
       setSelectedNotifIds(new Set());
       setIsSelectMode(false);
     } catch (err) {
@@ -206,12 +224,16 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
     const ids = Array.from(selectedNotifIds);
     try {
       setIsClearing(true);
-      await apiClearNotifications(null, ids);
-      const unreadCleared = notifications.filter(
-        (n) => selectedNotifIds.has(n.id) && !n.is_read
-      ).length;
-      setNotifications((prev) => prev.filter((n) => !selectedNotifIds.has(n.id)));
-      setUnreadCount((prev) => Math.max(0, prev - unreadCleared));
+      if (employeeRuntime) {
+        await employeeRuntime.clearAllNotifications(ids);
+      } else {
+        await apiClearNotifications(null, ids);
+        const unreadCleared = localNotifications.filter(
+          (n) => selectedNotifIds.has(n.id) && !n.is_read
+        ).length;
+        setLocalNotifications((prev) => prev.filter((n) => !selectedNotifIds.has(n.id)));
+        setLocalUnreadCount((prev) => Math.max(0, prev - unreadCleared));
+      }
       setSelectedNotifIds(new Set());
       if (notifications.length <= ids.length) {
         setIsSelectMode(false);
@@ -227,12 +249,16 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
     e?.stopPropagation?.();
     try {
       setIsClearing(true);
-      await apiClearNotifications(notifId);
-      const notif = notifications.find((n) => n.id === notifId);
-      const wasUnread = notif && !notif.is_read;
-      setNotifications((prev) => prev.filter((n) => n.id !== notifId));
-      if (wasUnread) {
-        setUnreadCount((prev) => Math.max(0, prev - 1));
+      if (employeeRuntime) {
+        await employeeRuntime.clearAllNotifications([notifId]);
+      } else {
+        await apiClearNotifications(notifId);
+        const notif = localNotifications.find((n) => n.id === notifId);
+        const wasUnread = notif && !notif.is_read;
+        setLocalNotifications((prev) => prev.filter((n) => n.id !== notifId));
+        if (wasUnread) {
+          setLocalUnreadCount((prev) => Math.max(0, prev - 1));
+        }
       }
       setSelectedNotifIds((prev) => {
         const next = new Set(prev);
@@ -251,14 +277,19 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
     if (selectedNotifIds.size === 0) return;
     const ids = Array.from(selectedNotifIds);
     try {
-      await apiMarkNotificationRead(null, ids);
-      const countUnreadInSelected = notifications.filter(
-        (n) => selectedNotifIds.has(n.id) && !n.is_read
-      ).length;
-      setNotifications((prev) =>
-        prev.map((n) => (selectedNotifIds.has(n.id) ? { ...n, is_read: true } : n))
-      );
-      setUnreadCount((prev) => Math.max(0, prev - countUnreadInSelected));
+      if (employeeRuntime) {
+        await apiMarkNotificationRead(null, ids);
+        await employeeRuntime.syncNotifications();
+      } else {
+        await apiMarkNotificationRead(null, ids);
+        const countUnreadInSelected = localNotifications.filter(
+          (n) => selectedNotifIds.has(n.id) && !n.is_read
+        ).length;
+        setLocalNotifications((prev) =>
+          prev.map((n) => (selectedNotifIds.has(n.id) ? { ...n, is_read: true } : n))
+        );
+        setLocalUnreadCount((prev) => Math.max(0, prev - countUnreadInSelected));
+      }
     } catch (err) {
       console.error('Failed to mark selected as read:', err);
     }
@@ -267,11 +298,15 @@ export function TopHeader({ onToggleSidebar = () => {} }) {
   const handleNotifClick = async (notif) => {
     try {
       if (!notif.is_read) {
-        await apiMarkNotificationRead(notif.id);
-        setUnreadCount((prev) => Math.max(0, prev - 1));
-        setNotifications((prev) =>
-          prev.map((n) => (n.id === notif.id ? { ...n, is_read: true } : n))
-        );
+        if (employeeRuntime) {
+          await employeeRuntime.markNotificationAsRead(notif.id);
+        } else {
+          await apiMarkNotificationRead(notif.id);
+          setLocalUnreadCount((prev) => Math.max(0, prev - 1));
+          setLocalNotifications((prev) =>
+            prev.map((n) => (n.id === notif.id ? { ...n, is_read: true } : n))
+          );
+        }
       }
       setShowNotifMenu(false);
       if (notif.notification_type === 'JOB_OFFER' || notif.notification_type === 'JOB_OFFERED') {

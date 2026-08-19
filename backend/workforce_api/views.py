@@ -1218,6 +1218,7 @@ class WorkforceJobListView(APIView):
         company = emp.company if emp else getattr(user, "company", None)
 
         if is_admin_role(user):
+            context = {"request": request}
             if user.is_superuser:
                 jobs = ServiceRequest.objects.all().order_by("-created_at")[:50]
             elif company:
@@ -1226,6 +1227,7 @@ class WorkforceJobListView(APIView):
                 jobs = ServiceRequest.objects.none()
         elif emp:
             now = timezone.now()
+            from workforce_api.models import WorkforceJobOffer, WorkforceJobLifecycleEvent, WorkforceWorkExtension, JobPayment
             from workforce_api.services.workload import ACTIVE_QUEUE_STATUSES, WORKLOAD_OCCUPIED_STATUSES
             from workforce_api.services.automatic_dispatch import reconsider_jobs_for_employee, expire_and_reassign_offers
 
@@ -1303,12 +1305,62 @@ class WorkforceJobListView(APIView):
             if emp.company:
                 qs = qs.filter(company=emp.company)
 
+            qs = qs.select_related("customer", "assigned_employee", "assigned_employee__user", "company")
             qs = qs.distinct().order_by("-updated_at", "-created_at")
-            jobs = qs
-        else:
-            jobs = ServiceRequest.objects.none()
+            job_list = list(qs[:100])
 
-        serializer = WorkforceJobSerializer(jobs, many=True, context={"request": request})
+            job_ids = [j.id for j in job_list]
+            emp_offers_map = {}
+            active_offers_map = {}
+            lifecycle_events_map = {}
+            extensions_map = {}
+            active_extensions_map = {}
+            payments_map = {}
+
+            if job_ids:
+                # 1. Bulk fetch employee job offers
+                offers = list(WorkforceJobOffer.objects.filter(job_id__in=job_ids, employee=emp).order_by("offered_at"))
+                for o in offers:
+                    emp_offers_map[o.job_id] = o
+                    if o.status == "OFFERED" and o.expires_at > now:
+                        active_offers_map[o.job_id] = o
+
+                # 2. Bulk fetch acceptance lifecycle events
+                events = list(WorkforceJobLifecycleEvent.objects.filter(
+                    job_id__in=job_ids,
+                    employee=emp,
+                    event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
+                ).order_by("created_at"))
+                for ev in events:
+                    lifecycle_events_map[ev.job_id] = ev
+
+                # 3. Bulk fetch work extensions
+                exts = list(WorkforceWorkExtension.objects.filter(job_id__in=job_ids).select_related("technician", "technician__user").order_by("-created_at"))
+                for ext in exts:
+                    extensions_map.setdefault(ext.job_id, []).append(ext)
+                    if ext.status in ["REQUESTED", "ADMIN_APPROVED", "CUSTOMER_ACCEPTED", "IN_PROGRESS"] and ext.job_id not in active_extensions_map:
+                        active_extensions_map[ext.job_id] = ext
+
+                # 4. Bulk fetch payments
+                payments = list(JobPayment.objects.filter(job_id__in=job_ids))
+                for p in payments:
+                    payments_map[p.job_id] = p
+
+            context = {
+                "request": request,
+                "emp_offers_map": emp_offers_map,
+                "active_offers_map": active_offers_map,
+                "lifecycle_events_map": lifecycle_events_map,
+                "extensions_map": extensions_map,
+                "active_extensions_map": active_extensions_map,
+                "payments_map": payments_map,
+            }
+            jobs = job_list
+        else:
+            jobs = []
+            context = {"request": request}
+
+        serializer = WorkforceJobSerializer(jobs, many=True, context=context)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 

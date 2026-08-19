@@ -14,7 +14,7 @@ export function PendingReviewPage() {
       setIsRefreshing(true);
       const updatedUser = await refreshProfile();
       if (updatedUser) {
-        setProfile(employee);
+        setProfile(updatedUser);
       }
     } catch (_) {
     } finally {

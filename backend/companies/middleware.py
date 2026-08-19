@@ -28,8 +28,8 @@ class CompanyMiddleware(MiddlewareMixin):
                 if user_id:
                     from django.contrib.auth import get_user_model
                     User = get_user_model()
-                    u = User.objects.filter(id=user_id).first()
-                    if u and u.company_id:
+                    u = User.objects.select_related('company').filter(id=user_id).first()
+                    if u and u.company:
                         company = u.company
                 if not company and company_id:
                     from companies.models import Company
@@ -38,9 +38,12 @@ class CompanyMiddleware(MiddlewareMixin):
                 pass
 
         if not company:
-            user = getattr(request, 'user', None)
-            if user and user.is_authenticated:
-                company = getattr(user, 'company', None)
+            try:
+                user = getattr(request, 'user', None)
+                if user and getattr(user, 'is_authenticated', False):
+                    company = getattr(user, 'company', None)
+            except Exception:
+                pass
 
         request.company = company
         return None

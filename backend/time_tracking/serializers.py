@@ -59,6 +59,9 @@ class TimeLogSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
     def get_employee_name(self, obj):
-        if obj.user:
-            return obj.user.get_full_name() or obj.user.username
+        try:
+            if obj.user:
+                return obj.user.get_full_name() or obj.user.username
+        except Exception:
+            pass
         return f"Employee #{obj.employee_id}"

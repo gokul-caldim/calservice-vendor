@@ -37,7 +37,7 @@ export function AuthProvider({ children }) {
         const me = await apiFetchMe();
 
         if (me && me.username) {
-          const isAdmin = ['admin', 'manager'].includes((me.role || '').toLowerCase()) || me.is_superuser;
+          const isAdmin = ['admin', 'manager'].includes((me.role || '').toLowerCase()) || Boolean(me.is_superuser);
           let empData = null;
 
           if (!isAdmin) {
@@ -77,9 +77,12 @@ export function AuthProvider({ children }) {
           return null;
         }
       } catch (e) {
-        clearAuthTokens();
-        setUser(null);
-        setEmployee(null);
+        // Only wipe auth tokens if server explicitly rejected with 401
+        if (e && e.status === 401) {
+          clearAuthTokens();
+          setUser(null);
+          setEmployee(null);
+        }
         return null;
       } finally {
         inFlightRefreshRef.current = null;
@@ -91,11 +94,40 @@ export function AuthProvider({ children }) {
 
   const login = useCallback(async (identifier, password) => {
     const res = await apiWorkforceLogin(identifier, password);
-    if (res) {
-      const token = res.access_token || res.token;
-      const refresh = res.refresh_token;
+    if (!res) {
+      throw new Error('Authentication failed. Please try again.');
+    }
+
+    const token = res.access_token || res.token;
+    const refresh = res.refresh_token;
+    if (token) {
       setAuthTokens(token, refresh);
     }
+
+    if (res.user) {
+      const isAdmin = ['admin', 'manager'].includes((res.user.role || '').toLowerCase()) || Boolean(res.user.is_superuser);
+      const initialUser = {
+        id: res.user.id,
+        username: res.user.username,
+        email: res.user.email || '',
+        firstName: res.user.first_name || '',
+        lastName: res.user.last_name || '',
+        role: res.user.role || 'employee',
+        companyId: res.user.company,
+        companyName: res.user.company_name || '',
+        isAdmin: isAdmin,
+        isEmployee: !isAdmin,
+        registrationStatus: isAdmin ? 'approved' : 'not_started',
+        isOnline: false,
+        availability: 'offline',
+      };
+      setUser(initialUser);
+
+      // Trigger background profile refresh for non-blocking extended details
+      refreshProfile(true).catch(() => {});
+      return initialUser;
+    }
+
     return await refreshProfile(true);
   }, [refreshProfile]);
 
@@ -106,7 +138,7 @@ export function AuthProvider({ children }) {
       const refresh = res.refresh_token;
       setAuthTokens(token, refresh);
     }
-    await refreshProfile();
+    await refreshProfile(true);
     return res;
   }, [refreshProfile]);
 

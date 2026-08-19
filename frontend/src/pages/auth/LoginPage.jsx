@@ -47,7 +47,27 @@ export function LoginPage() {
         }
       }
     } catch (err) {
-      setError(err.message || 'Invalid credentials. Please verify your email/password.');
+      if (typeof console !== 'undefined' && console.info) {
+        console.info('[AUTH CLIENT]', {
+          status: err.status,
+          code: err.code,
+          message: err.message,
+        });
+      }
+      const serverMsg = err.data?.error || err.message;
+      if (err.status === 401) {
+        setError(serverMsg || 'Invalid credentials. Please verify your email/username and password.');
+      } else if (err.status === 403 || err.code === 'ACCOUNT_INACTIVE') {
+        setError(serverMsg || 'Account is inactive or deactivated. Please contact your administrator.');
+      } else if (err.status === 503 || err.code === 'DB_UNAVAILABLE') {
+        setError(serverMsg || 'Database service temporarily unavailable. Please retry shortly.');
+      } else if (err.code === 'CREDENTIALS_REQUIRED') {
+        setError(serverMsg || 'Identifier and password required.');
+      } else if (err.code === 'NETWORK_ERROR') {
+        setError('Network error. Please check your internet connection.');
+      } else {
+        setError(serverMsg || 'Unable to complete sign-in. Please try again.');
+      }
     } finally {
       setIsSubmitting(false);
     }

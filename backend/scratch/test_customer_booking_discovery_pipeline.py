@@ -91,7 +91,7 @@ sr1_obj = ServiceRequest(
     assigned_employee=None,
     otp_attempt_count=0,
     otp_hash="",
-    request_id=f"SR-DISCOVERY-{int(now.timestamp())}",
+    request_id=f"SR-D-{int(now.timestamp()) % 1000000}",
 )
 ServiceRequest.objects.bulk_create([sr1_obj])
 sr1 = ServiceRequest.objects.get(request_id=sr1_obj.request_id)
@@ -161,7 +161,7 @@ sr2_obj = ServiceRequest(
     assigned_employee=None,
     otp_attempt_count=0,
     otp_hash="",
-    request_id=f"SR-STRANDED-{int(now.timestamp())}",
+    request_id=f"SR-S-{int(now.timestamp()) % 1000000}",
 )
 ServiceRequest.objects.bulk_create([sr2_obj])
 sr2 = ServiceRequest.objects.get(request_id=sr2_obj.request_id)

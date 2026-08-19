@@ -1,6 +1,7 @@
 import React from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthProvider.jsx';
+import { EmployeeRuntimeProvider } from './context/EmployeeRuntimeProvider.jsx';
 import { AdminRoute, EmployeeRoute, AuthenticatedRoute } from './components/common/ProtectedRoute.jsx';
 
 import { LoginPage } from './pages/auth/LoginPage.jsx';
@@ -16,6 +17,16 @@ import { EmployeeProfilePage } from './pages/employee/EmployeeProfilePage.jsx';
 import { EmployeeSettingsPage } from './pages/employee/EmployeeSettingsPage.jsx';
 import { EmployeePerformancePage } from './pages/employee/EmployeePerformancePage.jsx';
 import { EmployeeLocationPage } from './pages/employee/EmployeeLocationPage.jsx';
+
+function EmployeeWorkspaceLayout() {
+  return (
+    <EmployeeRoute>
+      <EmployeeRuntimeProvider>
+        <Outlet />
+      </EmployeeRuntimeProvider>
+    </EmployeeRoute>
+  );
+}
 
 
 import { AdminDashboardPage } from './pages/admin/AdminDashboardPage.jsx';
@@ -112,85 +123,23 @@ export function App() {
             }
           />
 
-          {/* Approved Technician Workspace */}
-          <Route
-            path="/workforce/employee/dashboard"
-            element={
-              <EmployeeRoute>
-                <EmployeeDashboardPage />
-              </EmployeeRoute>
-            }
-          />
-          <Route
-            path="/workforce/employee/jobs"
-            element={
-              <EmployeeRoute>
-                <EmployeeDashboardPage />
-              </EmployeeRoute>
-            }
-          />
-          {/* Removed Employee Routes Redirects */}
-          <Route path="/workforce/employee/schedule" element={<Navigate to="/workforce/employee/dashboard" replace />} />
-          <Route path="/workforce/employee/attendance" element={<Navigate to="/workforce/employee/dashboard" replace />} />
-          <Route path="/workforce/employee/leave" element={<Navigate to="/workforce/employee/dashboard" replace />} />
-          <Route path="/workforce/employee/earnings" element={<Navigate to="/workforce/employee/dashboard" replace />} />
-
-          <Route
-            path="/workforce/employee/documents"
-            element={
-              <EmployeeRoute>
-                <EmployeeDashboardPage />
-              </EmployeeRoute>
-            }
-          />
-          <Route
-            path="/workforce/employee/services"
-            element={
-              <EmployeeRoute>
-                <EmployeeDashboardPage />
-              </EmployeeRoute>
-            }
-          />
-          <Route
-            path="/workforce/employee/profile"
-            element={
-              <EmployeeRoute>
-                <EmployeeProfilePage />
-              </EmployeeRoute>
-            }
-          />
-          <Route
-            path="/workforce/employee/settings"
-            element={
-              <EmployeeRoute>
-                <EmployeeSettingsPage />
-              </EmployeeRoute>
-            }
-          />
-          <Route
-            path="/workforce/employee/performance"
-            element={
-              <EmployeeRoute>
-                <EmployeePerformancePage />
-              </EmployeeRoute>
-            }
-          />
-          <Route
-            path="/workforce/employee/feedback"
-            element={
-              <EmployeeRoute>
-                <EmployeePerformancePage />
-              </EmployeeRoute>
-            }
-          />
-          <Route
-            path="/workforce/employee/location"
-            element={
-              <EmployeeRoute>
-                <EmployeeLocationPage />
-              </EmployeeRoute>
-            }
-          />
+          {/* Approved Technician Workspace with Persistent Session Runtime */}
+          <Route path="/workforce/employee" element={<EmployeeWorkspaceLayout />}>
+            <Route index element={<Navigate to="/workforce/employee/dashboard" replace />} />
+            <Route path="dashboard" element={<EmployeeDashboardPage />} />
+            <Route path="jobs" element={<EmployeeDashboardPage />} />
+            <Route path="schedule" element={<Navigate to="/workforce/employee/dashboard" replace />} />
+            <Route path="attendance" element={<Navigate to="/workforce/employee/dashboard" replace />} />
+            <Route path="leave" element={<Navigate to="/workforce/employee/dashboard" replace />} />
+            <Route path="earnings" element={<Navigate to="/workforce/employee/dashboard" replace />} />
+            <Route path="documents" element={<EmployeeDashboardPage />} />
+            <Route path="services" element={<EmployeeDashboardPage />} />
+            <Route path="profile" element={<EmployeeProfilePage />} />
+            <Route path="settings" element={<EmployeeSettingsPage />} />
+            <Route path="performance" element={<EmployeePerformancePage />} />
+            <Route path="feedback" element={<EmployeePerformancePage />} />
+            <Route path="location" element={<EmployeeLocationPage />} />
+          </Route>
 
 
           {/* Workforce Admin Operations Workspace */}

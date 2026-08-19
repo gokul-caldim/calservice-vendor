@@ -471,6 +471,9 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     def _get_emp_offer(self, obj, emp):
         if not emp:
             return None
+        emp_offers_map = self.context.get("emp_offers_map")
+        if emp_offers_map is not None:
+            return emp_offers_map.get(obj.id)
         from .models import WorkforceJobOffer
         return WorkforceJobOffer.objects.filter(job=obj, employee=emp).order_by("-offered_at").first()
 
@@ -532,12 +535,16 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         if not self.get_is_accepted_by_current_employee(obj):
             return None
         emp = self._get_context_emp()
-        from .models import WorkforceJobLifecycleEvent
-        accept_event = WorkforceJobLifecycleEvent.objects.filter(
-            job=obj,
-            employee=emp,
-            event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
-        ).order_by("-created_at").first()
+        lifecycle_events_map = self.context.get("lifecycle_events_map")
+        if lifecycle_events_map is not None:
+            accept_event = lifecycle_events_map.get(obj.id)
+        else:
+            from .models import WorkforceJobLifecycleEvent
+            accept_event = WorkforceJobLifecycleEvent.objects.filter(
+                job=obj,
+                employee=emp,
+                event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
+            ).order_by("-created_at").first()
         if accept_event and accept_event.accepted_at:
             return accept_event.accepted_at.isoformat()
         return (obj.updated_at or obj.created_at).isoformat() if (obj.updated_at or obj.created_at) else None
@@ -548,12 +555,16 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         if obj.status not in ["accepted", "on_the_way"]:
             return None
         emp = self._get_context_emp()
-        from .models import WorkforceJobLifecycleEvent
-        accept_event = WorkforceJobLifecycleEvent.objects.filter(
-            job=obj,
-            employee=emp,
-            event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
-        ).order_by("-created_at").first()
+        lifecycle_events_map = self.context.get("lifecycle_events_map")
+        if lifecycle_events_map is not None:
+            accept_event = lifecycle_events_map.get(obj.id)
+        else:
+            from .models import WorkforceJobLifecycleEvent
+            accept_event = WorkforceJobLifecycleEvent.objects.filter(
+                job=obj,
+                employee=emp,
+                event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
+            ).order_by("-created_at").first()
         if accept_event and accept_event.cancellation_deadline:
             return accept_event.cancellation_deadline.isoformat()
         from datetime import timedelta
@@ -597,12 +608,16 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         emp = self._get_context_emp()
         if not emp:
             return None
-        from .models import WorkforceJobOffer
-        from django.utils import timezone
-        offer = WorkforceJobOffer.objects.filter(job=obj, employee=emp, status="OFFERED").first()
+        active_offers_map = self.context.get("active_offers_map")
+        if active_offers_map is not None:
+            offer = active_offers_map.get(obj.id)
+        else:
+            from .models import WorkforceJobOffer
+            from django.utils import timezone
+            offer = WorkforceJobOffer.objects.filter(job=obj, employee=emp, status="OFFERED").first()
+            if offer and offer.expires_at <= timezone.now():
+                offer = None
         if not offer:
-            return None
-        if offer.expires_at <= timezone.now():
             return None
         return {
             "id": offer.id,
@@ -613,11 +628,58 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         }
 
     def get_extensions(self, obj):
+        extensions_map = self.context.get("extensions_map")
+        if extensions_map is not None:
+            exts = extensions_map.get(obj.id, [])
+            return [
+                {
+                    "id": ext.id,
+                    "job": ext.job_id,
+                    "technician": ext.technician_id,
+                    "technician_id": getattr(ext.technician, "employee_id", str(ext.technician_id)),
+                    "technician_name": (f"{ext.technician.user.first_name} {ext.technician.user.last_name}".strip() or ext.technician.user.username) if ext.technician and ext.technician.user else "Technician",
+                    "company": ext.company_id,
+                    "title": ext.title,
+                    "description": ext.description,
+                    "reason": ext.reason,
+                    "estimated_labor_cost": str(ext.estimated_labor_cost or "0.00"),
+                    "estimated_materials_cost": str(ext.estimated_materials_cost or "0.00"),
+                    "total_extension_cost": str(getattr(ext, "requested_amount", None) or getattr(ext, "approved_amount", None) or ((ext.estimated_labor_cost or 0) + (ext.estimated_materials_cost or 0)) or "0.00"),
+                    "status": ext.status,
+                    "requires_specialist": ext.requires_specialist,
+                    "is_critical": ext.is_critical,
+                    "created_at": ext.created_at.isoformat() if ext.created_at else None,
+                }
+                for ext in exts
+            ]
         from .models import WorkforceWorkExtension
         exts = WorkforceWorkExtension.objects.filter(job=obj).order_by("-created_at")
         return WorkforceWorkExtensionSerializer(exts, many=True).data
 
     def get_active_extension(self, obj):
+        active_extensions_map = self.context.get("active_extensions_map")
+        if active_extensions_map is not None:
+            active = active_extensions_map.get(obj.id)
+            if active:
+                return {
+                    "id": active.id,
+                    "job": active.job_id,
+                    "technician": active.technician_id,
+                    "technician_id": getattr(active.technician, "employee_id", str(active.technician_id)),
+                    "technician_name": (f"{active.technician.user.first_name} {active.technician.user.last_name}".strip() or active.technician.user.username) if active.technician and active.technician.user else "Technician",
+                    "company": active.company_id,
+                    "title": active.title,
+                    "description": active.description,
+                    "reason": active.reason,
+                    "estimated_labor_cost": str(active.estimated_labor_cost or "0.00"),
+                    "estimated_materials_cost": str(active.estimated_materials_cost or "0.00"),
+                    "total_extension_cost": str(getattr(active, "requested_amount", None) or getattr(active, "approved_amount", None) or ((active.estimated_labor_cost or 0) + (active.estimated_materials_cost or 0)) or "0.00"),
+                    "status": active.status,
+                    "requires_specialist": active.requires_specialist,
+                    "is_critical": active.is_critical,
+                    "created_at": active.created_at.isoformat() if active.created_at else None,
+                }
+            return None
         from .models import WorkforceWorkExtension
         active = WorkforceWorkExtension.objects.filter(
             job=obj,
@@ -628,10 +690,14 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         return None
 
     def get_payment(self, obj):
-        from .models import JobPayment
-        pmt = getattr(obj, "payment_record", None)
-        if not pmt:
-            pmt = JobPayment.objects.filter(job=obj).first()
+        payments_map = self.context.get("payments_map")
+        if payments_map is not None:
+            pmt = payments_map.get(obj.id)
+        else:
+            from .models import JobPayment
+            pmt = getattr(obj, "payment_record", None)
+            if not pmt:
+                pmt = JobPayment.objects.filter(job=obj).first()
         if not pmt:
             is_online = (obj.payment_method or "").upper() in ["ONLINE", "PREPAID"]
             is_paid = obj.payment_status in ["paid", "collected"]
