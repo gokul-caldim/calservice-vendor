@@ -136,6 +136,16 @@ export async function apiRejectJobOffer(jobId, reason = '') {
   });
 }
 
+export async function apiCancelJob(jobId, reasonCode, reasonDetail = '') {
+  return await apiRequest(`/workforce/jobs/${jobId}/cancel/`, {
+    method: 'POST',
+    json: {
+      reason_code: reasonCode,
+      reason_detail: reasonDetail,
+    },
+  });
+}
+
 export async function apiVerifyArrival(jobId, lat, lon) {
   return await apiRequest(`/workforce/jobs/${jobId}/arrive/`, {
     method: 'POST',

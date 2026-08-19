@@ -39,8 +39,8 @@ import {
 } from 'lucide-react';
 import { getGPSPosition } from '../../hooks/useGPSPosition.js';
 import { apiUpdateLocationFull } from '../../api/workforceService.js';
-
 import { loadMapsApi } from '../../utils/loadGoogleMaps.js';
+import { TechnicianNavigationView } from './navigation/TechnicianNavigationView.jsx';
 
 // Calculate Haversine direct distance in meters
 function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
@@ -69,6 +69,17 @@ export function JobTrackingMap({
   geofenceRadius = 300,
   viewRole = 'technician', // 'technician' or 'customer'
 }) {
+  if (viewRole === 'technician') {
+    return (
+      <TechnicianNavigationView
+        job={job}
+        technicianLocation={technicianLocation}
+        preServiceState={preServiceState}
+        geofenceRadius={geofenceRadius}
+      />
+    );
+  }
+
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
   const techMarkerRef = useRef(null);

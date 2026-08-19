@@ -7,8 +7,10 @@
 
 let mapsApiPromise = null;
 
-export function loadMapsApi(apiKey) {
+export function loadMapsApi(explicitKey) {
   if (typeof window === 'undefined') return Promise.reject(new Error('No browser window available.'));
+
+  const apiKey = explicitKey || import.meta.env.VITE_GOOGLE_MAPS_KEY || import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
   if (!apiKey) return Promise.reject(new Error('Google Maps API key is not configured.'));
 
   const isMapsReady = () => {
@@ -16,8 +18,7 @@ export function loadMapsApi(apiKey) {
       window.google &&
       window.google.maps &&
       typeof window.google.maps.Map === 'function' &&
-      window.google.maps.ControlPosition &&
-      typeof window.google.maps.Marker === 'function'
+      typeof window.google.maps.DirectionsService === 'function'
     );
   };
 

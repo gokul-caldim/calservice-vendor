@@ -411,16 +411,6 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     payment = serializers.SerializerMethodField()
     cancellation_info = serializers.SerializerMethodField()
 
-    # Authoritative state machine & offer fields (Rule 1 & Rule 2)
-    job_status = serializers.SerializerMethodField()
-    offer_status = serializers.SerializerMethodField()
-    is_offer = serializers.SerializerMethodField()
-    is_accepted_by_current_employee = serializers.SerializerMethodField()
-    is_assigned_to_current_employee = serializers.SerializerMethodField()
-    accepted_at = serializers.SerializerMethodField()
-    cancellation_deadline = serializers.SerializerMethodField()
-    offer_expires_at = serializers.SerializerMethodField()
-
     class Meta:
         model = ServiceRequest
         fields = [
@@ -451,6 +441,7 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "cancellation_info",
             "extensions",
             "active_extension",
+            "cancellation_info",
             "created_at",
             "updated_at",
             # Authoritative fields
@@ -654,41 +645,39 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         return JobPaymentSerializer(pmt).data
 
     def get_cancellation_info(self, obj):
-        if not self.get_is_accepted_by_current_employee(obj):
+        request = self.context.get("request")
+        if not request or not getattr(request, "user", None):
             return None
-        if obj.status not in ["accepted", "on_the_way"]:
-            return None
-        emp = self._get_context_emp()
-        if not emp:
+        emp = getattr(request.user, "employee_profile", None)
+        if not emp or obj.assigned_employee_id != emp.id:
             return None
 
-        from .models import WorkforceJobLifecycleEvent
-        from datetime import timedelta
+        if obj.status not in ["accepted", "on_the_way", "en_route"]:
+            return {
+                "can_cancel": False,
+                "reason": "Not in cancellable state",
+                "remaining_seconds": 0,
+            }
+
+        from service_requests.models import EmployeeJob
         from django.utils import timezone
+        from datetime import timedelta
 
-        accept_event = WorkforceJobLifecycleEvent.objects.filter(
-            job=obj,
-            employee=emp,
-            event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
-        ).order_by("-created_at").first()
+        emp_job = EmployeeJob.objects.filter(service_request=obj, employee=emp).first()
+        accepted_at = (emp_job.accepted_date if emp_job and emp_job.accepted_date else None) or obj.updated_at
+        if not accepted_at:
+            return None
 
+        deadline = accepted_at + timedelta(minutes=5)
         now = timezone.now()
-        accepted_at = accept_event.accepted_at if accept_event else (obj.updated_at or obj.created_at)
-        deadline = (
-            accept_event.cancellation_deadline if (accept_event and accept_event.cancellation_deadline)
-            else (accepted_at + timedelta(minutes=5)) if accepted_at else None
-        )
-
-        remaining_s = max(0, int((deadline - now).total_seconds())) if deadline else 0
-        is_state_allowed = obj.status in ["accepted", "on_the_way"]
-        is_available = bool(is_state_allowed and deadline and now <= deadline)
+        remaining_seconds = max(0, int((deadline - now).total_seconds()))
+        can_cancel = remaining_seconds > 0
 
         return {
-            "accepted_at": accepted_at.isoformat() if accepted_at else None,
-            "cancellation_deadline": deadline.isoformat() if deadline else None,
-            "remaining_seconds": remaining_s,
-            "cancellation_available": is_available,
-            "is_state_allowed": is_state_allowed,
+            "can_cancel": can_cancel,
+            "accepted_at": accepted_at.isoformat(),
+            "cancellation_deadline": deadline.isoformat(),
+            "remaining_seconds": remaining_seconds,
         }
 
 

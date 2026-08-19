@@ -166,13 +166,20 @@ class ClockInView(APIView):
         from .geo import haversine_distance, GeofenceDecision, evaluate
 
         # 2 & 3 & 4. Verify active accepted primary job assignment owned by this employee
-        emp_job_sr_ids = list(EmployeeJob.objects.filter(employee=emp).values_list("service_request_id", flat=True))
-        active_job = ServiceRequest.objects.filter(
-            Q(assigned_employee=emp) | Q(id__in=emp_job_sr_ids),
-            company=company,
-            status__in=["accepted", "on_the_way", "arrived"]
-        ).first()
-
+        job_id = request.data.get("job_id") or request.data.get("service_request_id")
+        if job_id:
+            active_job = ServiceRequest.objects.filter(
+                id=job_id,
+                company=company,
+                status__in=["accepted", "on_the_way", "arrived"]
+            ).first()
+        else:
+            emp_job_sr_ids = list(EmployeeJob.objects.filter(employee=emp).values_list("service_request_id", flat=True))
+            active_job = ServiceRequest.objects.filter(
+                Q(assigned_employee=emp) | Q(id__in=emp_job_sr_ids),
+                company=company,
+                status__in=["accepted", "on_the_way", "arrived"]
+            ).first()
 
         if not active_job:
             return Response({
@@ -187,14 +194,18 @@ class ClockInView(APIView):
                 "code": "CUSTOMER_COORDINATES_MISSING"
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # 6, 7, 8. Pre-Service Verification Gate (Arrival, OTP, and 3 Photos)
+        # 6, 7, 8. Pre-Service Verification Gate (Arrival, OTP, and Before Face Selfie)
         verification = PreServiceVerification.objects.filter(job=active_job).first()
+        if verification:
+            verification.check_completion()
+            verification.save()
+
         if not verification or not verification.is_complete:
             missing_items = []
             if not verification:
-                missing_items = ["GPS Arrival Geofence", "Presence Photo", "Customer OTP", "Appliance Photo", "Work Area Photo"]
+                missing_items = ["GPS Arrival Geofence", "Customer Work Start OTP", "Before Face Selfie"]
                 return Response({
-                    "error": "Clock-In rejected: Pre-service verification incomplete. Arrival, OTP and evidence required.",
+                    "error": "Clock-In rejected: Pre-service verification incomplete. Arrival, OTP and face selfie required.",
                     "code": "ARRIVAL_REQUIRED",
                     "details": {"missing_items": missing_items}
                 }, status=status.HTTP_400_BAD_REQUEST)
@@ -214,11 +225,7 @@ class ClockInView(APIView):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             if not verification.presence_photo:
-                missing_items.append("Presence Photo")
-            if not verification.appliance_photo:
-                missing_items.append("Before Appliance Photo")
-            if not verification.work_area_photo:
-                missing_items.append("Before Work Area Photo")
+                missing_items.append("Before Face Selfie")
 
             return Response({
                 "error": f"Clock-In rejected: Pre-service evidence incomplete. Missing: {', '.join(missing_items)}.",
@@ -263,7 +270,7 @@ class ClockInView(APIView):
         if gps_timestamp:
             try:
                 from django.utils.dateparse import parse_datetime
-                if isinstance(gps_timestamp, (int, float)) or (isinstance(gps_timestamp, str) and gps_timestamp.isdigit()):
+                if isinstance(gps_timestamp, (int, float)) or (isinstance(gps_timestamp, str) and str(gps_timestamp).isdigit()):
                     ts_num = float(gps_timestamp)
                     if ts_num > 1e11:  # milliseconds
                         ts_num /= 1000.0
@@ -286,13 +293,13 @@ class ClockInView(APIView):
             except Exception:
                 pass
 
-        # 11. Customer Job Geofence (Haversine distance <= 300m)
+        # 11. Customer Job Geofence (Haversine distance <= 250m)
         dist_to_job = haversine_distance(lat_val, lon_val, float(active_job.latitude), float(active_job.longitude))
-        ARRIVAL_RADIUS_METERS = 300.0
+        ARRIVAL_RADIUS_METERS = 250.0
 
-        if dist_to_job > ARRIVAL_RADIUS_METERS:
+        if dist_to_job > ARRIVAL_RADIUS_METERS and not (verification and verification.geofence_passed):
             return Response({
-                "error": f"Clock-In failed: You are {int(dist_to_job)}m away from customer destination. You must be within 300m to clock in.",
+                "error": f"Clock-In failed: You are {int(dist_to_job)}m away from customer destination. You must be within {int(ARRIVAL_RADIUS_METERS)}m to clock in.",
                 "code": "OUTSIDE_GEOFENCE",
                 "details": {
                     "distance_m": round(dist_to_job, 1),

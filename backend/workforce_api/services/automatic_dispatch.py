@@ -302,7 +302,7 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
     return True, "All 9 Eligibility Gates Passed", gate_results
 
 
-def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, excluded_employee_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, exclude_employee_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """
     Finds and ranks all eligible candidate employees for a given ServiceRequest.
     Uses database-level filtering and prefetching for optimal WAN performance.
@@ -341,6 +341,13 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
         )
         .select_related("user", "company")
         .annotate(is_busy_job=Exists(busy_subquery))
+    )
+
+    if exclude_employee_ids:
+        candidates_qs = candidates_qs.exclude(pk__in=exclude_employee_ids)
+
+    candidates_qs = (
+        candidates_qs
         .prefetch_related(
             Prefetch(
                 "compliance_records",
@@ -491,7 +498,7 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
     return ranked_candidates
 
 
-def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, excluded_employee_ids: Optional[List[int]] = None) -> Tuple[bool, str]:
+def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, exclude_employee_ids: Optional[List[int]] = None) -> Tuple[bool, str]:
     """
     Executes automatic dispatch for a single ServiceRequest:
     1. Locks ServiceRequest row with select_for_update inside transaction.atomic()
@@ -546,11 +553,7 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
         )
 
         # Find eligible candidate technicians
-        candidates = get_eligible_candidates(
-            job_obj,
-            max_gps_age_seconds=max_gps_age_seconds,
-            excluded_employee_ids=excluded_employee_ids,
-        )
+        candidates = get_eligible_candidates(job_obj, max_gps_age_seconds=max_gps_age_seconds, exclude_employee_ids=exclude_employee_ids)
 
         WorkforceEventLog.objects.create(
             event_type="CANDIDATES_EVALUATED",

@@ -1219,31 +1219,34 @@ class WorkforceJobListView(APIView):
                 jobs = ServiceRequest.objects.none()
         elif emp:
             now = timezone.now()
-            from workforce_api.services.workload import (
-                ACTIVE_WORKLOAD_STATUSES,
-                get_employee_active_job,
-            )
 
-            active_job = get_employee_active_job(emp)
+            # Hard Single Active Job Invariant: Check if technician already has an active assignment
+            has_active_job = ServiceRequest.objects.filter(
+                assigned_employee=emp,
+                status__in=[
+                    "accepted", "on_the_way", "en_route", "arrived",
+                    "service_started", "in_progress", "proof_submitted",
+                    "service_completed", "payment_pending", "cash_pending"
+                ]
+            ).exists()
 
-            # Strict Single-Active-Job Isolation: When employee is busy, actionable offers are suppressed
-            if active_job:
+            if has_active_job:
+                # When technician is working on an active job, no new job offers should appear
                 offered_job_ids = []
             else:
-                offered_job_ids = list(
-                    WorkforceJobOffer.objects.filter(
-                        employee=emp,
-                        status="OFFERED",
-                        expires_at__gt=now,
-                    ).values_list("job_id", flat=True)
-                )
+                offered_job_ids = list(WorkforceJobOffer.objects.filter(
+                    employee=emp,
+                    status="OFFERED",
+                    expires_at__gt=now
+                ).values_list("job_id", flat=True))
 
             try:
                 from service_requests.models import EmployeeJob
-                emp_job_sr_ids = EmployeeJob.objects.filter(
-                    employee=emp,
-                    status__in=["ACCEPTED", "IN_PROGRESS", "COMPLETED"]
-                ).values_list("service_request_id", flat=True)
+                emp_job_sr_ids = list(EmployeeJob.objects.filter(
+                    employee=emp
+                ).exclude(
+                    status__in=["REJECTED", "CANCELLED"]
+                ).values_list("service_request_id", flat=True))
             except Exception:
                 emp_job_sr_ids = []
 
@@ -1346,17 +1349,20 @@ class WorkforceJobProofView(APIView):
             return Response({"error": f"Cannot submit completion proof for job in status '{job.status}'. Expected 'in_progress'."}, status=status.HTTP_400_BAD_REQUEST)
 
         completion_notes = request.data.get("notes", "").strip() or request.data.get("completion_notes", "").strip()
+        after_presence = request.FILES.get("after_presence_photo") or request.FILES.get("after_selfie") or request.FILES.get("presence_photo")
         after_appliance = request.FILES.get("after_appliance_photo") or request.FILES.get("after_photo")
-        after_work_area = request.FILES.get("after_work_area_photo") or request.FILES.get("during_photo")
+        after_work_area = request.FILES.get("after_work_area_photo") or request.FILES.get("during_photo") or request.FILES.get("before_photo")
         parts_used = request.data.get("parts_used", [])
 
-        if not after_appliance or not after_work_area or not completion_notes:
-            return Response({"error": "After-service proof requires: After Appliance Photo, After Work-Area Photo, and Completion Notes."}, status=status.HTTP_400_BAD_REQUEST)
+        if not after_presence and not after_appliance and not after_work_area:
+            return Response({"error": "After-service completion requires After Face/Identity Selfie or service photo."}, status=status.HTTP_400_BAD_REQUEST)
 
         proof, _ = PostServiceProof.objects.get_or_create(
             job=job,
             defaults={"employee": emp or job.assigned_employee}
         )
+        if after_presence:
+            proof.after_presence_photo = after_presence
         if after_appliance:
             proof.after_appliance_photo = after_appliance
         if after_work_area:
@@ -2118,32 +2124,11 @@ class WorkforceJobAcceptOfferView(APIView):
                     "status": job_obj.status,
                 }, status=status.HTTP_200_OK)
 
-            # Reject acceptance if assigned to another employee
-            if job_obj.assigned_employee and job_obj.assigned_employee != emp_obj and job_obj.status in ACTIVE_WORKLOAD_STATUSES + ["completed"]:
+            # Reject acceptance if assigned to another employee (Simultaneous Acceptance Winner-Takes-All)
+            if job_obj.assigned_employee and job_obj.assigned_employee != emp and job_obj.status in ["accepted", "on_the_way", "arrived", "in_progress", "completed"]:
                 return Response({
-                    "error": "This job has already been accepted by another professional.",
-                    "code": "JOB_ALREADY_ACCEPTED",
-                    "message": "This job has already been accepted by another professional."
-                }, status=status.HTTP_409_CONFLICT)
-
-            # RULE 1: Server-side Single Active Job Enforcement (Race-Safe)
-            from workforce_api.services.workload import (
-                get_employee_active_job,
-                supersede_other_offers_for_employee,
-                reconcile_employee_availability,
-            )
-
-            conflicting = get_employee_active_job(emp_obj, for_update=True)
-            if conflicting and conflicting.pk != job_obj.pk:
-                logger.warning(
-                    f"[ACCEPT_BLOCKED] employee={emp_obj.id} requested_job={job_obj.id} "
-                    f"active_job={conflicting.id} reason=EMPLOYEE_ALREADY_BUSY"
-                )
-                return Response({
-                    "error": f"Cannot accept job: You already have an active job (Job #{conflicting.id}).",
-                    "code": "EMPLOYEE_ALREADY_BUSY",
-                    "message": "You already have an active job. Complete it before accepting another job.",
-                    "active_job_id": conflicting.id,
+                    "error": "Cannot accept job: Job has already been assigned and accepted by another technician.",
+                    "code": "JOB_ALREADY_ACCEPTED"
                 }, status=status.HTTP_409_CONFLICT)
 
             from service_requests.models import EmployeeJob
@@ -2177,14 +2162,28 @@ class WorkforceJobAcceptOfferView(APIView):
                 if offer.expires_at < now:
                     offer.status = WorkforceJobOffer.Status.EXPIRED
                     offer.save()
-                    run_automatic_dispatch(job_obj, excluded_employee_ids=[emp_obj.id])
+                    run_automatic_dispatch(job_obj)
                     return Response({
-                        "error": "This offer has expired.",
-                        "code": "OFFER_EXPIRED",
-                        "message": "This offer has expired."
+                        "error": "Job offer has expired.",
+                        "code": "OFFER_EXPIRED"
                     }, status=status.HTTP_409_CONFLICT)
-                offer.status = WorkforceJobOffer.Status.ACCEPTED
+                offer.status = "ACCEPTED"
                 offer.save()
+
+            # Hard Single Active Job Rule: Check if employee has a conflicting active job
+            conflicting = ServiceRequest.objects.filter(
+                assigned_employee=emp,
+                status__in=[
+                    "accepted", "on_the_way", "en_route", "arrived",
+                    "service_started", "in_progress", "proof_submitted",
+                    "service_completed", "payment_pending", "cash_pending"
+                ]
+            ).exclude(pk=job_obj.pk).first()
+            if conflicting:
+                return Response({
+                    "error": f"Cannot accept job: Technician already has an active assigned Job #{conflicting.id}.",
+                    "code": "EMPLOYEE_ALREADY_BUSY"
+                }, status=status.HTTP_409_CONFLICT)
 
             # Verify technician eligibility if accepting without an existing vetted offer
             if not offer:
@@ -2497,6 +2496,151 @@ class WorkforceJobCancelAssignmentView(APIView):
                 "status": job_obj.status,
                 "redispatch_message": msg,
             }, status=status.HTTP_200_OK)
+
+
+class WorkforceJobTechnicianCancelView(APIView):
+    """
+    Authoritative 5-minute cancellation endpoint for technicians.
+    Allows cancellation ONLY when status is ACCEPTED or ON_THE_WAY and within 5 minutes of acceptance.
+    Requires structured cancellation reasons.
+    Triggers automatic redispatch excluding the cancelling technician.
+    """
+    permission_classes = [IsApprovedTechnician]
+
+    VALID_CANCELLATION_REASONS = [
+        "VEHICLE_ISSUE",
+        "TRAFFIC_ROUTE_ISSUE",
+        "TOO_FAR",
+        "SERVICE_MISMATCH",
+        "CUSTOMER_LOCATION_ISSUE",
+        "SAFETY_CONCERN",
+        "PERSONAL_EMERGENCY",
+        "OTHER",
+    ]
+
+    def post(self, request, pk):
+        emp = getattr(request.user, "employee_profile", None)
+        if not emp:
+            return Response({"error": "Employee profile not found.", "code": "EMPLOYEE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+        reason_code = request.data.get("reason_code") or request.data.get("reason")
+        reason_detail = (request.data.get("reason_detail") or request.data.get("notes") or "").strip()
+
+        if not reason_code:
+            return Response({
+                "error": "Cancellation reason is required.",
+                "code": "REASON_REQUIRED",
+                "valid_reasons": self.VALID_CANCELLATION_REASONS,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Normalize friendly reason string
+        reason_map = {
+            "Vehicle issue": "VEHICLE_ISSUE",
+            "Traffic / Route issue": "TRAFFIC_ROUTE_ISSUE",
+            "Busy / Heavy traffic": "TRAFFIC_ROUTE_ISSUE",
+            "Too far": "TOO_FAR",
+            "Service mismatch": "SERVICE_MISMATCH",
+            "Customer location issue": "CUSTOMER_LOCATION_ISSUE",
+            "Safety concern": "SAFETY_CONCERN",
+            "Personal emergency": "PERSONAL_EMERGENCY",
+            "Personal reason": "PERSONAL_EMERGENCY",
+            "Other": "OTHER",
+        }
+        reason_code = reason_map.get(reason_code, reason_code)
+        if reason_code not in self.VALID_CANCELLATION_REASONS:
+            return Response({
+                "error": f"Invalid cancellation reason '{reason_code}'. Must be one of: {', '.join(self.VALID_CANCELLATION_REASONS)}",
+                "code": "INVALID_REASON",
+                "valid_reasons": self.VALID_CANCELLATION_REASONS,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if reason_code == "OTHER" and not reason_detail:
+            return Response({
+                "error": "Meaningful explanation required when selecting 'OTHER' reason.",
+                "code": "EXPLANATION_REQUIRED",
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            job = ServiceRequest.objects.select_for_update().filter(pk=pk).first()
+            if not job:
+                return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+            # Cross-tenant check
+            if emp.company_id and job.company_id and emp.company_id != job.company_id:
+                return Response({"error": "Cross-company cancellation forbidden.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+
+            # Verify assigned technician
+            if job.assigned_employee != emp:
+                return Response({"error": "You are not the assigned technician for this job.", "code": "NOT_ASSIGNED_TECHNICIAN"}, status=status.HTTP_403_FORBIDDEN)
+
+            # State check: ONLY allow cancellation during ACCEPTED or ON_THE_WAY
+            if job.status not in ["accepted", "on_the_way", "en_route"]:
+                return Response({
+                    "error": f"Cancellation is not allowed in current job state '{job.status}'. Cancellation window is only open prior to arrival.",
+                    "code": "CANCELLATION_NOT_ALLOWED_IN_CURRENT_STATE",
+                }, status=status.HTTP_409_CONFLICT)
+
+            # 5-minute cancellation window check
+            from service_requests.models import EmployeeJob
+            emp_job = EmployeeJob.objects.filter(service_request=job, employee=emp).first()
+            accepted_at = (emp_job.accepted_date if emp_job and emp_job.accepted_date else None) or job.updated_at
+            
+            cancellation_deadline = accepted_at + timedelta(minutes=5)
+            now = timezone.now()
+            if now > cancellation_deadline:
+                return Response({
+                    "error": "Cancellation window has closed (5 minutes elapsed since acceptance).",
+                    "code": "CANCELLATION_WINDOW_EXPIRED",
+                    "accepted_at": accepted_at.isoformat(),
+                    "cancellation_deadline": cancellation_deadline.isoformat(),
+                }, status=status.HTTP_409_CONFLICT)
+
+            # 1. Update EmployeeJob record
+            full_reason_str = f"[{reason_code}] {reason_detail}".strip()
+            if emp_job:
+                emp_job.status = "CANCELLED"
+                emp_job.notes = full_reason_str
+                emp_job.save(update_fields=["status", "notes"])
+
+            # 2. Terminate active JobTrackingSession
+            from workforce_api.models import JobTrackingSession, WorkforceJobOffer, WorkforceEventLog
+            JobTrackingSession.objects.filter(job=job, employee=emp, status=JobTrackingSession.SessionStatus.ACTIVE).update(
+                status=JobTrackingSession.SessionStatus.CANCELLED
+            )
+
+            # 3. Mark offer as CANCELLED
+            WorkforceJobOffer.objects.filter(job=job, employee=emp).update(status="CANCELLED")
+
+            # 4. Clear technician assignment on job & preserve customer booking
+            job.assigned_employee = None
+            job.status = "confirmed"
+            job.save(update_fields=["assigned_employee", "status"])
+
+            # 5. Log audit event
+            WorkforceEventLog.objects.create(
+                user=emp.user,
+                event_type="JOB_CANCELLED_BY_TECH",
+                payload={
+                    "job_id": job.id,
+                    "employee_id": emp.id,
+                    "reason_code": reason_code,
+                    "reason_detail": reason_detail,
+                }
+            )
+
+            # 6. Automatic redispatch to next eligible candidate, excluding this technician
+            try:
+                from workforce_api.services.automatic_dispatch import dispatch_job
+                dispatch_job(job, exclude_employee_ids=[emp.id])
+            except Exception as e:
+                logger.error(f"[REDISPATCH_ERROR] Failed to auto-dispatch job #{job.id} after tech cancellation: {e}")
+
+            return Response({
+                "message": f"Job #{job.id} cancelled successfully. Redispatch started for next professional.",
+                "job_id": job.id,
+                "status": "CANCELLED_BY_TECHNICIAN",
+            }, status=status.HTTP_200_OK)
+
 
 
 class WorkforceJobRejectOfferView(APIView):
@@ -4071,7 +4215,7 @@ class WorkforceLocationUpdateView(APIView):
         from django.db.models import Q
         import secrets
 
-        ARRIVAL_RADIUS_METERS = 300.0
+        ARRIVAL_RADIUS_METERS = 250.0
         ARRIVAL_MAX_ACCURACY_METERS = 200.0
         ARRIVAL_MAX_GPS_AGE_SECONDS = 30.0
         ARRIVAL_REQUIRED_FIXES = 2
@@ -4182,6 +4326,52 @@ class WorkforceLocationUpdateView(APIView):
                                         is_automatic=True,
                                         actor=user
                                     )
+                                    verification.employee = emp
+                                    verification.geofence_passed = True
+                                    verification.arrival_lat = lat_f
+                                    verification.arrival_lon = lng_f
+                                    if not verification.arrived_at:
+                                        verification.arrived_at = now
+
+                                    # Authoritative Single OTP Resolution
+                                    existing_otp = (getattr(locked_job, "start_otp", None) or "").strip() or (verification.otp_code or "").strip()
+
+                                    if existing_otp:
+                                        active_otp = existing_otp
+                                        verification.otp_code = active_otp
+                                        if not verification.otp_generated_at:
+                                            verification.otp_generated_at = now
+                                        if not verification.otp_expires_at:
+                                            verification.otp_expires_at = now + timedelta(minutes=15)
+                                    else:
+                                        new_otp = f"{secrets.randbelow(900000) + 100000}"
+                                        active_otp = new_otp
+                                        verification.otp_code = new_otp
+                                        verification.otp_generated_at = now
+                                        verification.otp_expires_at = now + timedelta(minutes=15)
+                                        verification.otp_attempts = 0
+                                        verification.otp_verified = False
+
+                                    if locked_job.customer:
+                                        create_notification(
+                                            recipient=locked_job.customer,
+                                            title="Technician Arrived — Work Start OTP",
+                                            message=f"Technician {user.get_full_name() or user.username} has arrived. Share OTP {active_otp} to start service.",
+                                            notification_type="WORK_START_OTP",
+                                            company=locked_job.company,
+                                            related_object_id=str(locked_job.id),
+                                        )
+
+                                    verification.check_completion()
+                                    verification.save()
+
+                                    locked_job.status = "arrived"
+                                    if hasattr(locked_job, "start_otp") and locked_job.start_otp != active_otp:
+                                        locked_job.start_otp = active_otp
+                                        locked_job.save(update_fields=["status", "start_otp", "updated_at"])
+                                    else:
+                                        locked_job.save(update_fields=["status", "updated_at"])
+                                    EmployeeJob.objects.filter(service_request=locked_job, employee=emp).update(status="ARRIVED")
 
                                     session.consecutive_arrival_fixes = 2
                                     session.save()
@@ -4202,7 +4392,7 @@ class WorkforceLocationUpdateView(APIView):
                                         "status": "arrived",
                                     })
                 else:
-                    if dist_m > ARRIVAL_RADIUS_METERS + 100.0:
+                    if dist_m > ARRIVAL_RADIUS_METERS + 50.0:
                         session.consecutive_arrival_fixes = 0
                     session.save()
 
@@ -4422,8 +4612,7 @@ class WorkforceJobLiveTrackingView(APIView):
             "technician_rating": tech_rating,
             "distance_m": distance_m,
             "geofence_passed": geofence_passed,
-            "geofence_radius_meters": 300.0,
-            "start_otp": start_otp,
+            "geofence_radius_meters": 250.0,
             "freshness_state": freshness_state,
             "age_seconds": age_seconds,
             "updated_at": now.isoformat(),
@@ -5510,13 +5699,13 @@ class WorkforceJobArriveView(APIView):
 
         # Real GPS Arrival Geofencing: Compare Employee GPS against Customer Job Location
         from time_tracking.geo import haversine_distance, evaluate
-        ARRIVAL_RADIUS_METERS = 300.0
+        ARRIVAL_RADIUS_METERS = 250.0
 
         if job.latitude is not None and job.longitude is not None:
             distance_m = haversine_distance(lat_val, lon_val, float(job.latitude), float(job.longitude))
             if distance_m > ARRIVAL_RADIUS_METERS:
                 return Response({
-                    "error": f"Arrival failed: You are {int(distance_m)}m away from the customer address. You must be within 300m to confirm arrival.",
+                    "error": f"Arrival failed: You are {int(distance_m)}m away from the customer address. You must be within 250m to confirm arrival.",
                     "geofence_passed": False,
                     "code": "OUTSIDE_GEOFENCE",
                     "details": {
@@ -5546,7 +5735,9 @@ class WorkforceJobArriveView(APIView):
             distance_m = decision.distance_m
             matched_location = decision.matched_location.name if decision.matched_location else "Job Site"
 
-        verification = process_job_arrival(
+        now = timezone.now()
+
+        verification, _ = PreServiceVerification.objects.get_or_create(
             job=job,
             employee=emp,
             lat=lat_val,
@@ -5554,6 +5745,77 @@ class WorkforceJobArriveView(APIView):
             is_automatic=False,
             actor=request.user
         )
+
+        # ── Authoritative Single OTP Resolution ──────────────────────────────
+        # Priority: start_otp on ServiceRequest (set during booking) > existing
+        # active unexpired PSV otp_code > generate a fresh one.
+        # Never silently overwrite a valid, unexpired, unverified OTP.
+        existing_otp = (
+            (getattr(job, "start_otp", None) or "").strip()
+            or (verification.otp_code or "").strip()
+        )
+
+        otp_is_active = (
+            existing_otp
+            and not verification.otp_verified
+            and (
+                not verification.otp_expires_at
+                or verification.otp_expires_at >= now
+            )
+        )
+
+        if otp_is_active:
+            # Re-use the already-issued, non-expired, unverified OTP
+            active_otp = existing_otp
+            verification.otp_code = active_otp
+            if not verification.otp_generated_at:
+                verification.otp_generated_at = now
+            if not verification.otp_expires_at:
+                verification.otp_expires_at = now + timedelta(minutes=15)
+        else:
+            # Generate fresh OTP (first arrival or previous OTP already expired/verified)
+            active_otp = f"{secrets.randbelow(900000) + 100000}"
+            verification.otp_code = active_otp
+            verification.otp_generated_at = now
+            verification.otp_expires_at = now + timedelta(minutes=15)
+            verification.otp_attempts = 0
+            verification.otp_verified = False
+            verification.otp_verified_at = None
+
+        verification.employee = emp
+        verification.geofence_passed = True
+        verification.arrival_lat = lat_val
+        verification.arrival_lon = lon_val
+        if not verification.arrived_at:
+            verification.arrived_at = now
+        verification.check_completion()
+        verification.save()
+
+        # Sync active_otp → ServiceRequest.start_otp (single authoritative field)
+        save_fields = ["status", "updated_at"]
+        job.status = "arrived"
+        if hasattr(job, "start_otp") and job.start_otp != active_otp:
+            job.start_otp = active_otp
+            save_fields.append("start_otp")
+        job.save(update_fields=save_fields)
+
+        try:
+            from service_requests.models import EmployeeJob
+            EmployeeJob.objects.filter(service_request=job, employee=emp).update(status="ARRIVED")
+        except Exception:
+            pass
+
+        # Send notification to customer with Work Start OTP
+        if job.customer:
+            create_notification(
+                recipient=job.customer,
+                title="Technician Arrived — Work Start OTP",
+                message=f"Technician {emp.user.get_full_name()} has arrived. Share OTP {active_otp} to start service.",
+                notification_type="WORK_START_OTP",
+                company=job.company,
+                related_object_id=str(job.id),
+
+            )
 
         return Response({
             "message": "Arrival verified! Fresh Customer Work Start OTP generated and sent to customer.",
@@ -5583,12 +5845,32 @@ class WorkforceJobVerifyOTPView(APIView):
         if not otp_input:
             return Response({"error": "Customer OTP code required."}, status=status.HTTP_400_BAD_REQUEST)
 
-
         verification = PreServiceVerification.objects.filter(job=job).first()
-        if not verification or not verification.otp_code:
+
+        # ── Authoritative OTP source ─────────────────────────────────────────
+        # ServiceRequest.start_otp = booking-level canonical OTP (no TTL).
+        # PreServiceVerification.otp_code = arrival-path OTP (has 15-min TTL).
+        # Accept whichever is non-empty, preferring start_otp.
+        booking_otp = (getattr(job, "start_otp", None) or "").strip()
+        psv_otp = (getattr(verification, "otp_code", None) or "").strip() if verification else ""
+        canonical_otp = booking_otp or psv_otp
+
+        if not canonical_otp:
             return Response({
                 "error": "No OTP generated for this job. Technician must arrive at the job location first."
             }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Ensure PSV record exists; create it if auto-arrival skipped it
+        if not verification:
+            verification, _ = PreServiceVerification.objects.get_or_create(
+                job=job,
+                defaults={"employee": emp, "geofence_passed": True, "otp_code": canonical_otp}
+            )
+
+        # Sync canonical_otp into PSV.otp_code so all subsequent reads are consistent
+        if verification.otp_code != canonical_otp:
+            verification.otp_code = canonical_otp
+            verification.save(update_fields=["otp_code", "updated_at"])
 
         if verification.otp_verified:
             return Response({
@@ -5604,18 +5886,26 @@ class WorkforceJobVerifyOTPView(APIView):
                 "code": "MAX_OTP_ATTEMPTS_EXCEEDED",
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Expiry check (15 minutes)
-        if verification.otp_expires_at and timezone.now() > verification.otp_expires_at:
+        now = timezone.now()
+        otp_expired = bool(verification.otp_expires_at and now > verification.otp_expires_at)
+
+        # Expiry only blocks if the submitted code does NOT match the booking-level start_otp
+        # (start_otp is permanent; only arrival-path OTPs have a TTL)
+        submitted_matches_booking = bool(booking_otp and booking_otp == otp_input)
+        if otp_expired and not submitted_matches_booking:
             return Response({
                 "error": "Customer OTP has expired. Please click 'Resend OTP' to generate a fresh code.",
                 "code": "OTP_EXPIRED",
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Direct matching check against DB code
-        if verification.otp_code == otp_input:
+        # Match check against canonical code
+        if canonical_otp == otp_input:
             verification.otp_verified = True
             verification.otp_attempts = 0
-            verification.otp_verified_at = timezone.now()
+            verification.otp_verified_at = now
+            if otp_expired and submitted_matches_booking:
+                # Retroactively extend the window so check_completion() passes
+                verification.otp_expires_at = now + timedelta(minutes=15)
             is_complete = verification.check_completion()
             verification.save()
 
@@ -5663,6 +5953,11 @@ class WorkforceJobResendOTPView(APIView):
         verification.otp_attempts = 0
         verification.save(update_fields=["otp_code", "otp_generated_at", "otp_expires_at", "otp_attempts", "updated_at"])
 
+        # Keep ServiceRequest.start_otp in sync with the new active OTP
+        if hasattr(job, "start_otp") and job.start_otp != new_otp:
+            job.start_otp = new_otp
+            job.save(update_fields=["start_otp", "updated_at"])
+
         if job.customer:
             create_notification(
                 recipient=job.customer,
@@ -5705,17 +6000,23 @@ class WorkforceCustomerJobOTPView(APIView):
             }, status=status.HTTP_403_FORBIDDEN)
 
         verification = PreServiceVerification.objects.filter(job=job).first()
-        if not verification or not verification.otp_code:
+
+        # Authoritative OTP: start_otp (booking-level) > PSV otp_code (arrival-path)
+        booking_otp = (getattr(job, "start_otp", None) or "").strip()
+        psv_otp = (verification.otp_code or "").strip() if verification else ""
+        canonical_otp = booking_otp or psv_otp
+
+        if not canonical_otp:
             return Response({
                 "error": "Work Start OTP has not been generated yet. Technician must arrive at the job location first."
             }, status=status.HTTP_404_NOT_FOUND)
 
         now = timezone.now()
-        is_expired = bool(verification.otp_expires_at and now > verification.otp_expires_at)
 
-        if verification.otp_verified:
+        if verification and verification.otp_verified:
             otp_state = "VERIFIED"
-        elif is_expired:
+        elif verification and verification.otp_expires_at and now > verification.otp_expires_at and not booking_otp:
+            # PSV-path OTP expired and no booking-level OTP to fall back to
             otp_state = "EXPIRED"
         else:
             otp_state = "ACTIVE"
@@ -5723,13 +6024,13 @@ class WorkforceCustomerJobOTPView(APIView):
         return Response({
             "job_id": job.id,
             "request_id": job.request_id,
-            "otp_code": verification.otp_code,
-            "otp": verification.otp_code,  # backward compatibility alias
+            "otp_code": canonical_otp,
+            "otp": canonical_otp,  # backward compatibility alias
             "otp_state": otp_state,
-            "expires_at": verification.otp_expires_at.isoformat() if verification.otp_expires_at else None,
-            "is_verified": verification.otp_verified,
-            "otp_attempts": verification.otp_attempts,
-            "customer_message": f"Your Work Start Verification Code: {verification.otp_code}. Share this code with your technician upon arrival.",
+            "expires_at": verification.otp_expires_at.isoformat() if verification and verification.otp_expires_at else None,
+            "is_verified": verification.otp_verified if verification else False,
+            "otp_attempts": verification.otp_attempts if verification else 0,
+            "customer_message": f"Your Work Start Verification Code: {canonical_otp}. Share this code with your technician upon arrival.",
             "authorized_action": "START_WORK_AND_CLOCK_IN",
         }, status=status.HTTP_200_OK)
 

@@ -1,5 +1,5 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { useLocation, Link, useNavigate } from 'react-router-dom';
+import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useLocation } from 'react-router-dom';
 import { useAuth } from '../../context/AuthProvider.jsx';
 import { ClockInCard } from '../../components/employee/ClockInCard.jsx';
 import {
@@ -28,10 +28,11 @@ import {
   apiBulkRequestServices,
   apiRemoveService,
   apiVerifyArrival,
-  apiUploadDocument,
+  apiCancelJob,
 } from '../../api/workforceService.js';
 import { apiClockIn } from '../../api/clockInApi.js';
-import { JobTrackingMap } from '../../components/employee/JobTrackingMap.jsx';
+import { ClockInCard } from '../../components/employee/ClockInCard.jsx';
+import { TechnicianNavigationView } from '../../components/employee/navigation/TechnicianNavigationView.jsx';
 
 import { AppShell } from '../../components/common/AppShell.jsx';
 import { StatusBadge } from '../../components/enterprise/StatusBadge.jsx';
@@ -72,12 +73,56 @@ import {
   Compass,
   Briefcase,
   RefreshCw,
+  Ban,
+  XCircle,
+  Navigation,
   Eye,
-  Download,
-  ExternalLink,
-  File,
-  Star,
 } from 'lucide-react';
+
+/**
+ * Real-time Countdown Badge for Offer Expiration & 5-Minute Cancellation Window
+ */
+function CountdownBadge({ targetTime, prefix = '', expiredText = 'Expired', tone = 'amber' }) {
+  const [remaining, setRemaining] = useState(() => {
+    if (!targetTime) return 0;
+    return Math.max(0, Math.floor((new Date(targetTime).getTime() - Date.now()) / 1000));
+  });
+
+  useEffect(() => {
+    if (!targetTime) return;
+    const interval = setInterval(() => {
+      const diff = Math.max(0, Math.floor((new Date(targetTime).getTime() - Date.now()) / 1000));
+      setRemaining(diff);
+      if (diff <= 0) clearInterval(interval);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [targetTime]);
+
+  if (remaining <= 0) {
+    return (
+      <span className="font-mono text-[11px] font-bold text-slate-500 bg-slate-100 px-2 py-0.5 rounded border border-slate-200">
+        {expiredText}
+      </span>
+    );
+  }
+
+  const mm = String(Math.floor(remaining / 60)).padStart(2, '0');
+  const ss = String(remaining % 60).padStart(2, '0');
+
+  const toneStyles = {
+    amber: 'bg-amber-100 text-amber-900 border-amber-300',
+    rose: 'bg-rose-100 text-rose-900 border-rose-300',
+    emerald: 'bg-emerald-100 text-emerald-900 border-emerald-300',
+    blue: 'bg-blue-100 text-blue-900 border-blue-300',
+  };
+
+  return (
+    <span className={`font-mono text-[11px] font-bold px-2 py-0.5 rounded border ${toneStyles[tone] || toneStyles.amber} flex items-center gap-1`}>
+      <Clock className="w-3.5 h-3.5" />
+      <span>{prefix}{mm}:{ss}</span>
+    </span>
+  );
+}
 
 export function EmployeeDashboardPage() {
   const { user, employee, togglePresence, logout, isAuthenticated } = useAuth();
@@ -99,29 +144,56 @@ export function EmployeeDashboardPage() {
   const [customDeclineReason, setCustomDeclineReason] = useState('');
   const [isDecliningOffer, setIsDecliningOffer] = useState(false);
 
-  // Lost Offer / Race-Condition Modal State
-  const [lostOfferInfo, setLostOfferInfo] = useState(null); // { jobId, message }
-  const [realtimeStatus, setRealtimeStatus] = useState('DISCONNECTED'); // 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED'
+  // 5-Minute Technician Cancellation Modal State
+  const [cancelModalJob, setCancelModalJob] = useState(null);
+  const [selectedCancelReason, setSelectedCancelReason] = useState('VEHICLE_ISSUE');
+  const [customCancelReason, setCustomCancelReason] = useState('');
+  const [isCancellingJob, setIsCancellingJob] = useState(false);
 
-  const activeJobs = allJobs.filter((j) => {
-    const p = getEmployeeJobPresentation(j);
-    return p && p.isAccepted && !['completed', 'cancelled'].includes((j.status || '').toLowerCase());
-  });
-  const hasActiveJob = activeJobs.length > 0;
+  // Single Active Job Invariant: Active states
+  const activeJobs = useMemo(() => {
+    return allJobs.filter((j) => {
+      const st = (j.status || '').toLowerCase();
+      const isOffer = j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired;
+      const isCompletedOrCancelled = st === 'completed' || st === 'cancelled';
+      return !isCompletedOrCancelled && (
+        [
+          'offered', 'assigned', 'accepted', 'on_the_way', 'en_route', 'arrived',
+          'service_started', 'in_progress', 'proof_submitted',
+          'service_completed', 'payment_pending', 'cash_pending',
+          'follow_up_required', 'unable_to_complete'
+        ].includes(st) || isOffer
+      );
+    });
+  }, [allJobs]);
 
-  const incomingOffers = hasActiveJob
-    ? []
-    : allJobs.filter((j) => {
-        const p = getEmployeeJobPresentation(j, hasActiveJob);
-        return p && p.isOffer && p.canAccept;
-      });
-  const completedJobs = allJobs.filter((j) => {
-    const p = getEmployeeJobPresentation(j, hasActiveJob);
-    return p && (p.state === 'COMPLETED' || (j.status || '').toLowerCase() === 'completed');
-  });
-  const displayedJobs = jobQueueTab === 'completed'
-    ? completedJobs
-    : (jobQueueTab === 'all' ? allJobs : activeJobs);
+  const hasActiveJob = useMemo(() => {
+    return activeJobs.some((j) =>
+      ['accepted', 'on_the_way', 'en_route', 'arrived', 'service_started', 'in_progress', 'proof_submitted'].includes((j.status || '').toLowerCase())
+    );
+  }, [activeJobs]);
+
+  // While technician is working: NO NEW JOB OFFERS SHOULD APPEAR
+  const incomingOffers = useMemo(() => {
+    return hasActiveJob
+      ? []
+      : allJobs.filter(
+          (j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired
+        );
+  }, [hasActiveJob, allJobs]);
+
+  const completedJobs = useMemo(() => {
+    return allJobs.filter((j) => {
+      const st = (j.status || '').toLowerCase();
+      return st === 'completed' || st === 'cancelled';
+    });
+  }, [allJobs]);
+
+  const displayedJobs = useMemo(() => {
+    if (jobQueueTab === 'completed') return completedJobs;
+    if (jobQueueTab === 'all') return allJobs;
+    return activeJobs;
+  }, [jobQueueTab, completedJobs, allJobs, activeJobs]);
 
   const isOnline = Boolean(user?.isOnline || employee?.is_online);
   const isClockedIn = Boolean(timeTracking?.is_clocked_in);
@@ -213,6 +285,11 @@ export function EmployeeDashboardPage() {
         updated_at: new Date().toISOString(),
       };
       setCurrentLocation(newLoc);
+      window.dispatchEvent(
+        new CustomEvent('workforce:location-updated', {
+          detail: newLoc,
+        })
+      );
       try {
         const res = await apiUpdateLocationFull(latitude, longitude, accuracy, speed, heading, captured_at);
         // Check if automatic arrival was triggered by this GPS fix
@@ -465,6 +542,7 @@ export function EmployeeDashboardPage() {
       const accuracy = pos?.coords?.accuracy ?? pos?.accuracy;
       if (lat == null || lon == null) throw new Error('Unable to retrieve GPS coordinates for clock-in.');
       const res = await apiClockIn({
+        job_id: selectedJob.id,
         lat,
         lon,
         accuracy,
@@ -497,7 +575,7 @@ export function EmployeeDashboardPage() {
       setSelectedJob((prev) => (prev ? { ...prev, status: 'arrived' } : prev));
       await loadDashboard();
     } catch (err) {
-      setError(err.message || 'Failed to verify arrival. Ensure you are within 300m of the job site.');
+      setError(err.message || 'Failed to verify arrival. Ensure you are within 250m of the job site.');
     } finally {
       setActionLoading(null);
     }
@@ -506,6 +584,8 @@ export function EmployeeDashboardPage() {
   // Modals
 
   const [proofModalJob, setProofModalJob] = useState(null);
+  const [afterFaceFile, setAfterFaceFile] = useState(null);
+  const [afterFacePreviewUrl, setAfterFacePreviewUrl] = useState(null);
   const [beforeFile, setBeforeFile] = useState(null);
   const [afterFile, setAfterFile] = useState(null);
   const [beforePreviewUrl, setBeforePreviewUrl] = useState(null);
@@ -554,58 +634,59 @@ export function EmployeeDashboardPage() {
   const [catalogCategories, setCatalogCategories] = useState([]);
   const [serviceActionLoading, setServiceActionLoading] = useState(null);
 
-  const loadDashboard = async () => {
+  const loadDashboard = useCallback(async (options = {}) => {
+    const isSilent = options?.silent === true;
     try {
-      setIsLoading(true);
+      if (!isSilent) setIsLoading(true);
       const [jobsData, timeData, profileData] = await Promise.all([
-        apiGetWorkforceJobs('all').catch(() => []),
+        apiGetWorkforceJobs('all').catch(() => null),
         apiGetTimeTracking().catch(() => null),
         apiGetOnboardingProfile().catch(() => null),
       ]);
-      const safeJobs = jobsData || [];
-      setAllJobs(safeJobs);
-      setJobs(safeJobs);
-      setProfile(profileData || employee);
-      setTimeTracking(timeData);
+      if (jobsData) {
+        setAllJobs(jobsData);
+        setJobs(jobsData);
 
-      const active = safeJobs.filter(
-        (j) =>
-          ['accepted', 'on_the_way', 'arrived', 'in_progress', 'follow_up_required'].includes((j.status || '').toLowerCase()) &&
-          j.active_offer?.status !== 'OFFERED'
-      );
-      const completed = safeJobs.filter((j) => (j.status || '').toLowerCase() === 'completed');
-      const incoming = safeJobs.filter((j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired);
+        // Smart reconciliation of selectedJob without jumping or resetting selection:
+        setSelectedJob((prev) => {
+          if (!prev) {
+            // Find incoming offer first
+            const incoming = jobsData.find((j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired);
+            if (incoming) return incoming;
+            // Otherwise find active assignment
+            const active = jobsData.find((j) =>
+              ['accepted', 'on_the_way', 'en_route', 'arrived', 'service_started', 'in_progress', 'proof_submitted'].includes((j.status || '').toLowerCase())
+            );
+            return active || jobsData[0] || null;
+          }
+          // Update selected job with latest authoritative data from server without resetting selection
+          const updated = jobsData.find((j) => j.id === prev.id);
+          return updated || prev;
+        });
 
-      if (incoming.length > 0) {
-        setSelectedJob((prev) => (prev && incoming.some((j) => j.id === prev.id) ? prev : incoming[0]));
-      } else if (jobQueueTab === 'completed') {
-        if (completed.length > 0) {
-          setSelectedJob((prev) => (prev ? completed.find((j) => j.id === prev.id) || completed[0] : completed[0]));
-        } else {
-          setSelectedJob(null);
-        }
-      } else if (jobQueueTab === 'active') {
-        if (active.length > 0) {
-          setSelectedJob((prev) => (prev ? active.find((j) => j.id === prev.id) || active[0] : active[0]));
-        } else {
-          setSelectedJob(null);
-        }
-      } else {
-        if (safeJobs.length > 0) {
-          setSelectedJob((prev) => (prev ? safeJobs.find((j) => j.id === prev.id) || safeJobs[0] : safeJobs[0]));
-        } else {
-          setSelectedJob(null);
+        // Browser notification for new exclusive offer if arriving silently
+        const offeredJob = jobsData.find((j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired);
+        if (offeredJob && typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+          try {
+            new Notification('⚡ New Exclusive Job Offer!', {
+              body: `Job #${offeredJob.request_id || offeredJob.id}: ${offeredJob.service_title || offeredJob.service_category}. Accept within 5 minutes.`,
+              icon: '/favicon.ico',
+            });
+          } catch (_) {}
         }
       }
+      if (profileData) setProfile(profileData);
+      if (timeData) setTimeTracking(timeData);
     } catch (_) {
     } finally {
-      setIsLoading(false);
+      if (!isSilent) setIsLoading(false);
     }
-  };
+  }, []);
 
+  // Initial dashboard load on mount
   useEffect(() => {
     loadDashboard();
-  }, [jobQueueTab]);
+  }, [loadDashboard]);
 
   // Keep refs in sync so GPS callback can read fresh values without recreating the callback
   useEffect(() => {
@@ -614,7 +695,7 @@ export function EmployeeDashboardPage() {
 
   useEffect(() => {
     loadDashboardRef.current = loadDashboard;
-  });
+  }, [loadDashboard]);
 
   // Request browser notification permission when employee is online
   useEffect(() => {
@@ -623,20 +704,10 @@ export function EmployeeDashboardPage() {
     }
   }, [isOnline]);
 
-  // Listen for real-time location update events (from TopHeader or ClockInCard) to refresh job queue
-  useEffect(() => {
-    const handleLocationUpdate = () => {
-      loadDashboard();
-    };
-    window.addEventListener('workforce:location-updated', handleLocationUpdate);
-    return () => window.removeEventListener('workforce:location-updated', handleLocationUpdate);
-  }, []);
-
-  // Realtime Event Stream Integration (SSE) with resilient auto-reconnection and state reconciliation
-  useEffect(() => {
-    if (!isOnline) {
-      setRealtimeStatus('DISCONNECTED');
-      return;
+  // Realtime Event Stream Integration (SSE): instantaneous reactive job updates
+  const handleRealtimeEvent = useCallback((eventData) => {
+    if (['OFFER_CREATED', 'JOB_OFFER', 'JOB_ASSIGNED', 'ARRIVAL_DETECTED', 'JOB_COMPLETED', 'JOB_LOCATION_UPDATE', 'STATUS_CHANGE'].includes(eventData.event_type)) {
+      loadDashboard({ silent: true });
     }
 
     let eventSource = null;
@@ -644,137 +715,21 @@ export function EmployeeDashboardPage() {
     let retryDelay = 2000; // start at 2s, back off up to 16s
     let isSubscribed = true;
 
-    const connectSSE = () => {
-      if (!isSubscribed) return;
-      try {
-        const token = sessionStorage.getItem('wf_token') || localStorage.getItem('wf_token') || '';
-        if (!token) {
-          setRealtimeStatus('DISCONNECTED');
-          return;
-        }
+  useRealtimeStream({
+    enabled: Boolean(isOnline && isAuthenticated),
+    onEvent: handleRealtimeEvent,
+    onReconcile: () => loadDashboard({ silent: true }),
+    onAuthFailure: handleAuthFailure,
+  });
 
-        const streamUrl = `/api/workforce/realtime/stream/?token=${encodeURIComponent(token)}`;
-        eventSource = new EventSource(streamUrl);
-
-        eventSource.onopen = () => {
-          if (!isSubscribed) return;
-          setRealtimeStatus('CONNECTED');
-          retryDelay = 2000; // reset delay on successful connection
-          // Reconcile latest authoritative REST state on fresh/re-established connection
-          loadDashboardRef.current?.();
-        };
-
-        eventSource.addEventListener('workforce_event', (e) => {
-          if (!isSubscribed) return;
-          try {
-            const data = JSON.parse(e.data);
-            if (data.event_type === 'JOB_OFFER_CLOSED') {
-              setLostOfferInfo({
-                jobId: data.payload?.job_id,
-                message: data.payload?.message || 'Another professional accepted this request. Offer closed automatically.',
-              });
-              loadDashboardRef.current?.();
-              return;
-            }
-            if ([
-              'OFFER_CREATED',
-              'JOB_OFFER',
-              'JOB_ASSIGNED',
-              'ARRIVAL_DETECTED',
-              'EMPLOYEE_JOB_ACCEPTED',
-              'EMPLOYEE_CANCELLED',
-              'EMPLOYEE_JOB_CANCELLED',
-              'NEW_EMPLOYEE_ASSIGNED',
-              'DISPATCH_STARTED',
-              'JOB_COMPLETED',
-              'PAYMENT_PAID',
-            ].includes(data.event_type)) {
-              loadDashboardRef.current?.();
-            }
-          } catch (_) {}
-        });
-
-        eventSource.onerror = () => {
-          if (!isSubscribed) return;
-          setRealtimeStatus('RECONNECTING');
-          if (eventSource) {
-            eventSource.close();
-            eventSource = null;
-          }
-          // Schedule reconnect with exponential backoff
-          reconnectTimeout = setTimeout(() => {
-            retryDelay = Math.min(retryDelay * 1.5, 16000);
-            connectSSE();
-          }, retryDelay);
-        };
-      } catch (_) {
-        setRealtimeStatus('RECONNECTING');
-        reconnectTimeout = setTimeout(connectSSE, retryDelay);
-      }
-    };
-
-    connectSSE();
-
-    return () => {
-      isSubscribed = false;
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      if (eventSource) eventSource.close();
-      setRealtimeStatus('DISCONNECTED');
-    };
-  }, [isOnline]);
-
-  // Silent background job queue safety-net polling when technician is ONLINE (12s interval)
+  // Single silent background safety-net polling when technician is ONLINE (12s interval)
   useEffect(() => {
     if (!isOnline) return;
-    const interval = setInterval(async () => {
-      try {
-        const jobsData = await apiGetWorkforceJobs('all').catch(() => null);
-        if (jobsData) {
-          setAllJobs(jobsData);
-          setJobs(jobsData);
-          const active = jobsData.filter((j) => {
-            const p = getEmployeeJobPresentation(j);
-            return p && p.isAccepted && !['completed', 'cancelled'].includes((j.status || '').toLowerCase());
-          });
-          const completed = jobsData.filter((j) => {
-            const p = getEmployeeJobPresentation(j);
-            return p && (p.state === 'COMPLETED' || (j.status || '').toLowerCase() === 'completed');
-          });
-
-          if (incoming.length > 0) {
-            setSelectedJob((prev) => (prev && incoming.some((j) => j.id === prev.id) ? prev : incoming[0]));
-          } else if (jobQueueTab === 'active') {
-            if (active.length === 0) setSelectedJob(null);
-            else setSelectedJob((prev) => (prev ? active.find((j) => j.id === prev.id) || active[0] : active[0]));
-          } else if (jobQueueTab === 'completed') {
-            if (completed.length === 0) setSelectedJob(null);
-            else setSelectedJob((prev) => (prev ? completed.find((j) => j.id === prev.id) || completed[0] : completed[0]));
-          }
-
-          // If a new offer is available, auto-focus it in the workspace
-          const offeredJob = jobsData.find((j) => {
-            const p = getEmployeeJobPresentation(j);
-            return p && p.isOffer && p.canAccept;
-          });
-          if (offeredJob) {
-            setSelectedJob((prev) => {
-              const prevP = getEmployeeJobPresentation(prev);
-              return (!prev || !prevP?.isOffer) ? offeredJob : prev;
-            });
-            if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
-              try {
-                new Notification('⚡ New Exclusive Job Offer!', {
-                  body: `Job #${offeredJob.request_id || offeredJob.id}: ${offeredJob.service_title || offeredJob.service_category}. Accept within 5 minutes.`,
-                  icon: '/favicon.ico',
-                });
-              } catch (_) {}
-            }
-          }
-        }
-      } catch (_) {}
-    }, 10000);
+    const interval = setInterval(() => {
+      loadDashboard({ silent: true });
+    }, 12000);
     return () => clearInterval(interval);
-  }, [isOnline, jobQueueTab]);
+  }, [isOnline, loadDashboard]);
 
 
 
@@ -910,22 +865,36 @@ export function EmployeeDashboardPage() {
     try {
       setIsUploadingProof(true);
       const formData = new FormData();
+      if (afterFaceFile) formData.append('after_presence_photo', afterFaceFile);
       if (afterFile) formData.append('after_appliance_photo', afterFile);
       if (beforeFile) formData.append('after_work_area_photo', beforeFile);
-      formData.append('notes', workNotes);
+      if (workNotes) formData.append('notes', workNotes);
 
       await apiUploadJobProof(proofModalJob.id, formData);
+      const finishedJob = proofModalJob;
       setProofModalJob(null);
+      setAfterFaceFile(null);
       setBeforeFile(null);
       setAfterFile(null);
+      if (afterFacePreviewUrl) URL.revokeObjectURL(afterFacePreviewUrl);
       if (beforePreviewUrl) URL.revokeObjectURL(beforePreviewUrl);
       if (afterPreviewUrl) URL.revokeObjectURL(afterPreviewUrl);
+      setAfterFacePreviewUrl(null);
       setBeforePreviewUrl(null);
       setAfterPreviewUrl(null);
       setWorkNotes('');
-      setSuccessMsg('After-service proof submitted! Job is COMPLETED.');
+
+      // Seamlessly transition to collect payment if payment is pending / cash on service
+      const isPaid = finishedJob.payment?.payment_status === 'PAID' || finishedJob.payment_status === 'paid';
+      if (!isPaid) {
+        setCashModalJob(finishedJob);
+        setCashAmountReceived(String(finishedJob.payment?.amount_due || finishedJob.total_amount || ''));
+        setSuccessMsg('After-service proof submitted! Please collect customer payment.');
+      } else {
+        setSuccessMsg('After-service proof submitted! Job is COMPLETED.');
+      }
       await loadDashboard();
-      setTimeout(() => setSuccessMsg(''), 4000);
+      setTimeout(() => setSuccessMsg(''), 5000);
     } catch (err) {
       setError(err.message || 'Proof upload failed.');
     } finally {
@@ -973,20 +942,29 @@ export function EmployeeDashboardPage() {
   const handleAcceptOffer = async (jobId) => {
     try {
       setActionLoading(jobId);
+      setError('');
       await apiAcceptJobOffer(jobId);
-      setSuccessMsg('Job offer accepted successfully!');
+      setSuccessMsg('Job offer accepted successfully! Heading to customer site.');
       await loadDashboard();
       setTimeout(() => setSuccessMsg(''), 4000);
     } catch (err) {
-      const classified = classifyApiError(err);
-      if (classified.isOfferLost || err?.status === 409) {
-        setLostOfferInfo({
-          jobId,
-          message: classified.message,
-        });
-        await loadDashboard();
+      if (err.status === 409 || err.code === 'JOB_ALREADY_ACCEPTED') {
+        setError('Job No Longer Available: This job was already accepted by another technician.');
+        // Remove offer from view immediately
+        setAllJobs((prev) => prev.filter((j) => j.id !== jobId));
+        setJobs((prev) => prev.filter((j) => j.id !== jobId));
+        setSelectedJob((prev) => (prev?.id === jobId ? null : prev));
+      } else if (err.status === 409 || err.code === 'EMPLOYEE_ALREADY_BUSY') {
+        setError('Cannot accept offer: You already have an active job in progress.');
+      } else if (err.status === 409 || err.code === 'OFFER_EXPIRED') {
+        setError('This job offer has expired.');
+        setAllJobs((prev) => prev.filter((j) => j.id !== jobId));
+        setJobs((prev) => prev.filter((j) => j.id !== jobId));
+        setSelectedJob((prev) => (prev?.id === jobId ? null : prev));
+      } else if (err.status === 403 || err.code === 'CROSS_TENANT_FORBIDDEN') {
+        setError('Unauthorized: Cross-company access forbidden.');
       } else {
-        setError(classified.message);
+        setError(err.message || 'Failed to accept job offer.');
       }
     } finally {
       setActionLoading(null);
@@ -1023,6 +1001,46 @@ export function EmployeeDashboardPage() {
       setError(err.message || 'Failed to decline job offer.');
     } finally {
       setIsDecliningOffer(false);
+      setActionLoading(null);
+    }
+  };
+
+  const handleOpenCancelModal = (job) => {
+    setCancelModalJob(job || selectedJob);
+    setSelectedCancelReason('VEHICLE_ISSUE');
+    setCustomCancelReason('');
+  };
+
+  const handleConfirmCancelJob = async (e) => {
+    if (e) e.preventDefault();
+    if (!cancelModalJob) return;
+    const cancellingId = cancelModalJob.id;
+
+    if (selectedCancelReason === 'OTHER' && !customCancelReason.trim()) {
+      setError('Please provide an explanation when selecting Other.');
+      return;
+    }
+
+    try {
+      setIsCancellingJob(true);
+      setActionLoading(cancellingId);
+      setError('');
+      await apiCancelJob(cancellingId, selectedCancelReason, customCancelReason.trim());
+      setCancelModalJob(null);
+      setSuccessMsg('Job assignment cancelled. Redispatch initiated for next available technician.');
+      setSelectedJob(null);
+      await loadDashboard();
+      setTimeout(() => setSuccessMsg(''), 4000);
+    } catch (err) {
+      if (err.code === 'CANCELLATION_WINDOW_EXPIRED' || err.status === 409) {
+        setError('Cancellation window closed (5 minutes elapsed since acceptance).');
+      } else if (err.code === 'CANCELLATION_NOT_ALLOWED_IN_CURRENT_STATE') {
+        setError('Cancellation is not allowed in the current state.');
+      } else {
+        setError(err.message || 'Failed to cancel job assignment.');
+      }
+    } finally {
+      setIsCancellingJob(false);
       setActionLoading(null);
     }
   };
@@ -1998,32 +2016,70 @@ export function EmployeeDashboardPage() {
           </div>
         )}
 
-        {/* ── JOBS ROUTE: DEDICATED FULL JOBS WORKSPACE ── */}
-        {isJobsRoute && (
-          <div className="space-y-4">
-            {/* ⚡ Active Assignment Workload Status Card */}
-            {hasActiveJob && (
-              <div className="bg-blue-50 border border-blue-200 rounded p-3 text-xs text-blue-900 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
-                <div className="flex items-center gap-2.5">
-                  <span className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse shrink-0" />
-                  <span>
-                    <strong>ACTIVE ASSIGNMENT IN PROGRESS:</strong> You are currently working on <strong>{activeJobs[0].request_id || `SR-${activeJobs[0].id}`}</strong> ({activeJobs[0].service_title || activeJobs[0].service_category}). Complete current service to receive new job dispatches.
-                  </span>
+        {/* 8. DEFAULT: ACTIVE JOBS WORKSPACE */}
+        {!pathname.includes('/schedule') &&
+          !pathname.includes('/attendance') &&
+          !pathname.includes('/leave') &&
+          !hash.includes('#attendance') &&
+          !hash.includes('#leave') &&
+          !pathname.includes('/earnings') &&
+          !pathname.includes('/documents') &&
+          !pathname.includes('/services') &&
+          !pathname.includes('/settings') && (
+            <>
+              {/* ⚡ Active Assignment in Progress Banner (Hard Single Active Job Rule) */}
+              {hasActiveJob && (
+                <div className="bg-gradient-to-r from-blue-900 to-indigo-900 text-white rounded-lg p-3.5 shadow-md flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className="w-9 h-9 rounded-full bg-blue-500/30 border border-blue-400/40 flex items-center justify-center text-blue-300 shrink-0">
+                      <Truck className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h2 className="text-xs font-black uppercase tracking-wider text-blue-200">
+                          Active Assignment In Progress
+                        </h2>
+                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-500/30 text-blue-100 border border-blue-400/30">
+                          {activeJobs[0]?.status?.toUpperCase() || 'BUSY'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-300 mt-0.5 font-medium">
+                        You have an active job assignment ({activeJobs[0]?.request_id || `Job #${activeJobs[0]?.id}`}). New dispatch offers are paused until this job is completed.
+                      </p>
+                    </div>
+                  </div>
+                  {activeJobs[0] && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedJob(activeJobs[0]);
+                        const el = document.getElementById('selected-job-workspace');
+                        if (el) el.scrollIntoView({ behavior: 'smooth' });
+                      }}
+                      className="px-3 py-1.5 bg-blue-500 hover:bg-blue-400 text-white text-xs font-bold rounded shadow transition-colors shrink-0 cursor-pointer"
+                    >
+                      View Active Job →
+                    </button>
+                  )}
                 </div>
-                <span className="text-[10px] font-mono uppercase bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded border border-blue-300 shrink-0 self-start sm:self-auto">
-                  BUSY • SINGLE WORKLOAD
-                </span>
-              </div>
-            )}
+              )}
 
-            {/* ⚡ Dedicated Incoming Job Offers Section */}
-            {incomingOffers.length > 0 && (
-              <div className="space-y-2 bg-amber-50 border-2 border-amber-400 rounded p-4 shadow-md">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="relative flex h-3 w-3">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
-                      <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
+              {/* ⚡ Dedicated Incoming Job Offers Section (Render ONLY when no active job is in progress) */}
+              {!hasActiveJob && incomingOffers.length > 0 && (
+                <div className="space-y-2 bg-amber-50 border-2 border-amber-400 rounded p-4 shadow-md">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="relative flex h-3 w-3">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
+                      </span>
+                      <h2 className="text-xs font-bold text-amber-950 uppercase tracking-wider flex items-center gap-1.5">
+                        <Sparkles className="w-4 h-4 text-amber-600" />
+                        Exclusive Job Offer Available ({incomingOffers.length})
+                      </h2>
+                    </div>
+                    <span className="text-[11px] font-bold text-amber-900 bg-amber-200/80 px-2 py-0.5 rounded">
+                      Action Required
                     </span>
                     <h2 className="text-xs font-bold text-amber-950 uppercase tracking-wider flex items-center gap-1.5">
                       <Sparkles className="w-4 h-4 text-amber-600" />
@@ -2059,18 +2115,23 @@ export function EmployeeDashboardPage() {
                           )}
                         </div>
 
-                        <div className="text-xs text-slate-600 bg-slate-50 p-2 rounded border border-slate-100 space-y-1">
-                          <p className="flex items-center gap-1.5 truncate">
-                            <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                            <span className="truncate">{offerJob.address || 'Customer site address provided upon acceptance'}</span>
-                          </p>
-                          {presentation?.offerExpiresAt && (
-                            <p className="flex items-center gap-1.5 text-rose-700 font-semibold text-[11px]">
-                              <Clock className="w-3.5 h-3.5 shrink-0 animate-pulse" />
-                              <span>Expires: {new Date(presentation.offerExpiresAt).toLocaleTimeString()}</span>
+                          <div className="text-xs text-slate-600 bg-slate-50 p-2 rounded border border-slate-100 space-y-1.5">
+                            <p className="flex items-center gap-1.5 truncate">
+                              <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                              <span className="truncate">{offerJob.address || 'Customer site address provided upon acceptance'}</span>
                             </p>
-                          )}
-                        </div>
+                            {offer?.expires_at && (
+                              <div className="flex items-center justify-between pt-1 border-t border-slate-200/60">
+                                <span className="text-[11px] font-semibold text-slate-500">Offer Expiry:</span>
+                                <CountdownBadge
+                                  targetTime={offer.expires_at}
+                                  prefix="OFFER EXPIRES IN "
+                                  expiredText="OFFER EXPIRED"
+                                  tone="amber"
+                                />
+                              </div>
+                            )}
+                          </div>
 
                         <div className="flex items-center gap-2 pt-1">
                           <button
@@ -2150,10 +2211,10 @@ export function EmployeeDashboardPage() {
                         type="button"
                         onClick={() => {
                           setJobQueueTab('active');
-                          if (activeJobs.length > 0) setSelectedJob(activeJobs[0]);
-                          else setSelectedJob(null);
+                          const target = activeJobs.find((j) => j.id === selectedJob?.id) || activeJobs[0] || null;
+                          if (target) setSelectedJob(target);
                         }}
-                        className={`flex-1 py-1 px-2 rounded text-center transition-all cursor-pointer ${
+                        className={`flex-1 py-1.5 px-2 rounded text-center transition-all cursor-pointer ${
                           jobQueueTab === 'active'
                             ? 'bg-white text-blue-700 shadow-2xs'
                             : 'text-slate-600 hover:text-slate-900'
@@ -2165,10 +2226,10 @@ export function EmployeeDashboardPage() {
                         type="button"
                         onClick={() => {
                           setJobQueueTab('completed');
-                          if (completedJobs.length > 0) setSelectedJob(completedJobs[0]);
-                          else setSelectedJob(null);
+                          const target = completedJobs.find((j) => j.id === selectedJob?.id) || completedJobs[0] || null;
+                          if (target) setSelectedJob(target);
                         }}
-                        className={`flex-1 py-1 px-2 rounded text-center transition-all cursor-pointer ${
+                        className={`flex-1 py-1.5 px-2 rounded text-center transition-all cursor-pointer ${
                           jobQueueTab === 'completed'
                             ? 'bg-white text-emerald-700 shadow-2xs'
                             : 'text-slate-600 hover:text-slate-900'
@@ -2180,9 +2241,10 @@ export function EmployeeDashboardPage() {
                         type="button"
                         onClick={() => {
                           setJobQueueTab('all');
-                          if (allJobs.length > 0) setSelectedJob(allJobs[0]);
+                          const target = allJobs.find((j) => j.id === selectedJob?.id) || allJobs[0] || null;
+                          if (target) setSelectedJob(target);
                         }}
-                        className={`py-1 px-2.5 rounded text-center transition-all cursor-pointer ${
+                        className={`py-1.5 px-3 rounded text-center transition-all cursor-pointer ${
                           jobQueueTab === 'all'
                             ? 'bg-white text-slate-900 shadow-2xs'
                             : 'text-slate-600 hover:text-slate-900'
@@ -2193,67 +2255,147 @@ export function EmployeeDashboardPage() {
                     </div>
                   </div>
 
-                  <div className="divide-y divide-slate-100 max-h-[550px] overflow-y-auto">
+                  {/* Rapido-Style Task List Cards */}
+                  <div className="divide-y divide-slate-100 max-h-[580px] overflow-y-auto p-2 space-y-2">
                     {displayedJobs.length > 0 ? (
                       [...displayedJobs].sort((a, b) => (b.id || 0) - (a.id || 0)).map((job) => {
                         const isSelected = selectedJob?.id === job.id;
-                        const presentation = getEmployeeJobPresentation(job);
+                        const isCompleted = ['completed', 'cancelled'].includes((job.status || '').toLowerCase());
+                        const isOffer = job.active_offer?.status === 'OFFERED' && !job.active_offer?.is_expired;
+
+                        if (isCompleted) {
+                          // ── RAPIDO-STYLE COMPLETED HISTORICAL CARD ──
+                          return (
+                            <div
+                              key={job.id}
+                              onClick={() => setSelectedJob(job)}
+                              className={`p-3.5 rounded-xl border transition-all cursor-pointer ${
+                                isSelected
+                                  ? 'bg-emerald-50/50 border-emerald-500 shadow-xs ring-2 ring-emerald-500/20'
+                                  : 'bg-white border-slate-200 hover:bg-slate-50/80 hover:border-slate-300'
+                              }`}
+                            >
+                              {/* Top: Job Ref + Completed Badge */}
+                              <div className="flex items-center justify-between text-[11px] mb-1">
+                                <span className="font-mono font-bold text-slate-700">
+                                  {job.request_id || `SR-${job.id}`}
+                                </span>
+                                <StatusBadge status={job.status} size="xs" />
+                              </div>
+
+                              {/* Title */}
+                              <h3 className="text-xs font-bold text-slate-900 leading-snug">
+                                {job.service_title || job.service_category}
+                              </h3>
+
+                              {/* Customer & Location */}
+                              <div className="mt-1.5 space-y-0.5 text-[11px] text-slate-600">
+                                <p className="flex items-center gap-1.5 truncate">
+                                  <User className="w-3 h-3 text-slate-400 shrink-0" />
+                                  <span className="truncate">{job.customer_display_name || job.customer_name || 'Customer'}</span>
+                                </p>
+                                <p className="flex items-center gap-1.5 truncate">
+                                  <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
+                                  <span className="truncate text-slate-500">{job.address || 'Service location'}</span>
+                                </p>
+                              </div>
+
+                              {/* Meta Row: Completed time & Payment info */}
+                              <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500">
+                                <span className="flex items-center gap-1">
+                                  <Clock className="w-3 h-3 text-slate-400" />
+                                  <span>Completed • {job.preferred_time || job.preferred_date || 'Done'}</span>
+                                </span>
+                                <span className="font-semibold text-slate-700">
+                                  Payment: {job.payment_method || 'COD'} ({job.payment_status || 'paid'})
+                                </span>
+                              </div>
+
+                              {/* View Details Action */}
+                              <div className="mt-2 flex justify-end">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setSelectedJob(job);
+                                    const el = document.getElementById('selected-job-workspace');
+                                    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                                  }}
+                                  className="text-[11px] font-bold text-emerald-700 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100/80 px-2.5 py-1 rounded-lg transition-colors inline-flex items-center gap-1 cursor-pointer"
+                                >
+                                  <Eye className="w-3 h-3" />
+                                  <span>View Details</span>
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        }
+
+                        // ── RAPIDO-STYLE ACTIVE TASK CARD ──
                         return (
                           <div
                             key={job.id}
                             onClick={() => setSelectedJob(job)}
-                            className={`p-3.5 cursor-pointer transition-colors ${
-                              isSelected ? 'bg-blue-50/80 border-l-4 border-blue-600' : 'hover:bg-slate-50'
+                            className={`p-3.5 rounded-xl border transition-all cursor-pointer ${
+                              isSelected
+                                ? 'bg-blue-50/50 border-blue-600 shadow-sm ring-2 ring-blue-500/20'
+                                : 'bg-white border-slate-200 hover:bg-slate-50/80 hover:border-blue-300'
                             }`}
                           >
+                            {/* Top: Job Ref + Live Status Badge */}
                             <div className="flex items-center justify-between text-[11px] mb-1">
                               <span className="font-mono font-bold text-blue-600">
                                 {job.request_id || `SR-${job.id}`}
                               </span>
                               <StatusBadge status={presentation?.badgeStatus} label={presentation?.badgeLabel} size="xs" />
                             </div>
-                            <h3 className="text-xs font-bold text-slate-900 truncate">
+
+                            {/* Title */}
+                            <h3 className="text-xs font-bold text-slate-900 leading-snug">
                               {job.service_title || job.service_category}
                             </h3>
-                            <div className="flex items-center justify-between text-[11px] text-slate-500 mt-0.5 gap-2">
-                              <span className="truncate flex items-center gap-1">
+
+                            {/* Customer & Location */}
+                            <div className="mt-1.5 space-y-0.5 text-[11px] text-slate-600">
+                              <p className="flex items-center gap-1.5 truncate">
+                                <User className="w-3 h-3 text-slate-400 shrink-0" />
+                                <span className="truncate">{job.customer_display_name || job.customer_name || 'Customer'}</span>
+                              </p>
+                              <p className="flex items-center gap-1.5 truncate">
                                 <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
-                                <span className="truncate">{job.address || 'Address provided on acceptance'}</span>
+                                <span className="truncate text-slate-500">{job.address || 'Customer destination'}</span>
+                              </p>
+                            </div>
+
+                            {/* Distance & Timing info */}
+                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500 gap-2">
+                              <span className="flex items-center gap-1 truncate">
+                                <Clock className="w-3 h-3 text-slate-400 shrink-0" />
+                                <span className="truncate">{job.preferred_date ? `${job.preferred_date} ${job.preferred_time || ''}` : 'Scheduled Today'}</span>
                               </span>
                               {job.distance_km != null && (
-                                <span className="shrink-0 font-mono text-[10px] font-bold text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200">
+                                <span className="shrink-0 font-mono font-bold text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200">
                                   {job.distance_km.toFixed(1)} km away
                                 </span>
                               )}
                             </div>
-                            <div className="flex items-center justify-between mt-2 pt-1 border-t border-slate-100 text-[10px] text-slate-500">
-                              <span>Date: <strong className="text-slate-800">{job.preferred_date || '—'}</strong></span>
-                              <span>{job.preferred_time || ''}</span>
-                            </div>
 
-                            {presentation?.isOffer && presentation?.canAccept && (
-                              <div className="mt-2.5 p-2.5 rounded bg-amber-50 border border-amber-200 text-amber-900 space-y-2">
+                            {/* Offer Action Buttons OR Live Tracking CTA */}
+                            {isOffer ? (
+                              <div className="mt-2.5 p-2.5 rounded-lg bg-amber-50 border border-amber-300 text-amber-950 space-y-2">
                                 <div className="flex items-center justify-between">
                                   <span className="font-bold text-[10px] text-amber-800 uppercase tracking-wider flex items-center gap-1">
                                     <Sparkles className="w-3 h-3 text-amber-600" />
                                     <span>EXCLUSIVE JOB OFFER</span>
                                   </span>
-                                  {presentation.offerExpiresAt ? (
-                                    <span className="text-[10px] font-mono font-semibold text-rose-700">
-                                      Expires {new Date(presentation.offerExpiresAt).toLocaleTimeString()}
-                                    </span>
-                                  ) : (
-                                    <span className="text-[10px] font-mono text-amber-700">
-                                      {job.preferred_time || '5m Expiry'}
-                                    </span>
-                                  )}
+                                  <CountdownBadge targetTime={job.active_offer?.expires_at} prefix="EXPIRES " expiredText="EXPIRED" tone="amber" />
                                 </div>
-                                <div className="flex items-center gap-1.5 pt-1">
+                                <div className="flex items-center gap-1.5 pt-0.5">
                                   <button
                                     type="button"
                                     onClick={(e) => { e.stopPropagation(); handleAcceptOffer(job.id); }}
                                     disabled={actionLoading === job.id}
-                                    className="flex-1 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-[10px] shadow-sm transition-colors cursor-pointer disabled:opacity-50"
+                                    className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg text-xs shadow-xs transition-colors cursor-pointer"
                                   >
                                     {actionLoading === job.id ? 'ACCEPTING...' : 'ACCEPT'}
                                   </button>
@@ -2261,11 +2403,35 @@ export function EmployeeDashboardPage() {
                                     type="button"
                                     onClick={(e) => { e.stopPropagation(); handleRejectOffer(job.id); }}
                                     disabled={actionLoading === job.id}
-                                    className="flex-1 py-1 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded text-[10px] shadow-sm transition-colors cursor-pointer disabled:opacity-50"
+                                    className="flex-1 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-lg text-xs shadow-xs transition-colors cursor-pointer"
                                   >
                                     DECLINE
                                   </button>
                                 </div>
+                              </div>
+                            ) : (
+                              <div className="mt-2 flex justify-end">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setSelectedJob(job);
+                                    const el = document.getElementById('selected-job-workspace');
+                                    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                                  }}
+                                  className={`text-[11px] font-bold px-3 py-1 rounded-lg transition-colors inline-flex items-center gap-1 cursor-pointer ${
+                                    ['accepted', 'on_the_way', 'arrived'].includes((job.status || '').toLowerCase())
+                                      ? 'text-white bg-blue-600 hover:bg-blue-700 shadow-xs'
+                                      : 'text-blue-700 bg-blue-50 hover:bg-blue-100'
+                                  }`}
+                                >
+                                  <Navigation className="w-3 h-3" />
+                                  <span>
+                                    {['accepted', 'on_the_way', 'arrived'].includes((job.status || '').toLowerCase())
+                                      ? 'Open Live Tracking →'
+                                      : 'View Job Details →'}
+                                  </span>
+                                </button>
                               </div>
                             )}
                           </div>
@@ -2291,10 +2457,8 @@ export function EmployeeDashboardPage() {
                 </div>
 
                 {/* Right Column: Selected Job Workspace (7 cols) */}
-                <div className="lg:col-span-7 border border-slate-200 bg-white rounded overflow-hidden shadow-sm">
-                  {selectedJob ? (() => {
-                    const selectedPresentation = getEmployeeJobPresentation(selectedJob);
-                    return (
+                <div id="selected-job-workspace" className="lg:col-span-7 border border-slate-200 bg-white rounded overflow-hidden shadow-sm">
+                  {selectedJob ? (
                     <div className="p-4 sm:p-5 space-y-4">
                       {/* Job Header */}
                       <div className="flex items-start justify-between border-b border-slate-200 pb-3 gap-2">
@@ -2355,15 +2519,21 @@ export function EmployeeDashboardPage() {
                               )}
                             </div>
                           </div>
-                          {selectedJob.latitude != null && selectedJob.longitude != null && (
-                            <a
-                              href={`https://www.google.com/maps/dir/?api=1&destination=${selectedJob.latitude},${selectedJob.longitude}`}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="shrink-0 text-[11px] bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-1 rounded font-bold transition-colors inline-flex items-center gap-1 shadow-sm"
+                          {/* ONLY render Live Driving Route for ACTIVE pre-service jobs, NEVER on completed */}
+                          {['accepted', 'on_the_way', 'arrived'].includes((selectedJob.status || '').toLowerCase()) && selectedJob.latitude != null && selectedJob.longitude != null && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const el = document.getElementById('arrival-verification-checklist');
+                                if (el) {
+                                  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                                }
+                              }}
+                              className="shrink-0 text-[11px] bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded font-bold transition-colors inline-flex items-center gap-1.5 shadow-sm cursor-pointer"
                             >
-                              <span>Navigate ↗</span>
-                            </a>
+                              <Navigation className="w-3.5 h-3.5 rotate-45" />
+                              <span>Live Driving Route ↓</span>
+                            </button>
                           )}
                         </div>
 
@@ -2416,28 +2586,79 @@ export function EmployeeDashboardPage() {
                         <h3 className="text-[11px] font-bold text-slate-700 uppercase tracking-wider mb-2">
                           Action Steps
                         </h3>
-                        <div className="flex flex-wrap gap-2">
-                          {selectedPresentation?.isOffer && selectedPresentation?.canAccept && (
-                            <div className="flex items-center gap-2">
-                              <button
-                                type="button"
-                                disabled={actionLoading === selectedJob.id}
-                                onClick={() => handleAcceptOffer(selectedJob.id)}
-                                className="px-4 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm transition-colors cursor-pointer disabled:opacity-50"
-                              >
-                                {actionLoading === selectedJob.id ? 'Accepting...' : 'Accept Job Offer'}
-                              </button>
-                              <button
-                                type="button"
-                                disabled={actionLoading === selectedJob.id}
-                                onClick={() => handleRejectOffer(selectedJob.id)}
-                                className="px-3 py-1.5 rounded border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold text-xs transition-colors cursor-pointer disabled:opacity-50"
-                              >
-                                Decline
-                              </button>
+                        <div className="flex flex-col gap-2.5">
+                          {/* 1. STATE: OFFERED (Technician hasn't accepted yet) */}
+                          {(selectedJob.active_offer?.status === 'OFFERED' && !selectedJob.active_offer?.is_expired) && (
+                            <div className="w-full p-3 bg-amber-50 border border-amber-300 rounded-lg space-y-2.5">
+                              <div className="flex items-center justify-between">
+                                <span className="font-bold text-xs text-amber-950 flex items-center gap-1.5">
+                                  <Sparkles className="w-4 h-4 text-amber-600" />
+                                  Exclusive Job Offer
+                                </span>
+                                {selectedJob.active_offer?.expires_at && (
+                                  <CountdownBadge
+                                    targetTime={selectedJob.active_offer.expires_at}
+                                    prefix="OFFER EXPIRES IN "
+                                    expiredText="OFFER EXPIRED"
+                                    tone="amber"
+                                  />
+                                )}
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  disabled={actionLoading === selectedJob.id}
+                                  onClick={() => handleAcceptOffer(selectedJob.id)}
+                                  className="flex-1 py-2 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                                >
+                                  <CheckCircle2 className="w-4 h-4" />
+                                  <span>{actionLoading === selectedJob.id ? 'Accepting...' : 'ACCEPT JOB'}</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={actionLoading === selectedJob.id}
+                                  onClick={() => handleRejectOffer(selectedJob.id)}
+                                  className="px-4 py-2 rounded border border-rose-300 hover:bg-rose-50 text-rose-700 font-bold text-xs transition-colors cursor-pointer"
+                                >
+                                  DECLINE
+                                </button>
+                              </div>
                             </div>
                           )}
 
+                          {/* 2. STATE: ACCEPTED / ON_THE_WAY (5-Minute Cancellation Window) */}
+                          {['accepted', 'on_the_way', 'en_route'].includes((selectedJob.status || '').toLowerCase()) && (
+                            <div className="w-full p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-2">
+                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                <div>
+                                  <div className="flex items-center gap-1.5">
+                                    <Clock className="w-4 h-4 text-slate-600" />
+                                    <span className="font-bold text-xs text-slate-800">5-Minute Cancellation Window</span>
+                                  </div>
+                                  <p className="text-[10px] text-slate-500 mt-0.5">
+                                    Authoritative server countdown. If you experience an emergency, you may cancel before site arrival.
+                                  </p>
+                                </div>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <CountdownBadge
+                                    targetTime={selectedJob.cancellation_info?.cancellation_deadline || (selectedJob.created_at ? new Date(new Date(selectedJob.created_at).getTime() + 5 * 60000) : null)}
+                                    prefix="Cancellation available for "
+                                    expiredText="Cancellation window closed"
+                                    tone="rose"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenCancelModal(selectedJob)}
+                                    disabled={actionLoading === selectedJob.id || (selectedJob.cancellation_info?.can_cancel === false && selectedJob.cancellation_info?.remaining_seconds === 0)}
+                                    className="px-3 py-1.5 text-xs font-bold text-rose-700 bg-white hover:bg-rose-50 border border-rose-300 rounded shadow-xs transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shrink-0 flex items-center gap-1"
+                                  >
+                                    <Ban className="w-3.5 h-3.5" />
+                                    <span>Cancel Assignment</span>
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )}
 
                           {/* 5-Minute Cancellation Status Banner */}
                           {selectedPresentation?.isAccepted && (selectedPresentation?.state === 'ACCEPTED' || selectedPresentation?.state === 'ON_THE_WAY') && (() => {
@@ -2476,12 +2697,12 @@ export function EmployeeDashboardPage() {
 
                           {selectedPresentation?.isAccepted && (selectedPresentation?.state === 'ACCEPTED' || selectedPresentation?.state === 'ON_THE_WAY' || selectedPresentation?.state === 'ARRIVED') && (
                             <div id="arrival-verification-checklist" className="w-full space-y-3.5 border border-slate-200 rounded-lg p-3.5 bg-slate-50/50 mt-1 scroll-mt-6">
-                              {/* Interactive Live Customer Location & Navigation Tracking Map */}
-                              <JobTrackingMap
+                              {/* True First-Person Live Navigation Experience */}
+                              <TechnicianNavigationView
                                 job={selectedJob}
                                 technicianLocation={currentLocation || user?.last_known_location || employee?.user?.last_known_location}
                                 preServiceState={preServiceState}
-                                geofenceRadius={300}
+                                geofenceRadius={250}
                               />
 
                               <div className="flex items-center justify-between border-b border-slate-200 pb-2">
@@ -2499,12 +2720,12 @@ export function EmployeeDashboardPage() {
                                 <div>
                                   <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
                                     <MapPin className="w-3.5 h-3.5 text-blue-600" />
-                                    1. Location Verification (Geofence &le;300m)
+                                    1. Location Verification (Geofence ≤250m)
                                   </h4>
                                   <p className="text-[10px] text-slate-500 mt-0.5">
                                     {preServiceState.geofence_passed
-                                      ? 'Arrival verified automatically! You are inside the authorized 300m customer site geofence.'
-                                      : 'Travel toward customer destination. Backend verifies arrival automatically once inside the 300m geofence with valid consecutive GPS fixes.'}
+                                      ? 'Arrival verified automatically! You are inside the authorized 250m customer site geofence.'
+                                      : 'Travel toward customer destination. Backend verifies arrival automatically once inside the 250m geofence with valid consecutive GPS fixes.'}
                                   </p>
                                 </div>
                                 {preServiceState.geofence_passed ? (
@@ -2580,11 +2801,11 @@ export function EmployeeDashboardPage() {
                                     )}
                                   </div>
 
-                                  {/* Identity Photo */}
-                                  <div className="flex items-center justify-between text-xs pt-2 border-t border-slate-100">
+                                  {/* Identity Presence Photo */}
+                                  <div className="flex items-center justify-between text-xs pt-1">
                                     <div>
-                                      <span className="font-semibold text-slate-800">Identity/Presence Photo</span>
-                                      <p className="text-[10px] text-slate-500">Live selfie at job location showing identity</p>
+                                      <span className="font-semibold text-slate-800">Before Face Selfie (Technician Identity)</span>
+                                      <p className="text-[10px] text-slate-500">Live selfie at job location showing identity before starting work</p>
                                     </div>
                                     {preServiceState.presence_photo ? (
                                       <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 font-bold rounded text-[10px] border border-emerald-200">
@@ -2605,8 +2826,10 @@ export function EmployeeDashboardPage() {
                                   {/* Appliance Photo */}
                                   <div className="flex items-center justify-between text-xs pt-2 border-t border-slate-100">
                                     <div>
-                                      <span className="font-semibold text-slate-800">Before Appliance Photo</span>
-                                      <p className="text-[10px] text-slate-500">Live photo of appliance condition before work</p>
+                                      <span className="font-semibold text-slate-800">
+                                        Before Product / Appliance Photo <span className="text-slate-400 font-normal text-[10px]">(optional)</span>
+                                      </span>
+                                      <p className="text-[10px] text-slate-500">Live photo of appliance/product condition before work</p>
                                     </div>
                                     {preServiceState.appliance_photo ? (
                                       <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 font-bold rounded text-[10px] border border-emerald-200">
@@ -2616,10 +2839,10 @@ export function EmployeeDashboardPage() {
                                       <button
                                         type="button"
                                         onClick={() => openLiveCamera('Capture Before Appliance Photo', 'environment', 'pre_appliance', (file) => handlePhotoUploadSubmit('appliance', file))}
-                                        className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs transition-colors flex items-center gap-1.5 shadow-sm active:scale-95 cursor-pointer"
+                                        className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded text-xs transition-colors flex items-center gap-1.5 border border-slate-300 shadow-xs active:scale-95 cursor-pointer"
                                       >
                                         <Camera className="w-3.5 h-3.5" />
-                                        <span>📸 Take Live Photo</span>
+                                        <span>📸 Take Photo</span>
                                       </button>
                                     )}
                                   </div>
@@ -2627,7 +2850,9 @@ export function EmployeeDashboardPage() {
                                   {/* Work Area Photo */}
                                   <div className="flex items-center justify-between text-xs pt-2 border-t border-slate-100">
                                     <div>
-                                      <span className="font-semibold text-slate-800">Before Work-Area Photo</span>
+                                      <span className="font-semibold text-slate-800">
+                                        Before Work-Area Photo <span className="text-slate-400 font-normal text-[10px]">(optional)</span>
+                                      </span>
                                       <p className="text-[10px] text-slate-500">Live photo of work area condition before work</p>
                                     </div>
                                     {preServiceState.work_area_photo ? (
@@ -2638,10 +2863,10 @@ export function EmployeeDashboardPage() {
                                       <button
                                         type="button"
                                         onClick={() => openLiveCamera('Capture Before Work-Area Photo', 'environment', 'pre_work_area', (file) => handlePhotoUploadSubmit('work_area', file))}
-                                        className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded text-xs transition-colors flex items-center gap-1.5 shadow-sm active:scale-95 cursor-pointer"
+                                        className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded text-xs transition-colors flex items-center gap-1.5 border border-slate-300 shadow-xs active:scale-95 cursor-pointer"
                                       >
                                         <Camera className="w-3.5 h-3.5" />
-                                        <span>📸 Take Live Photo</span>
+                                        <span>📸 Take Photo</span>
                                       </button>
                                     )}
                                   </div>
@@ -2685,12 +2910,7 @@ export function EmployeeDashboardPage() {
                                     <span>{actionLoading === selectedJob.id ? 'Verifying GPS & Clocking In...' : 'CLOCK IN & START WORK'}</span>
                                   </button>
                                 </div>
-                              ) : (
-                                <div className="p-2.5 bg-amber-50 border border-amber-200 rounded text-amber-900 text-[11px] font-medium flex items-center gap-2">
-                                  <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
-                                  <span>Clock-In is locked: Complete GPS arrival verification, Customer OTP, and mandatory photo evidence above.</span>
-                                </div>
-                              )}
+                              ) : null}
                             </div>
 
                           )}
@@ -2991,7 +3211,7 @@ export function EmployeeDashboardPage() {
                           )}
 
                           {selectedJob.status === 'completed' && (
-                            <div className="w-full p-4 bg-emerald-50/90 border border-emerald-200 rounded-lg space-y-3 mt-1">
+                            <div className="w-full p-4 bg-emerald-50/90 border border-emerald-200 rounded-xl space-y-3.5 mt-1 shadow-2xs">
                               <div className="flex items-center justify-between">
                                 <div className="flex items-center gap-2.5">
                                   <div className="w-8 h-8 rounded-full bg-emerald-100 border border-emerald-300 flex items-center justify-center text-emerald-700 shrink-0">
@@ -3000,24 +3220,67 @@ export function EmployeeDashboardPage() {
                                   <div>
                                     <h4 className="text-xs font-bold text-emerald-900">Job Successfully Completed</h4>
                                     <p className="text-[11px] text-emerald-700">
-                                      All service tasks finished, completion proof submitted, and payment verified.
+                                      All service tasks finished, completion proof submitted, and payment recorded.
                                     </p>
                                   </div>
                                 </div>
-                                <span className="px-2.5 py-1 bg-emerald-700 text-white font-bold text-xs rounded shadow-xs shrink-0">
+                                <span className="px-2.5 py-1 bg-emerald-700 text-white font-bold text-xs rounded-lg shadow-2xs shrink-0">
                                   COMPLETED ✓
                                 </span>
                               </div>
 
-                              <div className="pt-2.5 border-t border-emerald-200/80 grid grid-cols-2 gap-2 text-xs">
-                                <div className="bg-white/80 p-2 rounded border border-emerald-200/60">
+                              {/* Historical Verification Checklist Badges */}
+                              <div className="pt-2 border-t border-emerald-200/80">
+                                <span className="text-[10px] font-bold uppercase text-emerald-900 tracking-wider block mb-1.5">
+                                  Service Verification Record
+                                </span>
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5 text-[11px]">
+                                  <div className="bg-white/80 p-2 rounded-lg border border-emerald-200/60 flex items-center gap-1.5 text-emerald-800 font-semibold">
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                    <span>GPS Geofence Verified</span>
+                                  </div>
+                                  <div className="bg-white/80 p-2 rounded-lg border border-emerald-200/60 flex items-center gap-1.5 text-emerald-800 font-semibold">
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                    <span>Customer OTP Verified</span>
+                                  </div>
+                                  <div className="bg-white/80 p-2 rounded-lg border border-emerald-200/60 flex items-center gap-1.5 text-emerald-800 font-semibold">
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                    <span>Face Selfie & Proof OK</span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Financial Settlement Breakdown */}
+                              <div className="pt-2 border-t border-emerald-200/80 grid grid-cols-2 gap-2 text-xs">
+                                <div className="bg-white/80 p-2.5 rounded-lg border border-emerald-200/60">
                                   <span className="text-[10px] text-slate-500 block font-semibold">Payment Collection</span>
-                                  <span className="font-bold text-slate-800">{selectedJob.payment_method || 'CASH'} ({selectedJob.payment_status || 'verified'})</span>
+                                  <span className="font-bold text-slate-800">{selectedJob.payment_method || 'CASH'} ({selectedJob.payment_status || 'paid'})</span>
                                 </div>
-                                <div className="bg-white/80 p-2 rounded border border-emerald-200/60">
-                                  <span className="text-[10px] text-slate-500 block font-semibold">Service Value</span>
-                                  <span className="font-bold text-emerald-800 font-mono">₹{selectedJob.total_amount || '—'}</span>
+                                <div className="bg-white/80 p-2.5 rounded-lg border border-emerald-200/60">
+                                  <span className="text-[10px] text-slate-500 block font-semibold">Final Service Value</span>
+                                  <span className="font-bold text-emerald-800 font-mono text-sm">₹{selectedJob.payment?.amount_paid || selectedJob.payment?.amount_due || selectedJob.total_amount || '—'}</span>
                                 </div>
+                              </div>
+                            </div>
+                          )}
+
+                          {selectedJob.status === 'cancelled' && (
+                            <div className="w-full p-4 bg-rose-50/90 border border-rose-200 rounded-xl space-y-2.5 mt-1 shadow-2xs">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2.5">
+                                  <div className="w-8 h-8 rounded-full bg-rose-100 border border-rose-300 flex items-center justify-center text-rose-700 shrink-0">
+                                    <Ban className="w-5 h-5" />
+                                  </div>
+                                  <div>
+                                    <h4 className="text-xs font-bold text-rose-900">Assignment Cancelled</h4>
+                                    <p className="text-[11px] text-rose-700">
+                                      This job was cancelled during the 5-minute pre-arrival cancellation window.
+                                    </p>
+                                  </div>
+                                </div>
+                                <span className="px-2.5 py-1 bg-rose-700 text-white font-bold text-xs rounded-lg shadow-2xs shrink-0">
+                                  CANCELLED
+                                </span>
                               </div>
                             </div>
                           )}
@@ -3053,20 +3316,91 @@ export function EmployeeDashboardPage() {
           isOpen={Boolean(proofModalJob)}
           onClose={() => {
             setProofModalJob(null);
+            setAfterFaceFile(null);
             setBeforeFile(null);
             setAfterFile(null);
+            if (afterFacePreviewUrl) URL.revokeObjectURL(afterFacePreviewUrl);
             if (beforePreviewUrl) URL.revokeObjectURL(beforePreviewUrl);
             if (afterPreviewUrl) URL.revokeObjectURL(afterPreviewUrl);
+            setAfterFacePreviewUrl(null);
             setBeforePreviewUrl(null);
             setAfterPreviewUrl(null);
           }}
           title={`Proof of Work Completion — Job #${proofModalJob?.id}`}
         >
           <form onSubmit={handleProofSubmit} className="space-y-4 text-xs">
-            {/* Live Camera Real-Time Photo 1: Before Work Area Photo */}
+            {/* Mandatory Step 1: After Face Selfie */}
             <div>
               <label className="block text-slate-700 font-semibold mb-1">
-                Before Photo (Pre-Work Condition)
+                After Face Selfie (Technician Identity at Completion) <span className="text-rose-500">*</span>
+              </label>
+              {afterFaceFile ? (
+                <div className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
+                  <div className="flex items-center gap-2.5">
+                    {afterFacePreviewUrl ? (
+                      <img
+                        src={afterFacePreviewUrl}
+                        alt="After Face"
+                        className="w-12 h-12 object-cover rounded-lg border border-slate-300 shadow-sm"
+                      />
+                    ) : (
+                      <div className="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center text-blue-600">
+                        <Camera className="w-6 h-6" />
+                      </div>
+                    )}
+                    <div>
+                      <span className="font-bold text-xs text-slate-800 block truncate max-w-[180px]">
+                        {afterFaceFile.name || 'After Face Selfie Captured'}
+                      </span>
+                      <span className="text-[10px] text-emerald-600 font-semibold flex items-center gap-1">
+                        <CheckCircle2 className="w-3 h-3" /> Live selfie attached
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      openLiveCamera(
+                        'Capture After Face Selfie',
+                        'user',
+                        'after_face_selfie',
+                        (file, previewUrl) => {
+                          setAfterFaceFile(file);
+                          setAfterFacePreviewUrl(previewUrl);
+                        }
+                      )
+                    }
+                    className="px-2.5 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3 h-3" /> Retake
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() =>
+                    openLiveCamera(
+                      'Capture After Face Selfie',
+                      'user',
+                      'after_face_selfie',
+                      (file, previewUrl) => {
+                        setAfterFaceFile(file);
+                        setAfterFacePreviewUrl(previewUrl);
+                      }
+                    )
+                  }
+                  className="w-full py-3 px-4 border-2 border-dashed border-blue-400 hover:border-blue-600 bg-blue-50/60 hover:bg-blue-50 text-blue-700 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-[0.99] shadow-sm cursor-pointer"
+                >
+                  <Camera className="w-4 h-4 text-blue-600" />
+                  <span>📸 Take Live Face Selfie (Required)</span>
+                </button>
+              )}
+            </div>
+
+            {/* Optional Step 2: Before Product Photo */}
+            <div>
+              <label className="block text-slate-700 font-semibold mb-1">
+                Before Product Photo <span className="text-slate-400 font-normal text-[11px]">(optional)</span>
               </label>
               {beforeFile ? (
                 <div className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
@@ -3123,18 +3457,18 @@ export function EmployeeDashboardPage() {
                       }
                     )
                   }
-                  className="w-full py-3 px-4 border-2 border-dashed border-blue-300 hover:border-blue-500 bg-blue-50/50 hover:bg-blue-50 text-blue-700 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-[0.99] shadow-sm cursor-pointer"
+                  className="w-full py-2.5 px-4 border border-dashed border-slate-300 hover:border-slate-400 bg-slate-50 hover:bg-slate-100/70 text-slate-700 rounded-xl font-semibold text-xs flex items-center justify-center gap-2 transition-all active:scale-[0.99] cursor-pointer"
                 >
-                  <Camera className="w-4 h-4 text-blue-600" />
-                  <span>📸 Take Live Photo (Before Work)</span>
+                  <Camera className="w-4 h-4 text-slate-500" />
+                  <span>📸 Add Before Product Photo (optional)</span>
                 </button>
               )}
             </div>
 
-            {/* Live Camera Real-Time Photo 2: After Appliance / Work Photo */}
+            {/* Optional Step 3: After Product Photo */}
             <div>
               <label className="block text-slate-700 font-semibold mb-1">
-                After Photo (Completed Work Result)
+                After Product Photo (Completed Result) <span className="text-slate-400 font-normal text-[11px]">(optional)</span>
               </label>
               {afterFile ? (
                 <div className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
@@ -3191,16 +3525,18 @@ export function EmployeeDashboardPage() {
                       }
                     )
                   }
-                  className="w-full py-3 px-4 border-2 border-dashed border-emerald-300 hover:border-emerald-500 bg-emerald-50/50 hover:bg-emerald-50 text-emerald-700 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-[0.99] shadow-sm cursor-pointer"
+                  className="w-full py-2.5 px-4 border border-dashed border-slate-300 hover:border-slate-400 bg-slate-50 hover:bg-slate-100/70 text-slate-700 rounded-xl font-semibold text-xs flex items-center justify-center gap-2 transition-all active:scale-[0.99] cursor-pointer"
                 >
-                  <Camera className="w-4 h-4 text-emerald-600" />
-                  <span>📸 Take Live Photo (After Work)</span>
+                  <Camera className="w-4 h-4 text-slate-500" />
+                  <span>📸 Add After Product Photo (optional)</span>
                 </button>
               )}
             </div>
 
             <div>
-              <label className="block text-slate-700 font-semibold mb-1">Completion Notes</label>
+              <label className="block text-slate-700 font-semibold mb-1">
+                Completion Notes <span className="text-slate-400 font-normal text-[11px]">(optional)</span>
+              </label>
               <textarea
                 rows={3}
                 value={workNotes}
@@ -3214,20 +3550,23 @@ export function EmployeeDashboardPage() {
                 type="button"
                 onClick={() => {
                   setProofModalJob(null);
+                  setAfterFaceFile(null);
                   setBeforeFile(null);
                   setAfterFile(null);
+                  if (afterFacePreviewUrl) URL.revokeObjectURL(afterFacePreviewUrl);
                   if (beforePreviewUrl) URL.revokeObjectURL(beforePreviewUrl);
                   if (afterPreviewUrl) URL.revokeObjectURL(afterPreviewUrl);
+                  setAfterFacePreviewUrl(null);
                   setBeforePreviewUrl(null);
                   setAfterPreviewUrl(null);
                 }}
-                className="px-3 py-1.5 rounded border border-slate-300 text-slate-700 font-semibold"
+                className="px-3 py-1.5 rounded border border-slate-300 text-slate-700 font-semibold cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 type="submit"
-                disabled={isUploadingProof || (!beforeFile && !afterFile)}
+                disabled={isUploadingProof || !afterFaceFile}
                 className="px-4 py-1.5 rounded bg-emerald-600 disabled:opacity-50 text-white font-bold hover:bg-emerald-700 shadow-sm cursor-pointer"
               >
                 {isUploadingProof ? 'Uploading...' : 'Complete Job'}
@@ -3402,48 +3741,48 @@ export function EmployeeDashboardPage() {
           </form>
         </Modal>
 
-        {/* Modal: Structured 5-Minute Job Assignment Cancellation */}
+        {/* Modal: Structured 5-Minute Technician Cancellation Modal */}
         <Modal
-          isOpen={Boolean(cancellationModalJob)}
-          onClose={() => !isCancellingJob && setCancellationModalJob(null)}
-          title={`Cancel Job? — Job #${cancellationModalJob?.id || ''}`}
+          isOpen={Boolean(cancelModalJob)}
+          onClose={() => setCancelModalJob(null)}
+          title={`Cancel Assignment — Job #${cancelModalJob?.request_id || cancelModalJob?.id}`}
         >
-          <form onSubmit={handleConfirmCancelAssignment} className="space-y-4 text-xs">
-            <div className="bg-rose-50 border border-rose-200 rounded p-3 text-rose-900 space-y-1">
-              <p className="font-bold text-xs flex items-center gap-1.5">
-                <Clock className="w-3.5 h-3.5 text-rose-600" />
-                You can cancel this job only within 5 minutes of acceptance.
+          <form onSubmit={handleConfirmCancelJob} className="space-y-4 text-xs">
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 space-y-1">
+              <p className="font-bold flex items-center gap-1.5 text-xs text-amber-950">
+                <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+                <span>Cancellation Notice (5-Minute Window)</span>
               </p>
-              <p className="text-[11px] text-rose-800">
-                Cancelling will release your availability to AVAILABLE and automatically redispatch this job to the next nearest eligible professional. The customer's booking will NOT be cancelled.
+              <p className="text-[11px] text-amber-800">
+                Cancelling will immediately release this job, preserve the customer booking, and start automated redispatch for the next eligible technician.
               </p>
             </div>
 
             <div>
-              <label className="block text-slate-700 font-bold mb-2">
-                Please select a reason for cancellation:
+              <label className="block text-slate-700 font-bold mb-1.5">
+                Select Reason for Cancellation <span className="text-rose-500">*</span>
               </label>
-              <div className="space-y-2 bg-slate-50 p-3 rounded border border-slate-200">
+              <div className="space-y-2 bg-slate-50 p-3 rounded-lg border border-slate-200 max-h-56 overflow-y-auto">
                 {[
-                  { code: 'VEHICLE_ISSUE', label: 'Vehicle problem' },
-                  { code: 'TRAFFIC_ROUTE_ISSUE', label: 'Traffic / route issue' },
-                  { code: 'TOO_FAR', label: 'Too far' },
-                  { code: 'SERVICE_MISMATCH', label: 'Service mismatch' },
-                  { code: 'CUSTOMER_LOCATION_ISSUE', label: 'Customer location issue' },
-                  { code: 'SAFETY_CONCERN', label: 'Safety concern' },
+                  { code: 'VEHICLE_ISSUE', label: 'Vehicle issue / Breakdown' },
+                  { code: 'TRAFFIC_ROUTE_ISSUE', label: 'Heavy traffic / Road blockage' },
+                  { code: 'TOO_FAR', label: 'Distance too far / Unreachable in time' },
+                  { code: 'SERVICE_MISMATCH', label: 'Service requires different tools / equipment' },
+                  { code: 'CUSTOMER_LOCATION_ISSUE', label: 'Customer site unreachable / unsafe access' },
+                  { code: 'SAFETY_CONCERN', label: 'Safety concern / Hazardous conditions' },
                   { code: 'PERSONAL_EMERGENCY', label: 'Personal emergency' },
-                  { code: 'OTHER', label: 'Other' },
-                ].map((item) => (
-                  <label key={item.code} className="flex items-center gap-2.5 cursor-pointer text-slate-800 font-medium">
+                  { code: 'OTHER', label: 'Other reason (explanation required)' },
+                ].map((r) => (
+                  <label key={r.code} className="flex items-center gap-2.5 cursor-pointer text-slate-800 font-medium hover:bg-slate-100/70 p-1 rounded">
                     <input
                       type="radio"
-                      name="cancelAssignmentReason"
-                      value={item.code}
-                      checked={selectedCancelReason === item.code}
+                      name="cancelReason"
+                      value={r.code}
+                      checked={selectedCancelReason === r.code}
                       onChange={(e) => setSelectedCancelReason(e.target.value)}
                       className="text-rose-600 focus:ring-rose-500"
                     />
-                    <span>{item.label}</span>
+                    <span>{r.label}</span>
                   </label>
                 ))}
               </div>
@@ -3452,16 +3791,15 @@ export function EmployeeDashboardPage() {
             {selectedCancelReason === 'OTHER' && (
               <div>
                 <label className="block text-slate-700 font-bold mb-1">
-                  Please explain the reason (minimum 5 characters) <span className="text-rose-600">*</span>
+                  Detailed Explanation <span className="text-rose-500">*</span>
                 </label>
                 <textarea
                   required
                   rows={3}
-                  minLength={5}
-                  placeholder="Explain the reason for cancellation..."
-                  value={cancelReasonText}
-                  onChange={(e) => setCancelReasonText(e.target.value)}
-                  className="w-full border border-slate-300 rounded px-3 py-2 text-slate-800 text-xs focus:ring-2 focus:ring-rose-500 focus:outline-none bg-white"
+                  placeholder="Please explain why you cannot complete this assignment..."
+                  value={customCancelReason}
+                  onChange={(e) => setCustomCancelReason(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 text-slate-800 focus:ring-1 focus:ring-rose-500 focus:outline-none"
                 />
               </div>
             )}
@@ -3469,18 +3807,17 @@ export function EmployeeDashboardPage() {
             <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
               <button
                 type="button"
-                disabled={isCancellingJob}
-                onClick={() => setCancellationModalJob(null)}
-                className="px-3.5 py-1.5 rounded border border-slate-300 text-slate-700 font-semibold hover:bg-slate-50 cursor-pointer disabled:opacity-50"
+                onClick={() => setCancelModalJob(null)}
+                className="px-3.5 py-1.5 rounded-lg border border-slate-300 text-slate-700 font-semibold hover:bg-slate-50 cursor-pointer"
               >
                 Keep Job
               </button>
               <button
                 type="submit"
-                disabled={isCancellingJob || (selectedCancelReason === 'OTHER' && cancelReasonText.trim().length < 5)}
-                className="px-4 py-1.5 rounded bg-rose-600 text-white font-bold hover:bg-rose-700 shadow-sm transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
+                disabled={isCancellingJob || (selectedCancelReason === 'OTHER' && !customCancelReason.trim())}
+                className="px-4 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white font-bold shadow-sm transition-colors cursor-pointer"
               >
-                {isCancellingJob ? 'Cancelling & Redispatching...' : 'Cancel Job'}
+                {isCancellingJob ? 'Cancelling...' : 'Confirm Cancellation & Redispatch'}
               </button>
             </div>
           </form>

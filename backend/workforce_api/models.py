@@ -527,8 +527,6 @@ class PreServiceVerification(models.Model):
             self.geofence_passed
             and self.otp_verified
             and self.presence_photo
-            and self.appliance_photo
-            and self.work_area_photo
         )
         self.is_complete = ready
         if ready and not self.completed_at:
@@ -751,6 +749,7 @@ class PostServiceProof(models.Model):
         on_delete=models.CASCADE,
         related_name="post_service_proofs",
     )
+    after_presence_photo = models.FileField(upload_to="post_service/presence/", null=True, blank=True)
     after_appliance_photo = models.FileField(upload_to="post_service/appliance/", null=True, blank=True)
     after_work_area_photo = models.FileField(upload_to="post_service/work_area/", null=True, blank=True)
     completion_notes = models.TextField(blank=True, default="")
@@ -767,9 +766,7 @@ class PostServiceProof(models.Model):
 
     def check_submission(self):
         ready = bool(
-            self.after_appliance_photo
-            and self.after_work_area_photo
-            and self.completion_notes
+            self.after_presence_photo or self.after_appliance_photo or self.after_work_area_photo
         )
         if ready and not self.is_submitted:
             from django.utils import timezone
