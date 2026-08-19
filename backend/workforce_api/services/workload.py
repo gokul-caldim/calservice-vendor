@@ -16,9 +16,30 @@ from django.utils import timezone
 
 logger = logging.getLogger("workforce.workload")
 
-# Authoritative definition of all statuses where an employee is actively responsible for a job
-# Strictly contains valid ServiceRequest.Status lifecycle values (Payment states are separated)
+# Authoritative definition of all statuses visible in an employee's active jobs queue
+ACTIVE_QUEUE_STATUSES: List[str] = [
+    "assigned",
+    "accepted",
+    "on_the_way",
+    "en_route",
+    "arrived",
+    "in_progress",
+    "proof_submitted",
+]
+
+# Authoritative definition of all statuses where an employee is actively executing work
 ACTIVE_WORKLOAD_STATUSES: List[str] = [
+    "accepted",
+    "on_the_way",
+    "en_route",
+    "arrived",
+    "in_progress",
+    "proof_submitted",
+]
+
+# Workload blocking statuses that prevent new exclusive offers (ONE EMPLOYEE = ONE ACTIVE JOB)
+WORKLOAD_OCCUPIED_STATUSES: List[str] = [
+    "assigned",
     "accepted",
     "on_the_way",
     "en_route",
@@ -37,7 +58,7 @@ TERMINAL_WORKLOAD_STATUSES: List[str] = [
 ]
 
 
-def get_employee_active_job(employee_or_id, for_update: bool = False):
+def get_employee_active_job(employee_or_id, for_update: bool = False, statuses: Optional[List[str]] = None):
     """
     Authoritative query returning the single active ServiceRequest for an employee,
     or None if the employee has no active workload.
@@ -59,9 +80,11 @@ def get_employee_active_job(employee_or_id, for_update: bool = False):
     if not emp_id:
         return None
 
+    target_statuses = statuses or WORKLOAD_OCCUPIED_STATUSES
+
     qs = ServiceRequest.objects.filter(
         assigned_employee_id=emp_id,
-        status__in=ACTIVE_WORKLOAD_STATUSES,
+        status__in=target_statuses,
     )
 
     if for_update:
@@ -75,14 +98,14 @@ def get_employee_active_job(employee_or_id, for_update: bool = False):
             from service_requests.models import EmployeeJob
             emp_job_qs = EmployeeJob.objects.filter(
                 employee_id=emp_id,
-                status__in=["ACCEPTED", "ON_THE_WAY", "ARRIVED", "IN_PROGRESS", "PROOF_SUBMITTED"],
+                status__in=["ASSIGNED", "ACCEPTED", "ON_THE_WAY", "EN_ROUTE", "ARRIVED", "IN_PROGRESS", "PROOF_SUBMITTED"],
             )
             if for_update:
                 emp_job_qs = emp_job_qs.select_for_update()
             active_emp_job = emp_job_qs.select_related("service_request").first()
             if active_emp_job and active_emp_job.service_request:
                 sr = active_emp_job.service_request
-                if sr.status in ACTIVE_WORKLOAD_STATUSES:
+                if sr.status in target_statuses:
                     active_job = sr
         except Exception as e:
             logger.debug(f"[WORKLOAD_FALLBACK_ERR] {e}")

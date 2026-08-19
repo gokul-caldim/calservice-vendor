@@ -62,3 +62,36 @@ export function clearAuthTokens() {
 export function hasAuthToken() {
   return Boolean(getAccessToken());
 }
+
+/**
+ * Safely decodes a JWT payload without external libraries.
+ */
+export function parseJwt(token) {
+  if (!token || typeof token !== 'string') return null;
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const base64Url = parts[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonPayload = decodeURIComponent(
+      atob(base64)
+        .split('')
+        .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    );
+    return JSON.parse(jsonPayload);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Checks if a JWT is expired or will expire within `bufferSeconds` (default 15s).
+ */
+export function isTokenExpired(token, bufferSeconds = 15) {
+  if (!token) return true;
+  const decoded = parseJwt(token);
+  if (!decoded || !decoded.exp) return false;
+  const nowInSeconds = Math.floor(Date.now() / 1000);
+  return decoded.exp <= nowInSeconds + bufferSeconds;
+}

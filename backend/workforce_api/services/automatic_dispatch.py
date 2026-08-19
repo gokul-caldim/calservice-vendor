@@ -383,8 +383,8 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
             status__in=["OFFERED", "REJECTED", "CANCELLED", "ACCEPTED"]
         ).values_list("employee_id", flat=True)
     )
-    if excluded_employee_ids:
-        previous_offers.update(excluded_employee_ids)
+    if exclude_employee_ids:
+        previous_offers.update(exclude_employee_ids)
 
     ranked_candidates = []
     now = timezone.now()

@@ -6,6 +6,17 @@ from django.conf import settings
 from rest_framework_simplejwt.authentication import JWTAuthentication
 
 
+from django.db import DatabaseError, OperationalError
+from rest_framework.exceptions import APIException
+from rest_framework import status
+
+
+class ServiceUnavailableException(APIException):
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    default_detail = "Database service temporarily unavailable. Please retry shortly."
+    default_code = "DB_UNAVAILABLE"
+
+
 class CookieJWTAuthentication(JWTAuthentication):
     def authenticate(self, request):
         header = self.get_header(request)
@@ -15,6 +26,8 @@ class CookieJWTAuthentication(JWTAuthentication):
                 try:
                     validated = self.get_validated_token(raw_token)
                     return self.get_user(validated), validated
+                except (OperationalError, DatabaseError):
+                    raise ServiceUnavailableException()
                 except Exception:
                     pass
 
@@ -23,6 +36,19 @@ class CookieJWTAuthentication(JWTAuthentication):
             try:
                 validated = self.get_validated_token(cookie_token)
                 return self.get_user(validated), validated
+            except (OperationalError, DatabaseError):
+                raise ServiceUnavailableException()
+            except Exception:
+                pass
+
+        # Support query param ?token= for EventSource / SSE / WebSockets
+        param_token = request.query_params.get("token") if hasattr(request, "query_params") else request.GET.get("token")
+        if param_token:
+            try:
+                validated = self.get_validated_token(param_token)
+                return self.get_user(validated), validated
+            except (OperationalError, DatabaseError):
+                raise ServiceUnavailableException()
             except Exception:
                 pass
 

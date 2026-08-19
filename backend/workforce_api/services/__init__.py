@@ -10,7 +10,9 @@ from .automatic_dispatch import (
     reconsider_jobs_for_employee,
 )
 from .workload import (
+    ACTIVE_QUEUE_STATUSES,
     ACTIVE_WORKLOAD_STATUSES,
+    WORKLOAD_OCCUPIED_STATUSES,
     TERMINAL_WORKLOAD_STATUSES,
     get_employee_active_job,
     is_employee_busy,
@@ -25,7 +27,9 @@ __all__ = [
     "get_eligible_candidates",
     "expire_and_reassign_offers",
     "reconsider_jobs_for_employee",
+    "ACTIVE_QUEUE_STATUSES",
     "ACTIVE_WORKLOAD_STATUSES",
+    "WORKLOAD_OCCUPIED_STATUSES",
     "TERMINAL_WORKLOAD_STATUSES",
     "get_employee_active_job",
     "is_employee_busy",

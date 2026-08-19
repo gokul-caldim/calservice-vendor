@@ -1169,6 +1169,13 @@ class WorkforcePresenceToggleView(APIView):
         reconcile_employee_availability(emp)
         emp.refresh_from_db(fields=["current_availability", "is_online"])
 
+        if emp.is_online and emp.current_availability == "available":
+            try:
+                from workforce_api.services.automatic_dispatch import reconsider_jobs_for_employee
+                reconsider_jobs_for_employee(emp)
+            except Exception as e:
+                logger.debug(f"[PRESENCE_TOGGLE_DISPATCH_ERR] {e}")
+
         try:
             PresenceLog.objects.create(
                 employee=emp,
@@ -1219,21 +1226,32 @@ class WorkforceJobListView(APIView):
                 jobs = ServiceRequest.objects.none()
         elif emp:
             now = timezone.now()
+            from workforce_api.services.workload import ACTIVE_QUEUE_STATUSES, WORKLOAD_OCCUPIED_STATUSES
+            from workforce_api.services.automatic_dispatch import reconsider_jobs_for_employee, expire_and_reassign_offers
 
-            # Hard Single Active Job Invariant: Check if technician already has an active assignment
+            # 1. Sweep expired offers
+            try:
+                expire_and_reassign_offers()
+            except Exception:
+                pass
+
+            # 2. Hard Single Active Job Invariant: Check if technician already has an active assignment in queue
             has_active_job = ServiceRequest.objects.filter(
                 assigned_employee=emp,
-                status__in=[
-                    "accepted", "on_the_way", "en_route", "arrived",
-                    "service_started", "in_progress", "proof_submitted",
-                    "service_completed", "payment_pending", "cash_pending"
-                ]
+                status__in=WORKLOAD_OCCUPIED_STATUSES
             ).exists()
 
             if has_active_job:
-                # When technician is working on an active job, no new job offers should appear
+                # When technician is occupied with an active job, no new job offers should appear
                 offered_job_ids = []
             else:
+                # Reconsider pending customer bookings in Supabase for this available technician
+                if emp.is_active and emp.is_online and emp.current_availability == "available":
+                    try:
+                        reconsider_jobs_for_employee(emp)
+                    except Exception as e:
+                        logger.debug(f"[DISPATCH_RECONSIDER_ERROR] {e}")
+
                 offered_job_ids = list(WorkforceJobOffer.objects.filter(
                     employee=emp,
                     status="OFFERED",
@@ -1250,22 +1268,43 @@ class WorkforceJobListView(APIView):
             except Exception:
                 emp_job_sr_ids = []
 
-            # Only return jobs assigned to the employee or actively offered (unexpired)
-            qs = ServiceRequest.objects.filter(
-                Q(assigned_employee=emp, status__in=ACTIVE_WORKLOAD_STATUSES + ["completed", "cancelled"]) |
-                Q(id__in=offered_job_ids) |
-                Q(id__in=emp_job_sr_ids)
+            # Canonical query definitions
+            assigned_active_qs = Q(
+                assigned_employee=emp,
+                status__in=ACTIVE_QUEUE_STATUSES
             )
+            completed_qs = Q(
+                assigned_employee=emp,
+                status__in=["completed", "cancelled"]
+            )
+            offered_qs = Q(
+                id__in=offered_job_ids
+            )
+            employee_job_qs = Q(
+                id__in=emp_job_sr_ids
+            )
+
+            status_filter = str(request.query_params.get("status", "active")).lower().strip()
+
+            if status_filter == "completed":
+                qs = ServiceRequest.objects.filter(
+                    Q(assigned_employee=emp, status="completed") |
+                    (Q(id__in=emp_job_sr_ids) & Q(status="completed"))
+                )
+            elif status_filter == "all":
+                qs = ServiceRequest.objects.filter(
+                    assigned_active_qs | completed_qs | offered_qs | employee_job_qs
+                )
+            else: # "active" default
+                qs = ServiceRequest.objects.filter(
+                    assigned_active_qs | offered_qs | (employee_job_qs & Q(status__in=ACTIVE_QUEUE_STATUSES))
+                ).exclude(status__in=["completed", "cancelled"])
+
             if emp.company:
                 qs = qs.filter(company=emp.company)
 
-            status_filter = str(request.query_params.get("status", "active")).lower().strip()
-            if status_filter == "completed":
-                jobs = qs.filter(status="completed").order_by("-updated_at", "-created_at")
-            elif status_filter == "all":
-                jobs = qs.order_by("-created_at")
-            else:
-                jobs = qs.exclude(status__in=["completed", "cancelled"]).order_by("-created_at")
+            qs = qs.distinct().order_by("-updated_at", "-created_at")
+            jobs = qs
         else:
             jobs = ServiceRequest.objects.none()
 
@@ -4588,6 +4627,13 @@ class WorkforceJobLiveTrackingView(APIView):
         if (is_owner_customer or is_tenant_admin) and verification and verification.otp_code and not verification.otp_verified:
             start_otp = verification.otp_code
 
+        tech_photo = ""
+        tech_rating = None
+        if tech:
+            profile_img = getattr(tech, "profile_photo", None) or getattr(tech, "photo", "")
+            tech_photo = profile_img.url if hasattr(profile_img, "url") else str(profile_img or "")
+            tech_rating = getattr(tech, "rating", None)
+
         logger.info(f"[MAP_RECONCILIATION] job_id={job.id} freshness_state={freshness_state} distance_m={distance_m} age_seconds={age_seconds}")
 
         return Response({
@@ -4610,6 +4656,7 @@ class WorkforceJobLiveTrackingView(APIView):
             } if tech else None,
             "technician_photo": tech_photo,
             "technician_rating": tech_rating,
+            "start_otp": start_otp,
             "distance_m": distance_m,
             "geofence_passed": geofence_passed,
             "geofence_radius_meters": 250.0,
@@ -5166,56 +5213,189 @@ class WorkforceRealtimeStreamView(APIView):
     renderer_classes = [ServerSentEventRenderer, JSONRenderer]
 
     def get(self, request):
+        from django.db import connection, DatabaseError, OperationalError
+        from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        logger.info("[Realtime SSE START] Received SSE connection request.")
         user = request.user
-        token_str = request.query_params.get("token")
+        token_str = request.query_params.get("token") or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+
+        # Step 1: JWT Authentication
         if (not user or not user.is_authenticated) and token_str:
             try:
-                from rest_framework_simplejwt.tokens import AccessToken
                 access_token = AccessToken(token_str)
                 user_id = access_token.get("user_id")
-                if user_id is not None:
-                    User = get_user_model()
-                    try:
-                        user = User.objects.filter(id=int(user_id)).first()
-                    except (ValueError, TypeError):
-                        user = User.objects.filter(id=user_id).first()
-            except Exception as e:
-                logger.warning("WorkforceRealtimeStream token validation error: %s", str(e))
-                user = None
+                if user_id is None:
+                    logger.warning("[Realtime AUTH] Token missing user_id claim.")
+                    return Response({"error": "Invalid token claims.", "code": "INVALID_TOKEN"}, status=status.HTTP_401_UNAUTHORIZED)
+            except (InvalidToken, TokenError) as jwt_err:
+                logger.warning("[Realtime AUTH] Authentication token invalid or expired: %s", str(jwt_err))
+                return Response({"error": "Invalid or expired authentication token.", "code": "INVALID_TOKEN"}, status=status.HTTP_401_UNAUTHORIZED)
+            except Exception as gen_err:
+                logger.warning("[Realtime AUTH] Unexpected token validation error: %s", str(gen_err))
+                return Response({"error": "Authentication validation failed.", "code": "AUTH_FAILED"}, status=status.HTTP_401_UNAUTHORIZED)
 
-        if not user or not user.is_authenticated or not getattr(user, "is_active", True):
-            return Response({"error": "Authentication required for realtime stream."}, status=status.HTTP_401_UNAUTHORIZED)
+            # Step 2: Database User Resolution with 503 Handling
+            try:
+                User = get_user_model()
+                try:
+                    user = User.objects.filter(id=int(user_id)).first()
+                except (ValueError, TypeError):
+                    user = User.objects.filter(id=user_id).first()
+            except (OperationalError, DatabaseError) as db_err:
+                logger.error("[Realtime DB] CONNECTION_POOL_EXHAUSTED during auth: %s", str(db_err))
+                return Response(
+                    {"error": "Database service temporarily unavailable. Please retry shortly.", "code": "DB_UNAVAILABLE"},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            finally:
+                connection.close()
 
+        if not user or not user.is_authenticated:
+            logger.warning("[Realtime AUTH] Authentication required for realtime stream.")
+            return Response({"error": "Authentication required for realtime stream.", "code": "AUTH_REQUIRED"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        if not getattr(user, "is_active", True):
+            logger.warning("[Realtime AUTH] Inactive user account: user_id=%s", getattr(user, "id", None))
+            return Response({"error": "User account inactive.", "code": "USER_INACTIVE"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        logger.info("[Realtime SSE AUTH OK] User #%s (%s) authenticated successfully.", user.id, user.username)
+
+        # Step 3: Resolve Company Scope & Admin Status
         user_company_id = getattr(user, "company_id", None)
-        is_admin = is_admin_role(user)
+        if not user_company_id:
+            emp = getattr(user, "employee_profile", None)
+            if not emp:
+                from employees.models import Employee
+                try:
+                    emp = Employee.objects.filter(user=user).first()
+                except (OperationalError, DatabaseError) as db_err:
+                    logger.error("[Realtime DB] CONNECTION_POOL_EXHAUSTED resolving employee profile: %s", str(db_err))
+                    return Response(
+                        {"error": "Database service temporarily unavailable.", "code": "DB_UNAVAILABLE"},
+                        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    )
+                finally:
+                    connection.close()
+            if emp:
+                user_company_id = emp.company_id
 
+        is_admin = is_admin_role(user)
+        user_id_val = user.id
+        is_superuser_val = getattr(user, "is_superuser", False)
+
+        # Step 4: Resolve Initial Event ID with Last-Event-ID support
+        client_last_id = request.headers.get("Last-Event-ID") or request.query_params.get("last_event_id")
+        try:
+            initial_last_id = int(client_last_id) if client_last_id else None
+        except (ValueError, TypeError):
+            initial_last_id = None
+
+        if initial_last_id is None:
+            try:
+                latest_ev = WorkforceEventLog.objects.order_by("-id").first()
+                initial_last_id = latest_ev.id if latest_ev else 0
+            except (OperationalError, DatabaseError) as db_err:
+                logger.error("[Realtime DB] CONNECTION_POOL_EXHAUSTED resolving latest event ID: %s", str(db_err))
+                return Response(
+                    {"error": "Database service temporarily unavailable.", "code": "DB_UNAVAILABLE"},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            finally:
+                connection.close()
+
+        # Step 5: Long-Running Connection-Safe Event Stream Generator
         def event_stream():
-            last_id = 0
+            last_id = initial_last_id
+            heartbeat_interval_seconds = 15
+            last_heartbeat_time = time.time()
+            last_reconcile_time = time.time()
+
+            logger.info("[Realtime SSE START] Stream generator running for user_id=%s, start_id=%s.", user_id_val, last_id)
+            # Initial connection confirmation event
             yield f"event: ping\ndata: {json.dumps({'status': 'connected', 'timestamp': timezone.now().isoformat()})}\n\n"
 
-            for _ in range(15):
-                events = WorkforceEventLog.objects.filter(id__gt=last_id).select_related("user").order_by("id")[:10]
-                for ev in events:
-                    last_id = ev.id
-                    if ev.user_id == user.id:
-                        is_authorized = True
-                    elif is_admin:
-                        is_authorized = (ev.user is None) or (getattr(ev.user, "company_id", None) == user_company_id) or user.is_superuser
-                    elif ev.user is None:
-                        ev_company_id = ev.payload.get("company_id") if isinstance(ev.payload, dict) else None
-                        is_authorized = (ev_company_id is None or ev_company_id == user_company_id)
-                    else:
-                        is_authorized = False
+            try:
+                while True:
+                    loop_now = time.time()
+                    events = []
 
-                    if is_authorized:
-                        event_data = {
-                            "id": ev.id,
-                            "event_type": ev.event_type,
-                            "payload": ev.payload,
-                            "timestamp": ev.created_at.isoformat(),
-                        }
-                        yield f"event: workforce_event\ndata: {json.dumps(event_data)}\n\n"
-                time.sleep(1)
+                    # Periodic Heartbeat (keep stream open, prevent proxy / browser timeout)
+                    if loop_now - last_heartbeat_time >= heartbeat_interval_seconds:
+                        last_heartbeat_time = loop_now
+                        logger.debug("[Realtime SSE HEARTBEAT] Sending keepalive ping to user_id=%s.", user_id_val)
+                        yield f": heartbeat\n\n"
+
+                    # Periodic Discovery / Reconciliation for connected technician (every 10s)
+                    if not is_admin and (loop_now - last_reconcile_time >= 10):
+                        last_reconcile_time = loop_now
+                        try:
+                            emp_obj = getattr(user, "employee_profile", None)
+                            if emp_obj and emp_obj.is_online and emp_obj.current_availability == "available":
+                                from workforce_api.services.automatic_dispatch import reconsider_jobs_for_employee
+                                reconsider_jobs_for_employee(emp_obj)
+                        except Exception as rec_err:
+                            logger.debug(f"[Realtime SSE RECONCILE ERR] {rec_err}")
+                        finally:
+                            connection.close()
+
+                    # Fetch newly emitted events using pure dictionary projection
+                    try:
+                        logger.debug("[Realtime SSE DB QUERY] Polling events > %s", last_id)
+                        events = list(
+                            WorkforceEventLog.objects.filter(id__gt=last_id)
+                            .values("id", "event_type", "payload", "created_at", "user_id")
+                            .order_by("id")[:20]
+                        )
+                    except (OperationalError, DatabaseError) as db_err:
+                        logger.error("[Realtime DB] CONNECTION_POOL_EXHAUSTED polling events: %s. Terminating stream for client backoff.", str(db_err))
+                        connection.close()
+                        # Exit the loop immediately so server does not hammer PostgreSQL every 1s
+                        break
+                    except Exception as q_err:
+                        logger.warning("[Realtime SSE EXCEPTION] Unexpected query exception: %s", str(q_err))
+                    finally:
+                        # CRITICAL: Always release the database connection immediately after the query!
+                        connection.close()
+
+                    for ev in events:
+                        ev_id = ev["id"]
+                        ev_user_id = ev["user_id"]
+                        ev_payload = ev["payload"]
+                        last_id = max(last_id, ev_id)
+
+                        if ev_user_id == user_id_val:
+                            is_authorized = True
+                        elif is_admin:
+                            is_authorized = (ev_user_id is None) or is_superuser_val
+                            if not is_authorized and isinstance(ev_payload, dict):
+                                ev_comp = ev_payload.get("company_id")
+                                is_authorized = (ev_comp is None or ev_comp == user_company_id)
+                        elif ev_user_id is None:
+                            ev_company_id = ev_payload.get("company_id") if isinstance(ev_payload, dict) else None
+                            is_authorized = (ev_company_id is None or ev_company_id == user_company_id)
+                        else:
+                            is_authorized = False
+
+                        if is_authorized:
+                            event_data = {
+                                "id": ev_id,
+                                "event_type": ev["event_type"],
+                                "payload": ev_payload,
+                                "timestamp": ev["created_at"].isoformat() if hasattr(ev["created_at"], "isoformat") else str(ev["created_at"]),
+                            }
+                            logger.info("[Realtime SSE EVENT] Delivering event #%s (%s) to user_id=%s", ev_id, ev["event_type"], user_id_val)
+                            yield f"id: {ev_id}\nevent: workforce_event\ndata: {json.dumps(event_data)}\n\n"
+
+                    time.sleep(1)
+            except GeneratorExit:
+                logger.info("[Realtime SSE END] Client disconnected (GeneratorExit) for user_id=%s.", user_id_val)
+            except Exception as stream_err:
+                logger.warning("[Realtime SSE EXCEPTION] Stream loop exception for user_id=%s: %s", user_id_val, str(stream_err))
+            finally:
+                logger.info("[Realtime SSE END] Stream ended for user_id=%s. Releasing any active DB connection.", user_id_val)
+                connection.close()
 
         response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
         response["Cache-Control"] = "no-cache"
@@ -5602,7 +5782,6 @@ def process_job_arrival(job, employee, lat, lon, is_automatic=False, actor=None)
     """
     from workforce_api.models import PreServiceVerification, WorkforceEventLog
     from service_requests.state_machine import apply_transition
-    from workforce_api.services.automatic_dispatch import create_notification
     import secrets
 
     now = timezone.now()

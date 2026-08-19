@@ -37,6 +37,9 @@ export async function apiRefreshToken() {
   const refreshToken = getRefreshToken();
   if (!refreshToken) {
     clearAuthTokens();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('workforce:auth-unauthorized'));
+    }
     return null;
   }
 
@@ -51,14 +54,21 @@ export async function apiRefreshToken() {
       if (res.ok) {
         const data = await res.json();
         const newToken = data.access_token || data.token;
+        const newRefreshToken = data.refresh_token || data.refresh || refreshToken;
         if (newToken) {
-          setAuthTokens(newToken, refreshToken);
+          setAuthTokens(newToken, newRefreshToken);
           return newToken;
         }
       }
 
-      // Refresh failed (invalid/expired refresh token)
-      clearAuthTokens();
+      if (res.status === 401 || res.status === 400) {
+        // Refresh rejected by server (invalid/expired refresh token)
+        clearAuthTokens();
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('workforce:auth-unauthorized'));
+        }
+      }
+      // For 503 (DB connection pool exhaustion) or 5xx, do NOT clear tokens
       return null;
     } catch (_) {
       return null;

@@ -99,7 +99,7 @@ export function CustomerTrackingMap({
       if (!techMarkerRef.current) {
         const techIcon = L.divIcon({
           className: 'tech-marker-custom',
-          html: `<div style="background:#2563eb;color:white;width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 10px rgba(37,99,235,0.4);border:2px solid white;font-size:16px;transform:rotate(${heading}deg);transition:transform 0.5s ease;">🚗</div>`,
+          html: `<div style="background:#2563eb;color:white;width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 10px rgba(37,99,235,0.4);border:2px solid white;font-size:16px;transform:rotate(${heading}deg);transition:transform 0.5s ease;">🏍️</div>`,
           iconSize: [36, 36],
           iconAnchor: [18, 18],
         });

@@ -410,6 +410,14 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     distance_km = serializers.SerializerMethodField()
     payment = serializers.SerializerMethodField()
     cancellation_info = serializers.SerializerMethodField()
+    job_status = serializers.SerializerMethodField()
+    offer_status = serializers.SerializerMethodField()
+    is_offer = serializers.SerializerMethodField()
+    is_accepted_by_current_employee = serializers.SerializerMethodField()
+    is_assigned_to_current_employee = serializers.SerializerMethodField()
+    accepted_at = serializers.SerializerMethodField()
+    cancellation_deadline = serializers.SerializerMethodField()
+    offer_expires_at = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceRequest
@@ -441,7 +449,6 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "cancellation_info",
             "extensions",
             "active_extension",
-            "cancellation_info",
             "created_at",
             "updated_at",
             # Authoritative fields
@@ -486,7 +493,7 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         return bool(obj.assigned_employee_id == emp.id)
 
     def get_is_offer(self, obj):
-        if self.get_is_accepted_by_current_employee(obj):
+        if self.get_is_accepted_by_current_employee(obj) or self.get_is_assigned_to_current_employee(obj):
             return False
         emp = self._get_context_emp()
         if not emp:

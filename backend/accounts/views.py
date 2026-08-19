@@ -74,10 +74,22 @@ class LoginView(APIView):
                     status=status.HTTP_403_FORBIDDEN
                 )
 
+            emp = None
+            try:
+                emp = Employee.objects.filter(user=user).first()
+            except Exception:
+                emp = None
+
+            user_role = getattr(user, "role", "employee")
+            if emp and user_role not in ["admin", "manager"]:
+                user_role = "employee"
+
+            company_id = getattr(user, "company_id", None) or (getattr(emp, "company_id", None) if emp else None)
+
             refresh = RefreshToken.for_user(user)
-            if hasattr(user, "company_id") and user.company_id:
-                refresh["company_id"] = user.company_id
-            refresh["role"] = getattr(user, "role", "employee")
+            if company_id:
+                refresh["company_id"] = company_id
+            refresh["role"] = user_role
 
             access_token_str = str(refresh.access_token)
             refresh_token_str = str(refresh)
@@ -93,8 +105,8 @@ class LoginView(APIView):
                     "email": user.email or "",
                     "first_name": user.first_name or "",
                     "last_name": user.last_name or "",
-                    "role": getattr(user, "role", "employee"),
-                    "company": getattr(user, "company_id", None),
+                    "role": user_role,
+                    "company": company_id,
                 }
             }, status=status.HTTP_200_OK)
 
@@ -112,19 +124,65 @@ class WorkforceRefreshView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        from django.db import connection, DatabaseError, OperationalError
+        from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+
         refresh_token = request.data.get("refresh_token") or request.data.get("refresh")
         if not refresh_token:
-            return Response({"error": "Refresh token required."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Refresh token required.", "code": "TOKEN_REQUIRED"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             refresh = RefreshToken(refresh_token)
-            new_access_token = str(refresh.access_token)
-            return Response({
-                "access_token": new_access_token,
-                "token": new_access_token,
-            }, status=status.HTTP_200_OK)
+        except (InvalidToken, TokenError):
+            return Response({"error": "Invalid or expired refresh token.", "code": "INVALID_REFRESH_TOKEN"}, status=status.HTTP_401_UNAUTHORIZED)
         except Exception:
-            return Response({"error": "Invalid or expired refresh token."}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response({"error": "Invalid refresh token format.", "code": "INVALID_REFRESH_TOKEN"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        user_role = "employee"
+        company_id = None
+
+        try:
+            # Re-resolve user and refresh claims on newly issued access token
+            user_id = refresh.payload.get("user_id")
+            if user_id:
+                user = User.objects.filter(id=user_id).first()
+                if user:
+                    emp = getattr(user, "employee_profile", None)
+                    if not emp:
+                        try:
+                            emp = Employee.objects.filter(user=user).first()
+                        except Exception:
+                            emp = None
+                    user_role = getattr(user, "role", "employee")
+                    if emp and user_role not in ["admin", "manager"]:
+                        user_role = "employee"
+                    company_id = getattr(user, "company_id", None) or (getattr(emp, "company_id", None) if emp else None)
+        except (OperationalError, DatabaseError) as db_err:
+            logger.error("[Refresh DB] Database unavailable during token refresh: %s", str(db_err))
+            return Response(
+                {"error": "Database service temporarily unavailable. Please retry shortly.", "code": "DB_UNAVAILABLE"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        finally:
+            connection.close()
+
+        access_obj = refresh.access_token
+        if company_id:
+            refresh["company_id"] = company_id
+            access_obj["company_id"] = company_id
+        refresh["role"] = user_role
+        access_obj["role"] = user_role
+
+        new_access_token = str(access_obj)
+        new_refresh_token = str(refresh)
+        response = Response({
+            "access_token": new_access_token,
+            "token": new_access_token,
+            "refresh_token": new_refresh_token,
+            "refresh": new_refresh_token,
+        }, status=status.HTTP_200_OK)
+        set_auth_cookies(response, new_access_token, new_refresh_token)
+        return response
 
 
 class MeView(APIView):

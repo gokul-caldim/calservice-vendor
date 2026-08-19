@@ -175,6 +175,8 @@ class ServiceRequest(models.Model):
     technician_location_name = models.CharField(max_length=200, blank=True, default="")
     start_otp = models.CharField(max_length=10, blank=True, default="")
     otp_verified = models.BooleanField(default=False)
+    otp_attempt_count = models.IntegerField(default=0, blank=True)
+    otp_hash = models.CharField(max_length=255, blank=True, default="")
     payment_collected_by_name = models.CharField(max_length=200, blank=True, default="")
     collection_method = models.CharField(max_length=50, blank=True, default="")
     collection_reference = models.CharField(max_length=100, blank=True, default="")

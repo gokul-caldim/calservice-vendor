@@ -17,7 +17,16 @@ class IsWorkforceEmployee(BasePermission):
         if not user or not user.is_authenticated:
             return False
         role = str(getattr(user, "role", "")).lower()
-        return role == "employee" or is_admin_role(user)
+        if role in ("employee", "technician") or is_admin_role(user):
+            return True
+        emp = getattr(user, "employee_profile", None)
+        if not emp:
+            from employees.models import Employee
+            try:
+                emp = Employee.objects.filter(user=user).first()
+            except Exception:
+                emp = None
+        return bool(emp and getattr(emp, "is_active", True) and getattr(user, "is_active", True))
 
 
 class IsPlatformSuperAdmin(BasePermission):
@@ -56,7 +65,13 @@ class IsApprovedTechnician(BasePermission):
             return True
 
         emp = getattr(user, "employee_profile", None)
-        if not emp or not emp.is_active or not getattr(user, "is_active", True):
+        if not emp:
+            from employees.models import Employee
+            try:
+                emp = Employee.objects.filter(user=user).first()
+            except Exception:
+                emp = None
+        if not emp or not getattr(emp, "is_active", True) or not getattr(user, "is_active", True):
             return False
 
         ob_data = (emp.bank_details or {}).get("onboarding", {}) if isinstance(emp.bank_details, dict) else {}
