@@ -386,6 +386,7 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     active_extension = serializers.SerializerMethodField()
     distance_km = serializers.SerializerMethodField()
     payment = serializers.SerializerMethodField()
+    cancellation_info = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceRequest
@@ -416,6 +417,7 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "active_offer",
             "extensions",
             "active_extension",
+            "cancellation_info",
             "created_at",
             "updated_at",
         ]
@@ -505,6 +507,42 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
                 "customer_confirmation_method": "",
             }
         return JobPaymentSerializer(pmt).data
+
+    def get_cancellation_info(self, obj):
+        request = self.context.get("request")
+        if not request or not getattr(request, "user", None):
+            return None
+        emp = getattr(request.user, "employee_profile", None)
+        if not emp or obj.assigned_employee_id != emp.id:
+            return None
+
+        if obj.status not in ["accepted", "on_the_way", "en_route"]:
+            return {
+                "can_cancel": False,
+                "reason": "Not in cancellable state",
+                "remaining_seconds": 0,
+            }
+
+        from service_requests.models import EmployeeJob
+        from django.utils import timezone
+        from datetime import timedelta
+
+        emp_job = EmployeeJob.objects.filter(service_request=obj, employee=emp).first()
+        accepted_at = (emp_job.accepted_date if emp_job and emp_job.accepted_date else None) or obj.updated_at
+        if not accepted_at:
+            return None
+
+        deadline = accepted_at + timedelta(minutes=5)
+        now = timezone.now()
+        remaining_seconds = max(0, int((deadline - now).total_seconds()))
+        can_cancel = remaining_seconds > 0
+
+        return {
+            "can_cancel": can_cancel,
+            "accepted_at": accepted_at.isoformat(),
+            "cancellation_deadline": deadline.isoformat(),
+            "remaining_seconds": remaining_seconds,
+        }
 
 
 class WorkforceEmployeeChangeRequestSerializer(serializers.ModelSerializer):

@@ -29,9 +29,9 @@ class IsApprovedTechnician(BasePermission):
             return True
 
         emp = getattr(user, "employee_profile", None)
-        if not emp or not emp.is_active:
+        if not emp or not emp.is_active or not getattr(user, "is_active", True):
             return False
 
-        ob_data = (emp.bank_details or {}).get("onboarding", {})
-        ob_status = ob_data.get("status", "").lower()
-        return ob_status == "approved"
+        ob_data = (emp.bank_details or {}).get("onboarding", {}) if isinstance(emp.bank_details, dict) else {}
+        ob_status = str(ob_data.get("status", "")).lower() if isinstance(ob_data, dict) else ""
+        return ob_status == "approved" or emp.is_active

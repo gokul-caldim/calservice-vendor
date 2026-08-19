@@ -52,9 +52,11 @@ def run_tests():
     def record_fail(test_name, err):
         nonlocal failed
         failed += 1
-        msg = f"FAILED: {test_name} -> {err}"
+        import traceback
+        tb = traceback.format_exc()
+        msg = f"FAILED: {test_name} -> {repr(err)}\n{tb}"
         errors.append(msg)
-        print(f" [FAIL] {test_name} -> {err}")
+        print(f" [FAIL] {test_name} -> {repr(err)}\n{tb}")
 
     # 1. Setup Test Company and Users
     company, _ = Company.objects.get_or_create(company_name="CalServices Handoff Test Co")
@@ -72,6 +74,9 @@ def run_tests():
             "bank_details": {"onboarding": {"status": "approved"}}
         }
     )
+    tech_emp.company = company
+    tech_emp.is_active = True
+    tech_emp.save()
 
     cust_user, _ = User.objects.get_or_create(
         username="handover_customer_01",
@@ -122,6 +127,19 @@ def run_tests():
             )
         else:
             sr_0297.assigned_employee = tech_emp
+            sr_0297.company = company
+            sr_0297.customer_name = "Sarah Conor"
+            sr_0297.phone = "+15551234567"
+            sr_0297.email = "customer01@gmail.com"
+            sr_0297.latitude = 12.971598
+            sr_0297.longitude = 77.594566
+            sr_0297.payment_method = "COD"
+            sr_0297.payment_status = "pending"
+            sr_0297.total_amount = Decimal("2498.00")
+            sr_0297.cart_data = [
+                {"id": 101, "name": "Split AC Service", "quantity": 1, "price": 1499, "selectedOption": "1.5 Ton"},
+                {"id": 102, "name": "Freon Gas Top-up", "quantity": 1, "price": 999}
+            ]
             sr_0297.status = "assigned"
             sr_0297.save()
 
