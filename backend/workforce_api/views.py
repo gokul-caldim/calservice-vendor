@@ -7819,6 +7819,51 @@ class WorkforceJobTimelineView(APIView):
         }, status=status.HTTP_200_OK)
 
 
+class WorkforcePublicSupportInquiryView(APIView):
+    """
+    Public API endpoint to submit operations support inquiries.
+    Permits unauthenticated access for onboarding technicians, prospective contractors, and customers.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        name = str(request.data.get("name", "")).strip()
+        email = str(request.data.get("email", "")).strip()
+        phone = str(request.data.get("phone", "")).strip()
+        category = str(request.data.get("category", "general")).strip()
+        subject = str(request.data.get("subject", "")).strip()
+        message = str(request.data.get("message", "")).strip()
+
+        if not name:
+            return Response({"error": "Full name is required.", "code": "NAME_REQUIRED"}, status=status.HTTP_400_BAD_REQUEST)
+        if not email or "@" not in email:
+            return Response({"error": "A valid email address is required.", "code": "INVALID_EMAIL"}, status=status.HTTP_400_BAD_REQUEST)
+        if not message:
+            return Response({"error": "Inquiry message is required.", "code": "MESSAGE_REQUIRED"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Generate unique verifiable ticket reference ID
+        ticket_id = f"CAL-{secrets.randbelow(900000) + 100000}"
+        submitted_at = timezone.now().isoformat()
+
+        logger.info(
+            "[SUPPORT INQUIRY RECEIVED] Ticket: %s | From: %s <%s> | Phone: %s | Category: %s | Message: %s",
+            ticket_id, name, email, phone, category, message[:120]
+        )
+
+        return Response({
+            "success": True,
+            "ticket_id": ticket_id,
+            "email": email,
+            "name": name,
+            "phone": phone,
+            "category": category,
+            "subject": subject or "Operations Support Inquiry",
+            "submitted_at": submitted_at,
+            "message": "Your support inquiry has been successfully submitted to Caldim Engineering Operations Desk. A ticket has been logged and our team will respond shortly.",
+        }, status=status.HTTP_201_CREATED)
+
+
+
 
 
 

@@ -37,6 +37,13 @@ export async function apiWorkforceLogout() {
   });
 }
 
+export async function apiSubmitSupportInquiry(payload) {
+  return await apiRequest('/workforce/support/inquiry/', {
+    method: 'POST',
+    json: payload,
+  });
+}
+
 // ── Onboarding Wizard (Phases 5–7) ───────────────────────────────────────────
 
 export async function apiGetOnboardingProfile() {

@@ -7,6 +7,12 @@ import { AdminRoute, EmployeeRoute, AuthenticatedRoute } from './components/comm
 import { LoginPage } from './pages/auth/LoginPage.jsx';
 import { SignupPage } from './pages/auth/SignupPage.jsx';
 
+import { TermsAndConditionsPage } from './pages/public/TermsAndConditionsPage.jsx';
+import { PrivacyPolicyPage } from './pages/public/PrivacyPolicyPage.jsx';
+import { SupportAndContactPage } from './pages/public/SupportAndContactPage.jsx';
+import { CancellationRefundsPage } from './pages/public/CancellationRefundsPage.jsx';
+import { ShippingPolicyPage } from './pages/public/ShippingPolicyPage.jsx';
+
 import { OnboardingWizardPage } from './pages/onboarding/OnboardingWizardPage.jsx';
 import { PendingReviewPage } from './pages/onboarding/PendingReviewPage.jsx';
 import { CorrectionRequiredPage } from './pages/onboarding/CorrectionRequiredPage.jsx';
@@ -88,6 +94,20 @@ export function App() {
           {/* Public Auth */}
           <Route path="/workforce/login" element={<LoginPage />} />
           <Route path="/workforce/signup" element={<SignupPage />} />
+
+          {/* Public Legal, Compliance & Support Hub */}
+          <Route path="/terms" element={<TermsAndConditionsPage />} />
+          <Route path="/workforce/terms" element={<TermsAndConditionsPage />} />
+          <Route path="/privacy" element={<PrivacyPolicyPage />} />
+          <Route path="/workforce/privacy" element={<PrivacyPolicyPage />} />
+          <Route path="/support" element={<SupportAndContactPage />} />
+          <Route path="/contact" element={<SupportAndContactPage />} />
+          <Route path="/workforce/support" element={<SupportAndContactPage />} />
+          <Route path="/cancellation-refunds" element={<CancellationRefundsPage />} />
+          <Route path="/refunds" element={<CancellationRefundsPage />} />
+          <Route path="/workforce/cancellation-refunds" element={<CancellationRefundsPage />} />
+          <Route path="/shipping-policy" element={<ShippingPolicyPage />} />
+          <Route path="/workforce/shipping-policy" element={<ShippingPolicyPage />} />
 
           {/* Technician Onboarding Lifecycle */}
           <Route
