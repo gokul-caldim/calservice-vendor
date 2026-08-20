@@ -26,27 +26,48 @@ export function EmployeeRoute({ children }) {
     return <Navigate to="/workforce/admin" replace />;
   }
 
-  // Employee Lifecycle Guard
+  // Authoritative Employee Lifecycle Guard
   const currentPath = location.pathname;
+  const normalizedStatus = (registrationStatus || 'not_started').toLowerCase();
 
-  if (registrationStatus === 'not_started' || registrationStatus === 'in_progress') {
-    if (!currentPath.includes('/workforce/onboarding/wizard')) {
-      return <Navigate to="/workforce/onboarding/wizard" replace />;
+  // 1. APPROVED Employee: Full access to Normal Workforce modules
+  if (normalizedStatus === 'approved') {
+    // Approved employees must NEVER access the onboarding flow.
+    // If navigating directly to any /workforce/onboarding route, redirect to Profile.
+    if (currentPath.startsWith('/workforce/onboarding')) {
+      return <Navigate to="/workforce/employee/profile" replace />;
     }
-  } else if (registrationStatus === 'submitted' || registrationStatus === 'under_review') {
-    if (!currentPath.includes('/workforce/onboarding/pending-review') && !currentPath.includes('/workforce/onboarding/wizard')) {
-      return <Navigate to="/workforce/onboarding/pending-review" replace />;
-    }
-  } else if (registrationStatus === 'correction_required') {
-    if (!currentPath.includes('/workforce/onboarding/corrections') && !currentPath.includes('/workforce/onboarding/wizard')) {
-      return <Navigate to="/workforce/onboarding/corrections" replace />;
-    }
-  } else if (registrationStatus === 'rejected') {
-    if (!currentPath.includes('/workforce/onboarding/rejected') && !currentPath.includes('/workforce/onboarding/wizard')) {
-      return <Navigate to="/workforce/onboarding/rejected" replace />;
-    }
+    return children;
   }
 
+  // 2. SUBMITTED / UNDER REVIEW Employee: Restricted to Pending Review Page
+  if (normalizedStatus === 'submitted' || normalizedStatus === 'under_review') {
+    if (currentPath !== '/workforce/onboarding/pending-review') {
+      return <Navigate to="/workforce/onboarding/pending-review" replace />;
+    }
+    return children;
+  }
+
+  // 3. CORRECTION REQUIRED Employee: Restricted to Corrections Page
+  if (normalizedStatus === 'correction_required') {
+    if (currentPath !== '/workforce/onboarding/corrections') {
+      return <Navigate to="/workforce/onboarding/corrections" replace />;
+    }
+    return children;
+  }
+
+  // 4. REJECTED Employee: Restricted to Application Declined Page
+  if (normalizedStatus === 'rejected') {
+    if (currentPath !== '/workforce/onboarding/rejected') {
+      return <Navigate to="/workforce/onboarding/rejected" replace />;
+    }
+    return children;
+  }
+
+  // 5. INCOMPLETE / NOT STARTED / DRAFT Employee: Restricted to Registration Wizard
+  if (currentPath !== '/workforce/onboarding/wizard') {
+    return <Navigate to="/workforce/onboarding/wizard" replace />;
+  }
 
   return children;
 }

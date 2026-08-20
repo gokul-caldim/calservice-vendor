@@ -6,6 +6,11 @@ from django.contrib.auth import get_user_model
 from rest_framework import serializers
 from employees.models import Employee
 from service_requests.models import ServiceRequest
+from workforce_api.services.registration import (
+    get_employee_registration_status,
+    get_employee_onboarding_dict,
+    REGISTRATION_STATUS_NOT_STARTED,
+)
 
 User = get_user_model()
 
@@ -103,27 +108,18 @@ class WorkforceEmployeeProfileSerializer(serializers.ModelSerializer):
         return ""
 
     def get_onboarding_data(self, obj):
-        return (obj.bank_details or {}).get("onboarding", {
-            "status": "not_started",
-            "step": 1,
-            "draft": {},
-            "services": [],
-            "documents": {},
-            "correction_notes": "",
-            "rejection_reason": "",
-        })
+        return get_employee_onboarding_dict(obj)
 
     def get_registration_status(self, obj):
-        ob = (obj.bank_details or {}).get("onboarding", {})
-        return ob.get("status", "not_started")
+        return get_employee_registration_status(obj)
 
     def get_approved_services(self, obj):
-        ob = (obj.bank_details or {}).get("onboarding", {})
+        ob = get_employee_onboarding_dict(obj)
         services = ob.get("services", [])
         return [s for s in services if s.get("status") == "approved"]
 
     def get_all_requested_services(self, obj):
-        ob = (obj.bank_details or {}).get("onboarding", {})
+        ob = get_employee_onboarding_dict(obj)
         return ob.get("services", [])
 
     def get_documents_status(self, obj):
@@ -418,6 +414,10 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     accepted_at = serializers.SerializerMethodField()
     cancellation_deadline = serializers.SerializerMethodField()
     offer_expires_at = serializers.SerializerMethodField()
+    server_time = serializers.SerializerMethodField()
+    offer_id = serializers.SerializerMethodField()
+    offered_at = serializers.SerializerMethodField()
+    can_cancel = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceRequest
@@ -460,6 +460,10 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "accepted_at",
             "cancellation_deadline",
             "offer_expires_at",
+            "server_time",
+            "offer_id",
+            "offered_at",
+            "can_cancel",
         ]
 
     def _get_context_emp(self):
@@ -602,6 +606,38 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     def get_service_title(self, obj):
         return obj.issue_title or obj.service_category
 
+    def get_server_time(self, obj):
+        from django.utils import timezone
+        return timezone.now().isoformat()
+
+    def get_offer_id(self, obj):
+        emp = self._get_context_emp()
+        if not emp:
+            return None
+        offer = self._get_emp_offer(obj, emp)
+        return offer.id if offer else None
+
+    def get_offered_at(self, obj):
+        emp = self._get_context_emp()
+        if not emp:
+            return None
+        offer = self._get_emp_offer(obj, emp)
+        return offer.offered_at.isoformat() if offer and offer.offered_at else None
+
+    def get_can_cancel(self, obj):
+        emp = self._get_context_emp()
+        if not emp or obj.assigned_employee_id != emp.id:
+            return False
+        if obj.status not in ["accepted", "on_the_way", "en_route", "arrived"]:
+            return False
+        from .models import PreServiceVerification
+        verification = getattr(obj, "pre_service_verification", None)
+        if not verification:
+            verification = PreServiceVerification.objects.filter(job=obj).first()
+        if verification and verification.otp_verified:
+            return False
+        return True
+
     def get_active_offer(self, obj):
         if self.get_is_accepted_by_current_employee(obj):
             return None
@@ -619,11 +655,15 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
                 offer = None
         if not offer:
             return None
+        from django.utils import timezone
         return {
             "id": offer.id,
+            "job_id": offer.job_id,
+            "employee_id": offer.employee_id,
             "status": "OFFERED",
             "offered_at": offer.offered_at.isoformat(),
             "expires_at": offer.expires_at.isoformat(),
+            "server_time": timezone.now().isoformat(),
             "is_expired": False,
         }
 

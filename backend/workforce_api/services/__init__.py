@@ -9,6 +9,19 @@ from .automatic_dispatch import (
     expire_and_reassign_offers,
     reconsider_jobs_for_employee,
 )
+from .geo_spatial import (
+    ADMIN_DISPATCH_RADIUS_KM,
+    MAX_GPS_AGE_SECONDS,
+    DISTANCE_TOLERANCE_KM,
+    DISTANCE_BANDS,
+    validate_coordinates,
+    calculate_distance_km,
+    calculate_distance_meters,
+    get_spatial_bounding_box,
+    get_distance_band,
+    is_within_radius,
+    destination_point,
+)
 from .workload import (
     ACTIVE_QUEUE_STATUSES,
     ACTIVE_WORKLOAD_STATUSES,
@@ -20,6 +33,20 @@ from .workload import (
     supersede_other_offers_for_employee,
 )
 
+from .registration import (
+    REGISTRATION_STATUS_NOT_STARTED,
+    REGISTRATION_STATUS_IN_PROGRESS,
+    REGISTRATION_STATUS_SUBMITTED,
+    REGISTRATION_STATUS_UNDER_REVIEW,
+    REGISTRATION_STATUS_CORRECTION_REQUIRED,
+    REGISTRATION_STATUS_APPROVED,
+    REGISTRATION_STATUS_REJECTED,
+    VALID_REGISTRATION_STATUSES,
+    get_employee_onboarding_dict,
+    get_employee_registration_status,
+    is_employee_approved,
+)
+
 __all__ = [
     "dispatch_job",
     "dispatch_pending_jobs",
@@ -27,6 +54,17 @@ __all__ = [
     "get_eligible_candidates",
     "expire_and_reassign_offers",
     "reconsider_jobs_for_employee",
+    "ADMIN_DISPATCH_RADIUS_KM",
+    "MAX_GPS_AGE_SECONDS",
+    "DISTANCE_TOLERANCE_KM",
+    "DISTANCE_BANDS",
+    "validate_coordinates",
+    "calculate_distance_km",
+    "calculate_distance_meters",
+    "get_spatial_bounding_box",
+    "get_distance_band",
+    "is_within_radius",
+    "destination_point",
     "ACTIVE_QUEUE_STATUSES",
     "ACTIVE_WORKLOAD_STATUSES",
     "WORKLOAD_OCCUPIED_STATUSES",
@@ -35,4 +73,15 @@ __all__ = [
     "is_employee_busy",
     "reconcile_employee_availability",
     "supersede_other_offers_for_employee",
+    "REGISTRATION_STATUS_NOT_STARTED",
+    "REGISTRATION_STATUS_IN_PROGRESS",
+    "REGISTRATION_STATUS_SUBMITTED",
+    "REGISTRATION_STATUS_UNDER_REVIEW",
+    "REGISTRATION_STATUS_CORRECTION_REQUIRED",
+    "REGISTRATION_STATUS_APPROVED",
+    "REGISTRATION_STATUS_REJECTED",
+    "VALID_REGISTRATION_STATUSES",
+    "get_employee_onboarding_dict",
+    "get_employee_registration_status",
+    "is_employee_approved",
 ]

@@ -104,9 +104,15 @@ export function AuthProvider({ children }) {
       setAuthTokens(token, refresh);
     }
 
+    // Await full authoritative profile refresh to eliminate provisional race condition
+    const fullyResolvedUser = await refreshProfile(true);
+    if (fullyResolvedUser) {
+      return fullyResolvedUser;
+    }
+
     if (res.user) {
       const isAdmin = ['admin', 'manager'].includes((res.user.role || '').toLowerCase()) || Boolean(res.user.is_superuser);
-      const initialUser = {
+      const fallbackUser = {
         id: res.user.id,
         username: res.user.username,
         email: res.user.email || '',
@@ -117,18 +123,15 @@ export function AuthProvider({ children }) {
         companyName: res.user.company_name || '',
         isAdmin: isAdmin,
         isEmployee: !isAdmin,
-        registrationStatus: isAdmin ? 'approved' : 'not_started',
+        registrationStatus: res.user.registration_status || (isAdmin ? 'approved' : 'not_started'),
         isOnline: false,
         availability: 'offline',
       };
-      setUser(initialUser);
-
-      // Trigger background profile refresh for non-blocking extended details
-      refreshProfile(true).catch(() => {});
-      return initialUser;
+      setUser(fallbackUser);
+      return fallbackUser;
     }
 
-    return await refreshProfile(true);
+    return null;
   }, [refreshProfile]);
 
   const signup = useCallback(async (payload) => {

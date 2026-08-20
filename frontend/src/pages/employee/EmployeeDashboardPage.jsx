@@ -86,21 +86,22 @@ import {
 /**
  * Real-time Countdown Badge for Offer Expiration & 5-Minute Cancellation Window
  */
-function CountdownBadge({ targetTime, prefix = '', expiredText = 'Expired', tone = 'amber' }) {
+function CountdownBadge({ targetTime, serverTimeOffset = 0, prefix = '', expiredText = 'Expired', tone = 'amber' }) {
+  const getNow = () => Date.now() + (serverTimeOffset || 0);
   const [remaining, setRemaining] = useState(() => {
     if (!targetTime) return 0;
-    return Math.max(0, Math.floor((new Date(targetTime).getTime() - Date.now()) / 1000));
+    return Math.max(0, Math.floor((new Date(targetTime).getTime() - getNow()) / 1000));
   });
 
   useEffect(() => {
     if (!targetTime) return;
     const interval = setInterval(() => {
-      const diff = Math.max(0, Math.floor((new Date(targetTime).getTime() - Date.now()) / 1000));
+      const diff = Math.max(0, Math.floor((new Date(targetTime).getTime() - getNow()) / 1000));
       setRemaining(diff);
       if (diff <= 0) clearInterval(interval);
     }, 1000);
     return () => clearInterval(interval);
-  }, [targetTime]);
+  }, [targetTime, serverTimeOffset]);
 
   if (remaining <= 0) {
     return (

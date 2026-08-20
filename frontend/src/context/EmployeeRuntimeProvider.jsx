@@ -58,6 +58,7 @@ export function EmployeeRuntimeProvider({ children }) {
   const [isJobsLoading, setIsJobsLoading] = useState(false);
   const [isCompletedLoading, setIsCompletedLoading] = useState(false);
   const [jobsError, setJobsError] = useState(null);
+  const [serverTimeOffset, setServerTimeOffset] = useState(0);
 
   // Sequence versioning to prevent out-of-order stale responses
   const fetchGenerationRef = useRef(0);
@@ -165,6 +166,15 @@ export function EmployeeRuntimeProvider({ children }) {
 
           if (Array.isArray(jobsData)) {
             setActiveJobs(jobsData);
+
+            // Synchronize server-time offset
+            const serverTimeStr = jobsData[0]?.server_time || jobsData[0]?.active_offer?.server_time;
+            if (serverTimeStr) {
+              const sTime = Date.parse(serverTimeStr);
+              if (!isNaN(sTime)) {
+                setServerTimeOffset(sTime - Date.now());
+              }
+            }
 
             // Seed initial offer IDs so historical offers do not trigger browser alerts
             const currentOffer = jobsData.find(
@@ -491,6 +501,8 @@ export function EmployeeRuntimeProvider({ children }) {
       jobsError,
       refreshActiveJobs,
       refreshCompletedJobs,
+      serverTimeOffset,
+      getServerTimeNow: () => Date.now() + (serverTimeOffset || 0),
 
       // Location & Presence State Machine
       presenceState,

@@ -229,7 +229,7 @@ export function Sidebar({ onCloseMobile = () => {} }) {
                 className={navItemClass}
               >
                 <FileText className="w-3.5 h-3.5 text-blue-600" />
-                <span>Registration Wizard</span>
+                <span>{statusText}</span>
               </NavLink>
               <NavLink
                 to="/workforce/employee/profile"

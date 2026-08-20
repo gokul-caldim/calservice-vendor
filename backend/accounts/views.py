@@ -12,6 +12,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .authentication import set_auth_cookies
 from employees.models import Employee
+from workforce_api.services.registration import get_employee_registration_status
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -196,6 +197,8 @@ class LoginView(APIView):
                 identifier, lookup_type, matched_user_id, matched_user_active, password_check, db_status, response_code, response_code_name
             )
 
+            reg_status = get_employee_registration_status(emp or user)
+
             response = Response({
                 "message": "Login successful.",
                 "access_token": access_token_str,
@@ -212,6 +215,7 @@ class LoginView(APIView):
                     "company_name": company_name,
                     "is_superuser": getattr(user, "is_superuser", False),
                     "employee_id": getattr(emp, "employee_id", None) if emp else None,
+                    "registration_status": reg_status,
                 }
             }, status=response_code)
 
@@ -340,6 +344,8 @@ class MeView(APIView):
             if emp and user_role not in ["admin", "manager"]:
                 user_role = "employee"
 
+            reg_status = get_employee_registration_status(emp or user)
+
             return Response({
                 "id": user.id,
                 "username": user.username,
@@ -351,6 +357,7 @@ class MeView(APIView):
                 "company_name": company_name,
                 "is_superuser": getattr(user, "is_superuser", False),
                 "employee_id": getattr(emp, "employee_id", None) if emp else None,
+                "registration_status": reg_status,
             }, status=status.HTTP_200_OK)
         except (OperationalError, DatabaseError) as db_err:
             logger.error("Database error in MeView: %s", str(db_err), exc_info=True)

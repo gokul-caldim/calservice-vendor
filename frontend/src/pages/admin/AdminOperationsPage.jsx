@@ -16,6 +16,7 @@ import {
   apiGetAdminApplications,
   apiGetEligibleTechnicians,
   apiTriggerAutoDispatch,
+  apiDispatchAssign,
   apiGetWorkforceJobs,
   apiGetFleetMap,
   apiGetAdminPendingServices,
@@ -422,6 +423,8 @@ export function AdminOperationsPage() {
 
   const [jobs, setJobs] = useState([]);
   const [selectedJob, setSelectedJob] = useState(null);
+  const [selectedBand, setSelectedBand] = useState('all');
+  const [candidatesLoading, setCandidatesLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('dispatch');
   const [isLoading, setIsLoading] = useState(true);
   const [dispatchLoading, setDispatchLoading] = useState(false);
@@ -430,14 +433,27 @@ export function AdminOperationsPage() {
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [timelineData, setTimelineData] = useState(null);
 
+  const fetchCandidatesForJob = async (job) => {
+    if (!job) return;
+    try {
+      setCandidatesLoading(true);
+      const res = await apiGetEligibleTechnicians(job.id, job.service_category || job.issue_title, 20.0);
+      const list = Array.isArray(res) ? res : res?.candidates || res?.results || [];
+      setEligibleFleet(list);
+    } catch (_) {
+      setEligibleFleet([]);
+    } finally {
+      setCandidatesLoading(false);
+    }
+  };
+
   const loadData = async () => {
     try {
       setIsLoading(true);
-      const [techs, jobsList, eligible, locsData, fleetData, pendingSvcData, pendingExtData] =
+      const [techs, jobsList, locsData, fleetData, pendingSvcData, pendingExtData] =
         await Promise.all([
           apiGetAdminApplications('approved').catch(() => []),
           apiGetWorkforceJobs().catch(() => []),
-          apiGetEligibleTechnicians().catch(() => []),
           apiGetLocations().catch(() => []),
           apiGetFleetMap().catch(() => []),
           apiGetAdminPendingServices().catch(() => []),
@@ -445,16 +461,18 @@ export function AdminOperationsPage() {
         ]);
 
       const safe = (d) => (Array.isArray(d) ? d : d?.results || []);
+      const jobsArr = safe(jobsList);
       setTechnicians(safe(techs));
-      setJobs(safe(jobsList));
-      setEligibleFleet(safe(eligible));
+      setJobs(jobsArr);
       setLocations(safe(locsData));
       setFleetMap(safe(fleetData));
       setPendingServices(safe(pendingSvcData));
       setPendingExtensions(safe(pendingExtData));
 
-      if (safe(jobsList).length > 0 && !selectedJob) {
-        setSelectedJob(safe(jobsList)[0]);
+      if (jobsArr.length > 0 && !selectedJob) {
+        const initialJob = jobsArr[0];
+        setSelectedJob(initialJob);
+        fetchCandidatesForJob(initialJob);
       }
     } catch (_) {
     } finally {
@@ -474,6 +492,12 @@ export function AdminOperationsPage() {
     fetchedRef.current = true;
     loadData();
   }, []);
+
+  useEffect(() => {
+    if (selectedJob?.id) {
+      fetchCandidatesForJob(selectedJob);
+    }
+  }, [selectedJob?.id]);
 
   // ── Fleet Map: auto-refresh every 60s when tab is visible ──────────────────
   useEffect(() => {
@@ -498,6 +522,22 @@ export function AdminOperationsPage() {
       setTimeout(() => setStatusMsg({ type: '', text: '' }), 4000);
     } catch (err) {
       setStatusMsg({ type: 'error', text: err.message || 'Auto dispatch failed.' });
+    } finally {
+      setDispatchLoading(false);
+    }
+  };
+
+  const handleDispatchToTechnician = async (employeeId) => {
+    if (!selectedJob || !employeeId) return;
+    try {
+      setDispatchLoading(true);
+      setStatusMsg({ type: '', text: '' });
+      const res = await apiDispatchAssign(selectedJob.id, employeeId);
+      setStatusMsg({ type: 'success', text: res.message || 'Job offer dispatched to technician.' });
+      await loadData();
+      setTimeout(() => setStatusMsg({ type: '', text: '' }), 4000);
+    } catch (err) {
+      setStatusMsg({ type: 'error', text: err.message || 'Dispatch assignment failed.' });
     } finally {
       setDispatchLoading(false);
     }
@@ -782,13 +822,49 @@ export function AdminOperationsPage() {
                   <div className="p-3 bg-emerald-50/70 border-b border-emerald-200/60 text-[11px] text-emerald-900 flex items-start gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                     <div>
-                      <span className="font-bold">Autonomous Dispatch Active:</span> Jobs are automatically assigned to nearest eligible technicians using the <strong>9-Gate Employee Eligibility Engine</strong> (real-time browser GPS &le; 300s freshness window, Haversine proximity, skill match, and shift clock-in state). Zero manual dispatch required.
+                      <span className="font-bold">20 KM Geographic Dispatch Active:</span> Fallback search evaluates candidates across a <strong>true 20 km circular radius</strong> in all 360° directions using authoritative geodesic Haversine calculation and 9-Gate qualification.
                     </div>
                   </div>
 
+                  {/* 20 KM Distance Bands Classification Tabs */}
+                  <div className="flex items-center gap-1.5 overflow-x-auto py-1.5 px-3 bg-slate-100/80 border-b border-slate-200 text-xs">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider shrink-0 mr-1">
+                      Distance Rings:
+                    </span>
+                    {[
+                      { id: 'all', label: `All 20km (${eligibleFleet.length})` },
+                      { id: '0-1km', label: '0–1 km' },
+                      { id: '1-2km', label: '1–2 km' },
+                      { id: '2-5km', label: '2–5 km' },
+                      { id: '5-10km', label: '5–10 km' },
+                      { id: '10-15km', label: '10–15 km' },
+                      { id: '15-20km', label: '15–20 km' },
+                    ].map((b) => (
+                      <button
+                        key={b.id}
+                        type="button"
+                        onClick={() => setSelectedBand(b.id)}
+                        className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors shrink-0 ${
+                          selectedBand === b.id
+                            ? 'bg-blue-600 text-white font-bold shadow-sm'
+                            : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-300'
+                        }`}
+                      >
+                        {b.label}
+                      </button>
+                    ))}
+                  </div>
+
                   <div className="divide-y divide-slate-100 max-h-[460px] overflow-y-auto">
-                    {eligibleFleet.length > 0 ? (
-                      eligibleFleet.map((tech) => (
+                    {candidatesLoading ? (
+                      <div className="p-12 text-center text-xs text-slate-500 flex items-center justify-center gap-2">
+                        <Loader className="w-4 h-4 animate-spin text-blue-600" />
+                        Scanning 20 km candidate pool across all directions...
+                      </div>
+                    ) : eligibleFleet.filter((tech) => selectedBand === 'all' || tech.distance_band === selectedBand).length > 0 ? (
+                      eligibleFleet
+                        .filter((tech) => selectedBand === 'all' || tech.distance_band === selectedBand)
+                        .map((tech) => (
                         <div
                           key={tech.id}
                           className={`p-3.5 space-y-2 hover:bg-slate-50 transition-colors ${
@@ -822,6 +898,11 @@ export function AdminOperationsPage() {
                                       GPS: {tech.gps_freshness} {tech.gps_age_seconds != null ? `(${tech.gps_age_seconds}s)` : ''}
                                     </span>
                                   )}
+                                  {tech.distance_band && tech.distance_band !== 'unknown' && (
+                                    <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200 text-[10px] font-mono font-semibold">
+                                      Ring: {tech.distance_band}
+                                    </span>
+                                  )}
                                   {tech.is_dispatch_ready && tech.score != null && (
                                     <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-900 text-[10px] font-bold">
                                       Match Score: {tech.score}
@@ -849,6 +930,17 @@ export function AdminOperationsPage() {
                               }`}>
                                 {tech.is_dispatch_ready ? '✓ Qualified Candidate' : tech.ineligibility_reason || 'Ineligible'}
                               </span>
+                              {tech.is_dispatch_ready && selectedJob && !['completed', 'cancelled'].includes(selectedJob.status) && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleDispatchToTechnician(tech.id)}
+                                  disabled={dispatchLoading}
+                                  className="mt-1 px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold rounded text-[11px] inline-flex items-center gap-1 shadow-sm transition-colors"
+                                >
+                                  <Send className="w-3 h-3" />
+                                  Dispatch Offer
+                                </button>
+                              )}
                             </div>
                           </div>
 
@@ -878,7 +970,9 @@ export function AdminOperationsPage() {
                       ))
                     ) : (
                       <div className="p-12 text-center text-xs text-slate-500">
-                        No online qualified technicians currently within operational radius for this service request.
+                        {selectedBand === 'all'
+                          ? 'No qualified technicians currently found within the 20 km operational radius for this service request.'
+                          : `No qualified technicians currently found in the ${selectedBand} distance ring.`}
                       </div>
                     )}
                   </div>

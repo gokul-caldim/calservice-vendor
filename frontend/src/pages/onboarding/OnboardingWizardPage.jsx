@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Navigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthProvider.jsx';
 import { AppShell } from '../../components/common/AppShell.jsx';
 
@@ -44,14 +44,28 @@ export function OnboardingWizardPage() {
   const { user, registrationStatus, refreshProfile } = useAuth();
   const navigate = useNavigate();
 
+  const normalizedStatus = (registrationStatus || 'not_started').toLowerCase();
+
+  // Defensive secondary guard: The wizard is strictly for incomplete/draft registrations
+  if (normalizedStatus === 'approved') {
+    return <Navigate to="/workforce/employee/profile" replace />;
+  }
+  if (normalizedStatus === 'submitted' || normalizedStatus === 'under_review') {
+    return <Navigate to="/workforce/onboarding/pending-review" replace />;
+  }
+  if (normalizedStatus === 'correction_required') {
+    return <Navigate to="/workforce/onboarding/corrections" replace />;
+  }
+  if (normalizedStatus === 'rejected') {
+    return <Navigate to="/workforce/onboarding/rejected" replace />;
+  }
+
   const [currentStep, setCurrentStep] = useState(1);
   const [catalog, setCatalog] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
-
-  const isLocked = ['approved', 'submitted', 'under_review'].includes(registrationStatus);
 
   // Form State
   const [formData, setFormData] = useState({
@@ -307,30 +321,6 @@ export function OnboardingWizardPage() {
   return (
     <AppShell breadcrumbs={[{ label: 'Registration Wizard' }]}>
       <div className="max-w-3xl mx-auto space-y-4">
-        {/* Status Banner when Locked */}
-        {isLocked && (
-          <div className="bg-white border border-slate-200 rounded p-3.5 shadow-sm flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5">
-              <div className={`p-1.5 rounded border ${registrationStatus === 'approved' ? 'bg-emerald-50 border-emerald-200 text-emerald-600' : 'bg-amber-50 border-amber-200 text-amber-600'}`}>
-                <Lock className="w-4 h-4" />
-              </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                    Employee Registration Status
-                  </h2>
-                  <StatusBadge status={registrationStatus} />
-                </div>
-                <p className="text-[11px] text-slate-500 mt-0.5">
-                  {registrationStatus === 'approved'
-                    ? 'Your registration application is fully approved. All identity, trade, and bank details are verified and active.'
-                    : 'Your registration application is lodged and pending Admin verification.'}
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
-
         {/* Step Indicator Bar (Desktop & Mobile) */}
         <div className="bg-white border border-slate-200 rounded p-3 shadow-sm">
           <div className="flex items-center justify-between sm:hidden mb-2">

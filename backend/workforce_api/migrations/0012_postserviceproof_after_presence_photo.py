@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('workforce_api', '0009_jobpayment_paymentcollectionevent_and_more'),
+        ('workforce_api', '0011_alter_workforcejoboffer_status_and_more'),
     ]
 
     operations = [
