@@ -12,8 +12,8 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Load .env file
-load_dotenv(BASE_DIR / ".env")
+# Load .env file with override=True to guarantee local .env takes precedence over inherited shell env vars
+load_dotenv(BASE_DIR / ".env", override=True)
 
 _raw_secret = os.getenv("SECRET_KEY") or os.getenv("DJANGO_SECRET_KEY")
 DEBUG = (os.getenv("DEBUG") or os.getenv("DJANGO_DEBUG") or "True").lower() in ("true", "1", "t")
@@ -116,10 +116,11 @@ if USE_POSTGRES:
             "USER": os.getenv("DB_USER", "postgres"),
             "PASSWORD": os.getenv("DB_PASSWORD", ""),
             "HOST": os.getenv("DB_HOST", "localhost"),
-            "PORT": os.getenv("DB_PORT", "5432"),
+            "PORT": os.getenv("DB_PORT", "6543"),
             "OPTIONS": _db_options,
             "CONN_MAX_AGE": int(os.getenv("DB_CONN_MAX_AGE", "0")),
             "CONN_HEALTH_CHECKS": True,
+            "DISABLE_SERVER_SIDE_CURSORS": True,
         }
     }
 else:

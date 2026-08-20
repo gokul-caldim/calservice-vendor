@@ -190,6 +190,7 @@ class ServiceRequest(models.Model):
     payment_collected_by_name = models.CharField(max_length=200, blank=True, default="")
     collection_method = models.CharField(max_length=50, blank=True, default="")
     collection_reference = models.CharField(max_length=100, blank=True, default="")
+    service_zone_name_snapshot = models.CharField(max_length=200, blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

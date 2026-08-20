@@ -29,7 +29,8 @@ class CookieJWTAuthentication(JWTAuthentication):
                 except (OperationalError, DatabaseError):
                     raise ServiceUnavailableException()
                 except Exception:
-                    pass
+                    # Explicit Bearer token provided but invalid/expired; do NOT fall back to cookies
+                    return None
 
         cookie_token = request.COOKIES.get(settings.AUTH_COOKIE)
         if cookie_token:

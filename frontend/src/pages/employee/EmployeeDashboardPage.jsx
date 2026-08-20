@@ -41,8 +41,8 @@ import { Modal } from '../../components/enterprise/Modal.jsx';
 import { LiveCameraCaptureModal } from '../../components/common/LiveCameraCaptureModal.jsx';
 import { classifyApiError } from '../../utils/apiErrorHandler.js';
 import { getEmployeeJobPresentation } from '../../utils/jobPresentation.js';
-import { useLocationTracker, getGPSPosition } from '../../hooks/useGPSPosition.js';
-import { useRealtimeStream } from '../../hooks/useRealtimeStream.js';
+import { useEmployeeRuntime, ACTIVE_QUEUE_STATUSES } from '../../context/EmployeeRuntimeContext.jsx';
+import { getGPSPosition } from '../../hooks/useGPSPosition.js';
 import { apiUpdateLocationFull } from '../../api/workforceService.js';
 import {
   Wrench,
@@ -86,21 +86,22 @@ import {
 /**
  * Real-time Countdown Badge for Offer Expiration & 5-Minute Cancellation Window
  */
-function CountdownBadge({ targetTime, prefix = '', expiredText = 'Expired', tone = 'amber' }) {
+function CountdownBadge({ targetTime, serverTimeOffset = 0, prefix = '', expiredText = 'Expired', tone = 'amber' }) {
+  const getNow = () => Date.now() + (serverTimeOffset || 0);
   const [remaining, setRemaining] = useState(() => {
     if (!targetTime) return 0;
-    return Math.max(0, Math.floor((new Date(targetTime).getTime() - Date.now()) / 1000));
+    return Math.max(0, Math.floor((new Date(targetTime).getTime() - getNow()) / 1000));
   });
 
   useEffect(() => {
     if (!targetTime) return;
     const interval = setInterval(() => {
-      const diff = Math.max(0, Math.floor((new Date(targetTime).getTime() - Date.now()) / 1000));
+      const diff = Math.max(0, Math.floor((new Date(targetTime).getTime() - getNow()) / 1000));
       setRemaining(diff);
       if (diff <= 0) clearInterval(interval);
     }, 1000);
     return () => clearInterval(interval);
-  }, [targetTime]);
+  }, [targetTime, serverTimeOffset]);
 
   if (remaining <= 0) {
     return (
@@ -130,17 +131,35 @@ function CountdownBadge({ targetTime, prefix = '', expiredText = 'Expired', tone
 
 export function EmployeeDashboardPage() {
   const { user, employee, togglePresence, logout, isAuthenticated } = useAuth();
+  const {
+    activeJobs,
+    completedJobs,
+    selectedJob,
+    setSelectedJob,
+    incomingOffer,
+    hasActiveJob,
+    isJobsLoading: isRuntimeJobsLoading,
+    refreshActiveJobs,
+    refreshCompletedJobs,
+    liveLocation,
+  } = useEmployeeRuntime();
+
   const location = useLocation();
   const pathname = location.pathname;
   const hash = location.hash;
 
-  const [jobs, setJobs] = useState([]);
-  const [allJobs, setAllJobs] = useState([]);
   const [jobQueueTab, setJobQueueTab] = useState('active'); // 'active' | 'completed' | 'all'
   const [profile, setProfile] = useState(null);
   const [timeTracking, setTimeTracking] = useState(null);
   const [skills, setSkills] = useState([]);
   const [selectedServiceIds, setSelectedServiceIds] = useState([]);
+
+  // Fetch completed jobs lazily when user opens completed or all tab
+  useEffect(() => {
+    if (jobQueueTab === 'completed' || jobQueueTab === 'all') {
+      refreshCompletedJobs({ silent: true });
+    }
+  }, [jobQueueTab, refreshCompletedJobs]);
 
   // Decline Offer Modal State
   const [declineModalJob, setDeclineModalJob] = useState(null);
@@ -155,53 +174,17 @@ export function EmployeeDashboardPage() {
   const [customCancelReason, setCustomCancelReason] = useState('');
   const [isCancellingJob, setIsCancellingJob] = useState(false);
 
-  // Canonical Active Queue Statuses matching backend ServiceRequest.Status
-  const ACTIVE_QUEUE_STATUSES = [
-    'assigned',
-    'accepted',
-    'on_the_way',
-    'en_route',
-    'arrived',
-    'in_progress',
-    'proof_submitted',
-  ];
+  const allJobs = useMemo(() => {
+    const map = new Map();
+    activeJobs.forEach((j) => map.set(j.id, j));
+    completedJobs.forEach((j) => map.set(j.id, j));
+    return Array.from(map.values());
+  }, [activeJobs, completedJobs]);
 
-  // Single Active Job Invariant: Active states
-  const activeJobs = useMemo(() => {
-    return allJobs.filter((j) => {
-      const st = (j.status || j.job_status || '').toLowerCase();
-      const isOffer = (j.is_offer || j.active_offer?.status === 'OFFERED') && !j.active_offer?.is_expired;
-      const isCompletedOrCancelled = st === 'completed' || st === 'cancelled' || st === 'unable_to_complete';
-      return !isCompletedOrCancelled && (
-        ACTIVE_QUEUE_STATUSES.includes(st) ||
-        isOffer ||
-        j.is_assigned_to_current_employee
-      );
-    });
-  }, [allJobs]);
-
-  const hasActiveJob = useMemo(() => {
-    return activeJobs.some((j) => {
-      const st = (j.status || j.job_status || '').toLowerCase();
-      return ACTIVE_QUEUE_STATUSES.includes(st) || j.is_assigned_to_current_employee;
-    });
-  }, [activeJobs]);
-
-  // While technician is working: NO NEW JOB OFFERS SHOULD APPEAR
+  // While technician is working on an active assignment: NO NEW JOB OFFERS SHOULD APPEAR
   const incomingOffers = useMemo(() => {
-    return hasActiveJob
-      ? []
-      : allJobs.filter(
-        (j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired
-      );
-  }, [hasActiveJob, allJobs]);
-
-  const completedJobs = useMemo(() => {
-    return allJobs.filter((j) => {
-      const st = (j.status || '').toLowerCase();
-      return st === 'completed' || st === 'cancelled';
-    });
-  }, [allJobs]);
+    return hasActiveJob || !incomingOffer ? [] : [incomingOffer];
+  }, [hasActiveJob, incomingOffer]);
 
   const displayedJobs = useMemo(() => {
     if (jobQueueTab === 'completed') return completedJobs;
@@ -241,8 +224,7 @@ export function EmployeeDashboardPage() {
     }
   }, [successMsg]);
 
-  // Selected job for detailed inspection workspace
-  const [selectedJob, setSelectedJob] = useState(null);
+  // Selected job presentation for detailed inspection workspace
   const selectedPresentation = useMemo(() => {
     return selectedJob ? getEmployeeJobPresentation(selectedJob) : null;
   }, [selectedJob]);
@@ -281,85 +263,17 @@ export function EmployeeDashboardPage() {
   });
   const [otpInput, setOtpInput] = useState('');
 
-  // ── Live GPS Tracking ────────────────────────────────────────────────────────
-  // Single continuous browser GPS watcher managed via useLocationTracker.
-  // Pushes real browser GPS to /workforce/presence/location/ (User.last_known_location).
-  // Stable ref so handleGPSPosition can read selectedJob without being re-created on every job change
-  const selectedJobRef = useRef(null);
-  // loadDashboard ref so GPS callback can call it without stale closure
-  const loadDashboardRef = useRef(null);
-
-  const handleGPSPosition = useCallback(
-    async ({ latitude, longitude, accuracy, speed, heading, captured_at }) => {
-      setGpsErrorState(null);
-      const newLoc = {
-        latitude,
-        longitude,
-        accuracy,
-        speed,
-        heading,
-        captured_at,
-        updated_at: new Date().toISOString(),
-      };
-      setCurrentLocation(newLoc);
-      window.dispatchEvent(
-        new CustomEvent('workforce:location-updated', {
-          detail: newLoc,
-        })
-      );
-      try {
-        const res = await apiUpdateLocationFull(latitude, longitude, accuracy, speed, heading, captured_at);
-        // Check if automatic arrival was triggered by this GPS fix
-        const currentJob = selectedJobRef.current;
-        if (res?.arrived_events?.length > 0 && currentJob) {
-          const thisArrived = res.arrived_events.find((e) => e.job_id === currentJob.id);
-          if (thisArrived) {
-            setPreServiceState((prev) => ({ ...prev, geofence_passed: true }));
-            setSelectedJob((prev) => (prev ? { ...prev, status: 'arrived' } : prev));
-            setSuccessMsg('Arrival Verified Automatically! Customer Work Start OTP is ready.');
-            if (loadDashboardRef.current) loadDashboardRef.current();
-          }
-        }
-      } catch (_) {
-        // Silent — GPS update failure should not disrupt the employee dashboard UI
-      }
-    },
-    // Stable empty deps — reads selectedJob via ref to avoid GPS watcher churn
-    [],
-  );
-
-  const handleGPSError = useCallback((err) => {
-    setGpsErrorState(err);
-  }, []);
-
-  useLocationTracker(isOnline, handleGPSPosition, handleGPSError);
-
-  // Automatic initial location resolution on dashboard mount
+  // ── Automatic Geofence Arrival Event Listener (Telemetry handled by EmployeeRuntimeProvider) ──
   useEffect(() => {
-    let isCancelled = false;
-    (async () => {
-      try {
-        const pos = await getGPSPosition(false);
-        if (!isCancelled && pos?.coords) {
-          const { latitude, longitude, accuracy, speed, heading } = pos.coords;
-          const captured_at = new Date(pos.timestamp || Date.now()).toISOString();
-          const initLoc = {
-            latitude,
-            longitude,
-            accuracy,
-            speed,
-            heading,
-            captured_at,
-            updated_at: new Date().toISOString(),
-          };
-          setCurrentLocation(initLoc);
-          apiUpdateLocationFull(latitude, longitude, accuracy, speed, heading, captured_at).catch(() => { });
-        }
-      } catch (_) { }
-    })();
-    return () => { isCancelled = true; };
-  }, []);
-  // ────────────────────────────────────────────────────────────────────────────────
+    const handleLocationUpdate = (e) => {
+      const payload = e.detail;
+      if (payload && selectedJob?.status === 'on_the_way') {
+        // Realtime arrival events handled by EmployeeRuntimeProvider SSE
+      }
+    };
+    window.addEventListener('workforce:location-updated', handleLocationUpdate);
+    return () => window.removeEventListener('workforce:location-updated', handleLocationUpdate);
+  }, [selectedJob?.status]);
 
   // Payment & Cash Collection State
   const [cashModalJob, setCashModalJob] = useState(null);
@@ -615,118 +529,32 @@ export function EmployeeDashboardPage() {
     const isSilent = options?.silent === true;
     try {
       if (!isSilent) setIsLoading(true);
-      const [jobsData, timeData, profileData] = await Promise.all([
-        apiGetWorkforceJobs('all').catch(() => null),
+      const [timeData, profileData] = await Promise.all([
         apiGetTimeTracking().catch(() => null),
         apiGetOnboardingProfile().catch(() => null),
+        refreshActiveJobs(options),
       ]);
-      if (jobsData) {
-        console.info(`[Jobs API] total=${jobsData.length}`);
-        jobsData.forEach((j) => {
-          console.info(`[Jobs API] id=${j.id} request_id=${j.request_id || ''} status=${j.status || j.job_status} is_assigned_to_current_employee=${Boolean(j.is_assigned_to_current_employee)} is_offer=${Boolean(j.is_offer)}`);
-        });
-
-        setAllJobs(jobsData);
-        setJobs(jobsData);
-
-        // Smart reconciliation of selectedJob without jumping or resetting selection:
-        setSelectedJob((prev) => {
-          if (!prev) {
-            // Find incoming offer first
-            const incoming = jobsData.find((j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired);
-            if (incoming) return incoming;
-            // Otherwise find active assignment
-            const active = jobsData.find((j) =>
-              ['assigned', 'accepted', 'on_the_way', 'en_route', 'arrived', 'in_progress', 'proof_submitted'].includes((j.status || j.job_status || '').toLowerCase())
-            );
-            return active || jobsData[0] || null;
-          }
-          // Update selected job with latest authoritative data from server without resetting selection
-          const updated = jobsData.find((j) => j.id === prev.id);
-          return updated || prev;
-        });
-
-        // Browser notification for new exclusive offer if arriving silently
-        const offeredJob = jobsData.find((j) => j.active_offer?.status === 'OFFERED' && !j.active_offer?.is_expired);
-        if (offeredJob && typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
-          try {
-            new Notification('⚡ New Exclusive Job Offer!', {
-              body: `Job #${offeredJob.request_id || offeredJob.id}: ${offeredJob.service_title || offeredJob.service_category}. Accept within 5 minutes.`,
-              icon: '/favicon.ico',
-            });
-          } catch (_) { }
-        }
-      }
       if (profileData) setProfile(profileData);
       if (timeData) setTimeTracking(timeData);
     } catch (_) {
     } finally {
       if (!isSilent) setIsLoading(false);
     }
-  }, []);
+  }, [refreshActiveJobs]);
 
   // Initial dashboard load on mount
   useEffect(() => {
     loadDashboard();
   }, [loadDashboard]);
 
-  // Keep refs in sync so GPS callback can read fresh values without recreating the callback
+  // Fetch module specific data depending on active path
   useEffect(() => {
-    selectedJobRef.current = selectedJob;
-  }, [selectedJob]);
-
-  useEffect(() => {
-    loadDashboardRef.current = loadDashboard;
-  }, [loadDashboard]);
-
-  // Request browser notification permission when employee is online
-  useEffect(() => {
-    if (isOnline && typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
-      Notification.requestPermission().catch(() => { });
+    if (pathname.includes('/services') || pathname.includes('/documents')) {
+      apiGetMySkills().then(setSkills).catch(() => setSkills([]));
+      apiGetCatalog().then(setCatalogCategories).catch(() => setCatalogCategories([]));
+      apiGetOnboardingProfile().then(setProfile).catch(() => { });
     }
-  }, [isOnline]);
-
-  // Realtime Event Stream Integration (SSE): instantaneous reactive job updates
-  const handleRealtimeEvent = useCallback((eventData) => {
-    if (['OFFER_CREATED', 'JOB_OFFER', 'JOB_ASSIGNED', 'ARRIVAL_DETECTED', 'JOB_COMPLETED', 'JOB_LOCATION_UPDATE', 'STATUS_CHANGE'].includes(eventData.event_type)) {
-      loadDashboard({ silent: true });
-    }
-  }, [loadDashboard]);
-
-  const handleRealtimeReconcile = useCallback(() => {
-    loadDashboard({ silent: true });
-  }, [loadDashboard]);
-
-  const handleRealtimeAuthFailure = useCallback(() => {
-    logout();
-  }, [logout]);
-
-  useRealtimeStream({
-    enabled: Boolean(isOnline && isAuthenticated),
-    onEvent: handleRealtimeEvent,
-    onReconcile: handleRealtimeReconcile,
-    onAuthFailure: handleRealtimeAuthFailure,
-  });
-
-  // Single silent background safety-net polling when technician is ONLINE (12s interval)
-  useEffect(() => {
-    if (!isOnline) return;
-    const interval = setInterval(() => {
-      loadDashboard({ silent: true });
-    }, 12000);
-    return () => clearInterval(interval);
-  }, [isOnline, loadDashboard]);
-
-
-
-    // Fetch module specific data depending on active path
-    useEffect(() => {
-      if (pathname.includes('/services') || pathname.includes('/documents')) {
-        apiGetMySkills().then(setSkills).catch(() => setSkills([]));
-        apiGetCatalog().then(setCatalogCategories).catch(() => setCatalogCategories([]));
-        apiGetOnboardingProfile().then(setProfile).catch(() => { });
-      }
-    }, [pathname]);
+  }, [pathname]);
 
     const handleRequestService = async (serviceId, name) => {
       try {
@@ -937,16 +765,14 @@ export function EmployeeDashboardPage() {
         if (err.status === 409 || err.code === 'JOB_ALREADY_ACCEPTED') {
           setError('Job No Longer Available: This job was already accepted by another technician.');
           // Remove offer from view immediately
-          setAllJobs((prev) => prev.filter((j) => j.id !== jobId));
-          setJobs((prev) => prev.filter((j) => j.id !== jobId));
           setSelectedJob((prev) => (prev?.id === jobId ? null : prev));
+          refreshActiveJobs({ force: true });
         } else if (err.status === 409 || err.code === 'EMPLOYEE_ALREADY_BUSY') {
           setError('Cannot accept offer: You already have an active job in progress.');
         } else if (err.status === 409 || err.code === 'OFFER_EXPIRED') {
           setError('This job offer has expired.');
-          setAllJobs((prev) => prev.filter((j) => j.id !== jobId));
-          setJobs((prev) => prev.filter((j) => j.id !== jobId));
           setSelectedJob((prev) => (prev?.id === jobId ? null : prev));
+          refreshActiveJobs({ force: true });
         } else if (err.status === 403 || err.code === 'CROSS_TENANT_FORBIDDEN') {
           setError('Unauthorized: Cross-company access forbidden.');
         } else {
@@ -977,9 +803,8 @@ export function EmployeeDashboardPage() {
         setActionLoading(decliningId);
         await apiRejectJobOffer(decliningId, finalReason);
         setDeclineModalJob(null);
-        setAllJobs((prev) => prev.filter((j) => j.id !== decliningId));
-        setJobs((prev) => prev.filter((j) => j.id !== decliningId));
         setSelectedJob((prev) => (prev?.id === decliningId ? null : prev));
+        refreshActiveJobs({ force: true });
         setSuccessMsg('Job offer declined.');
         await loadDashboard();
         setTimeout(() => setSuccessMsg(''), 4000);

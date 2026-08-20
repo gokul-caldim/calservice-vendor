@@ -393,10 +393,11 @@ export async function apiRejectApplication(applicationId, reason = '') {
 
 // ── Admin Dynamic Dispatch & Matching (Phase 14) ──────────────────────────────
 
-export async function apiGetEligibleTechnicians(jobId = '', serviceName = '') {
+export async function apiGetEligibleTechnicians(jobId = '', serviceName = '', radiusKm = 20.0) {
   const params = new URLSearchParams();
   if (jobId) params.set('job_id', jobId);
   if (serviceName) params.set('service', serviceName);
+  if (radiusKm) params.set('radius_km', radiusKm);
   return await apiRequest(`/workforce/dispatch/eligible-technicians/?${params.toString()}`);
 }
 

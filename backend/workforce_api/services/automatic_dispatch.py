@@ -25,16 +25,29 @@ from workforce_api.models import (
     WorkforceEmployeeCompliance,
     WorkforceEmployeeSchedule,
 )
-from time_tracking.geo import haversine_distance
+from workforce_api.services.geo_spatial import (
+    ADMIN_DISPATCH_RADIUS_KM,
+    MAX_GPS_AGE_SECONDS,
+    DISTANCE_TOLERANCE_KM,
+    calculate_distance_km,
+    calculate_distance_meters,
+    get_spatial_bounding_box,
+    get_distance_band,
+    is_within_radius,
+    validate_coordinates,
+)
 from workforce_api.services.workload import get_employee_active_job, ACTIVE_WORKLOAD_STATUSES
 
 logger = logging.getLogger("workforce.dispatch")
 
-# Strict GPS telemetry freshness requirement (2 minutes maximum age for live dispatch)
-MAX_GPS_AGE_SECONDS = 120
+# Backward compatibility alias
+haversine_distance = calculate_distance_meters
 
-# Maximum geographic dispatch radius (50 km)
-MAX_DISPATCH_RADIUS_KM = 50.0
+# Maximum geographic dispatch radius (5.0 km) & Distance Bands / Rings
+MAX_DISPATCH_RADIUS_KM = 5.0
+RING_1_MAX_KM = 1.0
+RING_2_MAX_KM = 2.0
+RING_3_MAX_KM = 5.0
 
 # Default job offer duration before auto-expiry and fallback
 DEFAULT_OFFER_DURATION_MINUTES = 5
@@ -145,12 +158,17 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
 
     # ── Gate 3: Required Documents Approved ───────────────────────────────────
     if emp and getattr(emp, "company_id", None):
-        from workforce_api.models import WorkforceRequiredDocument, WorkforceEmployeeDocument
-        mandatory_doc_reqs = WorkforceRequiredDocument.objects.filter(company_id=emp.company_id, is_mandatory=True)
-        if mandatory_doc_reqs.exists():
+        if hasattr(emp, "prefetched_mandatory_doc_reqs"):
+            mandatory_doc_reqs = emp.prefetched_mandatory_doc_reqs
+        else:
+            from workforce_api.models import WorkforceRequiredDocument
+            mandatory_doc_reqs = list(WorkforceRequiredDocument.objects.filter(company_id=emp.company_id, is_mandatory=True))
+
+        if mandatory_doc_reqs:
             if hasattr(emp, "prefetched_employee_documents"):
                 emp_docs_map = {d.requirement_id: d for d in emp.prefetched_employee_documents}
             else:
+                from workforce_api.models import WorkforceEmployeeDocument
                 emp_docs_map = {
                     d.requirement_id: d
                     for d in WorkforceEmployeeDocument.objects.filter(employee=emp, requirement__in=mandatory_doc_reqs)
@@ -182,11 +200,18 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
 
     # ── Gate 4: Mandatory Compliance Valid ────────────────────────────────────
     if emp and getattr(emp, "company_id", None):
-        from workforce_api.models import WorkforceComplianceRequirement
-        mandatory_comp_reqs = WorkforceComplianceRequirement.objects.filter(company_id=emp.company_id, is_mandatory=True)
-        if mandatory_comp_reqs.exists():
+        if hasattr(emp, "prefetched_mandatory_comp_reqs"):
+            mandatory_comp_reqs = emp.prefetched_mandatory_comp_reqs
+        else:
+            from workforce_api.models import WorkforceComplianceRequirement
+            mandatory_comp_reqs = list(WorkforceComplianceRequirement.objects.filter(company_id=emp.company_id, is_mandatory=True))
+
+        if mandatory_comp_reqs:
             today = timezone.now().date()
-            emp_comp_records = list(WorkforceEmployeeCompliance.objects.filter(employee=emp, requirement__in=mandatory_comp_reqs))
+            if hasattr(emp, "prefetched_compliance_records"):
+                emp_comp_records = emp.prefetched_compliance_records
+            else:
+                emp_comp_records = list(WorkforceEmployeeCompliance.objects.filter(employee=emp, requirement__in=mandatory_comp_reqs))
             emp_comp_map = {c.requirement_id: c for c in emp_comp_records}
             for comp_req in mandatory_comp_reqs:
                 c_rec = emp_comp_map.get(comp_req.id)
@@ -199,7 +224,12 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
                     gate_results["G4"] = False
                     return False, f"Gate 4: Mandatory compliance '{comp_req.title}' expired on {c_rec.expiry_date}.", gate_results
         else:
-            if hasattr(emp, "prefetched_invalid_compliance"):
+            if hasattr(emp, "prefetched_compliance_records"):
+                invalid_comp = next((c for c in emp.prefetched_compliance_records if c.status in ["EXPIRED", "REJECTED"]), None)
+                if invalid_comp:
+                    gate_results["G4"] = False
+                    return False, "Gate 4: Technician has expired or rejected mandatory compliance document.", gate_results
+            elif hasattr(emp, "prefetched_invalid_compliance"):
                 if emp.prefetched_invalid_compliance:
                     gate_results["G4"] = False
                     logger.debug(f"[9GATE_REJECT_GATE4_COMPLIANCE_INVALID] Employee #{emp.id} has invalid compliance.")
@@ -290,22 +320,35 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
                 return False, f"Gate 8: Technician is on approved leave from {start_date} to {end_date}.", gate_results
 
     # ── Gate 9: Workload Concurrency (Single-Active-Job Isolation) ──────────────
-    from workforce_api.services.workload import get_employee_active_job
-    active_job = get_employee_active_job(emp)
-    if active_job:
-        gate_results["G9"] = False
-        logger.info(
-            f"[DISPATCH_REJECT] employee={emp.id} reason=EMPLOYEE_ALREADY_BUSY active_job={active_job.id}"
-        )
-        return False, f"Gate 9: Technician is busy on active Job #{active_job.id} ({active_job.request_id}).", gate_results
+    if hasattr(emp, "is_busy_job"):
+        if emp.is_busy_job:
+            gate_results["G9"] = False
+            logger.info(
+                f"[DISPATCH_REJECT] employee={emp.id} reason=EMPLOYEE_ALREADY_BUSY (annotated)"
+            )
+            return False, f"Gate 9: Technician #{emp.id} is busy on an active job.", gate_results
+    else:
+        from workforce_api.services.workload import get_employee_active_job
+        active_job = get_employee_active_job(emp)
+        if active_job:
+            gate_results["G9"] = False
+            logger.info(
+                f"[DISPATCH_REJECT] employee={emp.id} reason=EMPLOYEE_ALREADY_BUSY active_job={active_job.id}"
+            )
+            return False, f"Gate 9: Technician is busy on active Job #{active_job.id} ({active_job.request_id}).", gate_results
 
     return True, "All 9 Eligibility Gates Passed", gate_results
 
 
-def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, exclude_employee_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+def get_eligible_candidates(
+    job_id_or_obj,
+    max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS,
+    radius_km: float = MAX_DISPATCH_RADIUS_KM,
+    exclude_employee_ids: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
     """
     Finds and ranks all eligible candidate employees for a given ServiceRequest.
-    Uses database-level filtering and prefetching for optimal WAN performance.
+    Uses mathematical bounding-box prefiltering and exact Haversine calculation.
     """
     if hasattr(job_id_or_obj, "latitude"):
         job_obj = job_id_or_obj
@@ -315,16 +358,12 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
             logger.warning(f"[DISPATCH_JOB_NOT_FOUND] Job #{job_id_or_obj} not found.")
             return []
 
-    if job_obj.latitude is None or job_obj.longitude is None:
-        logger.warning(f"[DISPATCH_GPS_MISSING] Job #{job_obj.id} lacks customer GPS coordinates.")
+    is_valid_coords, cust_lat, cust_lon, coord_err = validate_coordinates(job_obj.latitude, job_obj.longitude)
+    if not is_valid_coords:
+        logger.warning(f"[DISPATCH_GPS_MISSING] Job #{job_obj.id} invalid coordinates: {coord_err}")
         return []
 
-    try:
-        cust_lat = float(job_obj.latitude)
-        cust_lon = float(job_obj.longitude)
-    except (ValueError, TypeError):
-        logger.warning(f"[DISPATCH_GPS_MISSING] Job #{job_obj.id} has invalid customer GPS coordinates ({job_obj.latitude}, {job_obj.longitude}).")
-        return []
+    min_lat, max_lat, min_lon, max_lon = get_spatial_bounding_box(cust_lat, cust_lon, radius_km=radius_km)
 
     today_dow = timezone.now().weekday()
     from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES, get_employee_active_job
@@ -380,7 +419,6 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
     previous_offers = set(
         WorkforceJobOffer.objects.filter(
             job=job_obj,
-            status__in=["OFFERED", "REJECTED", "CANCELLED", "ACCEPTED"]
         ).values_list("employee_id", flat=True)
     )
     if exclude_employee_ids:
@@ -399,6 +437,16 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
         emp_lat = last_loc.get("latitude") if last_loc.get("latitude") is not None else last_loc.get("lat")
         emp_lon = last_loc.get("longitude") if last_loc.get("longitude") is not None else (last_loc.get("lng") or last_loc.get("lon"))
 
+        is_emp_loc_valid, emp_lat_f, emp_lon_f, _ = validate_coordinates(emp_lat, emp_lon)
+        if not is_emp_loc_valid:
+            logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=GPS_MISSING")
+            continue
+
+        # Bounding box prefilter
+        if not (min_lat <= emp_lat_f <= max_lat and min_lon <= emp_lon_f <= max_lon):
+            logger.debug(f"[DISPATCH_BOUNDING_BOX_EXCLUDED] employee={emp.id} outside bbox ({emp_lat_f}, {emp_lon_f})")
+            continue
+
         gps_age_s = None
         updated_at_str = last_loc.get("updated_at") or last_loc.get("captured_at")
         if updated_at_str:
@@ -411,17 +459,7 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
             except Exception:
                 pass
 
-        dist_km = None
-        emp_lat_f = None
-        emp_lon_f = None
-        if emp_lat is not None and emp_lon is not None:
-            try:
-                emp_lat_f = float(emp_lat)
-                emp_lon_f = float(emp_lon)
-                dist_m = haversine_distance(cust_lat, cust_lon, emp_lat_f, emp_lon_f)
-                dist_km = dist_m / 1000.0
-            except (ValueError, TypeError):
-                pass
+        dist_km = calculate_distance_km(cust_lat, cust_lon, emp_lat_f, emp_lon_f)
 
         logger.info(
             f"[9GATE_EVALUATION] employee={emp.id} online={emp.is_online} availability={emp.current_availability} "
@@ -441,15 +479,11 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
             logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason={reason}")
             continue
 
-        if emp_lat_f is None or emp_lon_f is None:
-            logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=GPS_MISSING")
-            continue
-
         if gps_age_s is None or gps_age_s > max_gps_age_seconds or gps_age_s < -60:
             logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=GPS_STALE gps_age={gps_age_s}s")
             continue
 
-        if dist_km is None or dist_km > MAX_DISPATCH_RADIUS_KM:
+        if not is_within_radius(dist_km, radius_km=radius_km):
             logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=RADIUS_EXCEEDED distance_km={dist_km}")
             continue
 
@@ -489,12 +523,16 @@ def get_eligible_candidates(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AG
 
         ranked_candidates.append({
             "employee": emp,
-            "distance_km": dist_km,
-            "score": total_score,
+            "distance_km": round(dist_km, 3),
+            "distance_band": get_distance_band(dist_km),
+            "latitude": emp_lat_f,
+            "longitude": emp_lon_f,
+            "gps_age_seconds": gps_age_s,
+            "score": round(total_score, 1),
         })
 
-    # Sort primarily by nearest distance (ascending), then by highest score (descending)
-    ranked_candidates.sort(key=lambda x: (x["distance_km"], -x["score"]))
+    # Deterministic sort: distance (ascending), score (descending), employee ID (ascending)
+    ranked_candidates.sort(key=lambda x: (x["distance_km"], -x["score"], x["employee"].id))
     return ranked_candidates
 
 
@@ -504,8 +542,9 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
     1. Locks ServiceRequest row with select_for_update inside transaction.atomic()
     2. Validates dispatchable state and coordinates
     3. Checks if an active exclusive offer already exists (idempotent guard)
-    4. Evaluates and ranks eligible candidates
-    5. Creates WorkforceJobOffer, sends JOB_OFFER notification, and logs audit events
+    4. Evaluates eligible candidates in 3 sequential geographic rings (≤1km, 1-2km, 2-5km)
+    5. Creates single exclusive WorkforceJobOffer (5-min expiry), sends JOB_OFFER notification
+    6. Falls back to Admin notification when all rings/candidates are exhausted
     """
     job_id = job_id_or_obj.pk if hasattr(job_id_or_obj, "pk") else job_id_or_obj
     from workforce_api.models import WorkforceEventLog
@@ -560,11 +599,36 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
             payload={"job_id": job_obj.id, "eligible_count": len(candidates)}
         )
 
-        if not candidates:
+        # Multi-Ring Wave Selection:
+        # Ring 1: <= 1.0 km
+        # Ring 2: > 1.0 km and <= 2.0 km
+        # Ring 3: > 2.0 km and <= 5.0 km
+        ring1 = [c for c in candidates if c["distance_km"] <= RING_1_MAX_KM]
+        ring2 = [c for c in candidates if RING_1_MAX_KM < c["distance_km"] <= RING_2_MAX_KM]
+        ring3 = [c for c in candidates if RING_2_MAX_KM < c["distance_km"] <= RING_3_MAX_KM]
+
+        top_candidate = None
+        wave_label = ""
+        if ring1:
+            top_candidate = ring1[0]
+            wave_label = "Ring 1 (≤ 1.0 km)"
+        elif ring2:
+            top_candidate = ring2[0]
+            wave_label = "Ring 2 (1.0 - 2.0 km)"
+        elif ring3:
+            top_candidate = ring3[0]
+            wave_label = "Ring 3 (2.0 - 5.0 km)"
+
+        if not top_candidate:
             if job_obj.status != "unassigned" or job_obj.assigned_employee is not None:
                 job_obj.status = "unassigned"
                 job_obj.assigned_employee = None
                 job_obj.save(update_fields=["status", "assigned_employee"])
+
+            WorkforceEventLog.objects.create(
+                event_type="DISPATCH_ADMIN_FALLBACK",
+                payload={"job_id": job_obj.id, "reason": "ALL_RINGS_EXHAUSTED", "candidates_considered": len(candidates)}
+            )
 
             admin_user = None
             if job_obj.company:
@@ -580,15 +644,13 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
                 WorkforceNotification.objects.create(
                     recipient=admin_user,
                     title="Automatic Dispatch: Awaiting Technician",
-                    message=f"No eligible nearby technician available for Job #{job_obj.id} ({service_name}). Job remains unassigned.",
+                    message=f"No eligible nearby technician available within 5 km for Job #{job_obj.id} ({service_name}). Job escalated to Admin dispatch.",
                     notification_type="DISPATCH_UNASSIGNED",
                     company=job_obj.company,
                     related_object_id=str(job_obj.id),
                 )
-            return False, "No eligible technicians available for automatic dispatch."
+            return False, "No eligible technicians available for automatic dispatch within 5 km. Job escalated to Admin dispatch."
 
-        # Top nearest candidate
-        top_candidate = candidates[0]
         top_emp = top_candidate["employee"]
         top_dist_km = top_candidate["distance_km"]
         top_score = top_candidate["score"]
@@ -622,7 +684,13 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
         WorkforceEventLog.objects.create(
             user=top_emp.user,
             event_type="OFFER_CREATED",
-            payload={"job_id": job_obj.id, "offer_id": offer.id, "employee_id": top_emp.id, "distance_km": round(top_dist_km, 2)}
+            payload={
+                "job_id": job_obj.id,
+                "offer_id": offer.id,
+                "employee_id": top_emp.id,
+                "distance_km": round(top_dist_km, 2),
+                "wave": wave_label,
+            }
         )
 
         loc_str = f" at {job_obj.address}" if job_obj.address else ""
@@ -633,7 +701,7 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
         WorkforceNotification.objects.create(
             recipient=top_emp.user,
             title="New Job Offer Available!",
-            message=f"You have a new exclusive job offer for '{service_label}'{req_id_str}{loc_str} ({top_dist_km:.1f} km away). Expiry: {expiry_str}. Open your dashboard to Accept or Decline.",
+            message=f"You have a new exclusive job offer for '{service_label}'{req_id_str}{loc_str} ({top_dist_km:.1f} km away via {wave_label}). Expiry: {expiry_str}. Open your dashboard to Accept or Decline.",
             notification_type="JOB_OFFER",
             company=job_obj.company,
             related_object_id=str(job_obj.id),
@@ -641,9 +709,9 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
 
         logger.info(
             f"[DISPATCH_DECISION] job={job_obj.id} employee={top_emp.id} "
-            f"distance_km={top_dist_km:.2f} score={top_score:.1f} status=OFFER_CREATED"
+            f"distance_km={top_dist_km:.2f} score={top_score:.1f} wave={wave_label} status=OFFER_CREATED"
         )
-        return True, f"Job #{job_obj.id} offered to {top_emp.user.get_full_name() or top_emp.user.username} ({top_dist_km:.1f}km away, Score: {top_score:.1f})."
+        return True, f"Job #{job_obj.id} offered to {top_emp.user.get_full_name() or top_emp.user.username} ({top_dist_km:.1f}km away via {wave_label}, Score: {top_score:.1f})."
 
 
 def dispatch_next_candidate(job_id_or_obj) -> Tuple[bool, str]:

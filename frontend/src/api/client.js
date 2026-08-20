@@ -92,9 +92,10 @@ export async function apiRequest(path, options = {}) {
     headers.set('X-CSRFToken', csrfToken);
   }
 
-  // Attach tab-scoped or stored Bearer token
+  // Attach tab-scoped or stored Bearer token (never attach to unauthenticated login/signup endpoints)
+  const isAuthEndpoint = path.includes('/auth/login') || path.includes('/auth/signup');
   const token = getAccessToken();
-  if (token && !headers.has('Authorization')) {
+  if (token && !headers.has('Authorization') && !isAuthEndpoint) {
     headers.set('Authorization', `Bearer ${token}`);
   }
 

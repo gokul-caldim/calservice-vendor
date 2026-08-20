@@ -43,6 +43,18 @@ import secrets
 from django.contrib.auth.hashers import make_password, check_password
 from accounts.permissions import is_admin_role
 from .permissions import IsWorkforceAdmin, IsWorkforceEmployee, IsApprovedTechnician
+from .services.registration import (
+    get_employee_registration_status,
+    get_employee_onboarding_dict,
+    is_employee_approved,
+    REGISTRATION_STATUS_NOT_STARTED,
+    REGISTRATION_STATUS_IN_PROGRESS,
+    REGISTRATION_STATUS_SUBMITTED,
+    REGISTRATION_STATUS_UNDER_REVIEW,
+    REGISTRATION_STATUS_CORRECTION_REQUIRED,
+    REGISTRATION_STATUS_APPROVED,
+    REGISTRATION_STATUS_REJECTED,
+)
 from .serializers import (
     WorkforceSignupSerializer,
     WorkforceOnboardingDraftSerializer,
@@ -1218,6 +1230,7 @@ class WorkforceJobListView(APIView):
         company = emp.company if emp else getattr(user, "company", None)
 
         if is_admin_role(user):
+            context = {"request": request}
             if user.is_superuser:
                 jobs = ServiceRequest.objects.all().order_by("-created_at")[:50]
             elif company:
@@ -1226,16 +1239,10 @@ class WorkforceJobListView(APIView):
                 jobs = ServiceRequest.objects.none()
         elif emp:
             now = timezone.now()
+            from workforce_api.models import WorkforceJobOffer, WorkforceJobLifecycleEvent, WorkforceWorkExtension, JobPayment
             from workforce_api.services.workload import ACTIVE_QUEUE_STATUSES, WORKLOAD_OCCUPIED_STATUSES
-            from workforce_api.services.automatic_dispatch import reconsider_jobs_for_employee, expire_and_reassign_offers
 
-            # 1. Sweep expired offers
-            try:
-                expire_and_reassign_offers()
-            except Exception:
-                pass
-
-            # 2. Hard Single Active Job Invariant: Check if technician already has an active assignment in queue
+            # 1. Hard Single Active Job Invariant: Check if technician already has an active assignment in queue
             has_active_job = ServiceRequest.objects.filter(
                 assigned_employee=emp,
                 status__in=WORKLOAD_OCCUPIED_STATUSES
@@ -1245,16 +1252,10 @@ class WorkforceJobListView(APIView):
                 # When technician is occupied with an active job, no new job offers should appear
                 offered_job_ids = []
             else:
-                # Reconsider pending customer bookings in Supabase for this available technician
-                if emp.is_active and emp.is_online and emp.current_availability == "available":
-                    try:
-                        reconsider_jobs_for_employee(emp)
-                    except Exception as e:
-                        logger.debug(f"[DISPATCH_RECONSIDER_ERROR] {e}")
-
+                # Clean read of valid, unexpired offers exclusively for this employee
                 offered_job_ids = list(WorkforceJobOffer.objects.filter(
                     employee=emp,
-                    status="OFFERED",
+                    status=WorkforceJobOffer.Status.OFFERED,
                     expires_at__gt=now
                 ).values_list("job_id", flat=True))
 
@@ -1303,12 +1304,62 @@ class WorkforceJobListView(APIView):
             if emp.company:
                 qs = qs.filter(company=emp.company)
 
+            qs = qs.select_related("customer", "assigned_employee", "assigned_employee__user", "company")
             qs = qs.distinct().order_by("-updated_at", "-created_at")
-            jobs = qs
-        else:
-            jobs = ServiceRequest.objects.none()
+            job_list = list(qs[:100])
 
-        serializer = WorkforceJobSerializer(jobs, many=True, context={"request": request})
+            job_ids = [j.id for j in job_list]
+            emp_offers_map = {}
+            active_offers_map = {}
+            lifecycle_events_map = {}
+            extensions_map = {}
+            active_extensions_map = {}
+            payments_map = {}
+
+            if job_ids:
+                # 1. Bulk fetch employee job offers
+                offers = list(WorkforceJobOffer.objects.filter(job_id__in=job_ids, employee=emp).order_by("offered_at"))
+                for o in offers:
+                    emp_offers_map[o.job_id] = o
+                    if o.status == "OFFERED" and o.expires_at > now:
+                        active_offers_map[o.job_id] = o
+
+                # 2. Bulk fetch acceptance lifecycle events
+                events = list(WorkforceJobLifecycleEvent.objects.filter(
+                    job_id__in=job_ids,
+                    employee=emp,
+                    event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
+                ).order_by("created_at"))
+                for ev in events:
+                    lifecycle_events_map[ev.job_id] = ev
+
+                # 3. Bulk fetch work extensions
+                exts = list(WorkforceWorkExtension.objects.filter(job_id__in=job_ids).select_related("technician", "technician__user").order_by("-created_at"))
+                for ext in exts:
+                    extensions_map.setdefault(ext.job_id, []).append(ext)
+                    if ext.status in ["REQUESTED", "ADMIN_APPROVED", "CUSTOMER_ACCEPTED", "IN_PROGRESS"] and ext.job_id not in active_extensions_map:
+                        active_extensions_map[ext.job_id] = ext
+
+                # 4. Bulk fetch payments
+                payments = list(JobPayment.objects.filter(job_id__in=job_ids))
+                for p in payments:
+                    payments_map[p.job_id] = p
+
+            context = {
+                "request": request,
+                "emp_offers_map": emp_offers_map,
+                "active_offers_map": active_offers_map,
+                "lifecycle_events_map": lifecycle_events_map,
+                "extensions_map": extensions_map,
+                "active_extensions_map": active_extensions_map,
+                "payments_map": payments_map,
+            }
+            jobs = job_list
+        else:
+            jobs = []
+            context = {"request": request}
+
+        serializer = WorkforceJobSerializer(jobs, many=True, context=context)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
@@ -1960,28 +2011,54 @@ class WorkforceDispatchEligibleListView(APIView):
     def get(self, request):
         from django.db.models import Exists, OuterRef, Prefetch
         from django.utils.dateparse import parse_datetime
-        from workforce_api.services.automatic_dispatch import check_candidate_eligibility, haversine_distance
+        from workforce_api.services.automatic_dispatch import check_candidate_eligibility
+        from workforce_api.services.geo_spatial import (
+            ADMIN_DISPATCH_RADIUS_KM,
+            MAX_GPS_AGE_SECONDS,
+            calculate_distance_km,
+            get_spatial_bounding_box,
+            get_distance_band,
+            is_within_radius,
+            validate_coordinates,
+        )
 
         service_name = request.query_params.get("service", "").strip()
         job_id = request.query_params.get("job_id")
+        raw_radius = request.query_params.get("radius_km")
+        
+        try:
+            radius_km = float(raw_radius) if raw_radius is not None else ADMIN_DISPATCH_RADIUS_KM
+        except (ValueError, TypeError):
+            radius_km = ADMIN_DISPATCH_RADIUS_KM
+
+        if radius_km <= 0.0 or radius_km > ADMIN_DISPATCH_RADIUS_KM:
+            radius_km = ADMIN_DISPATCH_RADIUS_KM
+
         job = None
         cust_lat = None
         cust_lon = None
+        min_lat, max_lat, min_lon, max_lon = -90.0, 90.0, -180.0, 180.0
 
         if job_id:
             job = ServiceRequest.objects.filter(pk=job_id).first()
-            if job:
-                if not getattr(request.user, "is_superuser", False):
-                    user_company = resolve_actor_company(request)
-                    if not user_company or not job.company_id or user_company.id != job.company_id:
-                        return Response({"error": "Unauthorized cross-company job query.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
-                service_name = service_name or job.issue_title or job.service_category
-                if job.latitude is not None and job.longitude is not None:
-                    try:
-                        cust_lat = float(job.latitude)
-                        cust_lon = float(job.longitude)
-                    except (ValueError, TypeError):
-                        pass
+            if not job:
+                return Response({"error": f"Job #{job_id} not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+            if not getattr(request.user, "is_superuser", False):
+                user_company = resolve_actor_company(request)
+                if not user_company or not job.company_id or user_company.id != job.company_id:
+                    return Response({"error": "Unauthorized cross-company job query.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+            
+            service_name = service_name or job.issue_title or job.service_category
+            is_valid_coords, cust_lat, cust_lon, coord_err = validate_coordinates(job.latitude, job.longitude)
+            if not is_valid_coords:
+                return Response({
+                    "error": "Customer service location lacks valid GPS coordinates.",
+                    "code": "GPS_COORDINATES_MISSING",
+                    "details": coord_err,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            min_lat, max_lat, min_lon, max_lon = get_spatial_bounding_box(cust_lat, cust_lon, radius_km=radius_km)
 
         today_dow = timezone.now().weekday()
         from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES
@@ -1996,6 +2073,11 @@ class WorkforceDispatchEligibleListView(APIView):
             if not user_company:
                 return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
             candidates_qs = candidates_qs.filter(company=user_company)
+        elif job and job.company_id:
+            candidates_qs = candidates_qs.filter(company_id=job.company_id)
+
+        target_company_id = user_company.id if user_company else (job.company_id if job else None)
+        mandatory_comp_reqs = list(WorkforceComplianceRequirement.objects.filter(company_id=target_company_id, is_mandatory=True)) if target_company_id else []
 
         candidates = list(
             candidates_qs
@@ -2005,9 +2087,8 @@ class WorkforceDispatchEligibleListView(APIView):
                     "compliance_records",
                     queryset=WorkforceEmployeeCompliance.objects.filter(
                         requirement__is_mandatory=True,
-                        status__in=["EXPIRED", "REJECTED"]
-                    ),
-                    to_attr="prefetched_invalid_compliance"
+                    ).select_related("requirement"),
+                    to_attr="prefetched_compliance_records"
                 ),
                 Prefetch(
                     "schedules",
@@ -2021,6 +2102,10 @@ class WorkforceDispatchEligibleListView(APIView):
                 )
             )
         )
+
+        for emp in candidates:
+            emp.prefetched_mandatory_comp_reqs = mandatory_comp_reqs
+            emp.prefetched_mandatory_doc_reqs = []
 
         now = timezone.now()
         GATE_NAMES = {
@@ -2048,8 +2133,10 @@ class WorkforceDispatchEligibleListView(APIView):
             emp_lat = last_loc.get("latitude") if last_loc.get("latitude") is not None else last_loc.get("lat")
             emp_lon = last_loc.get("longitude") if last_loc.get("longitude") is not None else (last_loc.get("lng") or last_loc.get("lon"))
 
+            is_emp_loc_valid, emp_lat_f, emp_lon_f, _ = validate_coordinates(emp_lat, emp_lon)
+
             gps_age_s = None
-            updated_at_str = last_loc.get("updated_at")
+            updated_at_str = last_loc.get("updated_at") or last_loc.get("captured_at")
             if updated_at_str:
                 try:
                     loc_dt = parse_datetime(str(updated_at_str))
@@ -2061,19 +2148,32 @@ class WorkforceDispatchEligibleListView(APIView):
                     pass
 
             dist_km = None
-            if cust_lat is not None and cust_lon is not None and emp_lat is not None and emp_lon is not None:
-                try:
-                    dist_m = haversine_distance(cust_lat, cust_lon, float(emp_lat), float(emp_lon))
-                    dist_km = round(dist_m / 1000.0, 2)
-                except (ValueError, TypeError):
-                    pass
+            dist_band = "unknown"
+            within_radius = True
+
+            if cust_lat is not None and cust_lon is not None:
+                if is_emp_loc_valid:
+                    # Mathematical bounding box prefilter check
+                    if not (min_lat <= emp_lat_f <= max_lat and min_lon <= emp_lon_f <= max_lon):
+                        dist_km = round(calculate_distance_km(cust_lat, cust_lon, emp_lat_f, emp_lon_f), 3)
+                        dist_band = get_distance_band(dist_km)
+                        within_radius = False
+                    else:
+                        dist_km = round(calculate_distance_km(cust_lat, cust_lon, emp_lat_f, emp_lon_f), 3)
+                        dist_band = get_distance_band(dist_km)
+                        within_radius = is_within_radius(dist_km, radius_km=radius_km)
+                else:
+                    within_radius = False
 
             gps_freshness = "MISSING"
+            is_gps_fresh = False
             if gps_age_s is not None:
                 if gps_age_s <= 30:
                     gps_freshness = "LIVE"
-                elif gps_age_s <= 120:
+                    is_gps_fresh = True
+                elif gps_age_s <= MAX_GPS_AGE_SECONDS:
                     gps_freshness = "UPDATING"
+                    is_gps_fresh = True
                 elif gps_age_s <= 300:
                     gps_freshness = "DELAYED"
                 else:
@@ -2094,26 +2194,47 @@ class WorkforceDispatchEligibleListView(APIView):
                     "passed": bool(gate_results.get(g_code, False)),
                 })
 
+            is_dispatch_ready = is_eligible and is_gps_fresh and within_radius and is_emp_loc_valid
+            final_reason = reason
+            if not is_emp_loc_valid and is_eligible:
+                final_reason = "GPS location missing or invalid"
+            elif not is_gps_fresh and is_eligible:
+                final_reason = f"GPS is stale ({gps_age_s}s old, max {MAX_GPS_AGE_SECONDS}s)"
+            elif not within_radius and is_eligible:
+                final_reason = f"Outside {radius_km}km radius ({dist_km:.2f}km away)"
+
             eligible.append({
                 "id": emp.id,
                 "employee_id": emp.employee_id,
                 "name": emp.user.get_full_name() or emp.user.username,
                 "phone": emp.user.mobile_number or emp.user.phone,
+                "latitude": emp_lat_f,
+                "longitude": emp_lon_f,
                 "is_online": emp.is_online,
                 "current_availability": emp.current_availability,
                 "registration_status": reg_status,
                 "approved_services": approved_svcs,
-                "is_dispatch_ready": is_eligible,
-                "ineligibility_reason": reason if not is_eligible else "",
+                "is_dispatch_ready": is_dispatch_ready,
+                "ineligibility_reason": final_reason if not is_dispatch_ready else "",
                 "distance_km": dist_km,
+                "distance_band": dist_band,
                 "score": score,
                 "gps_age_seconds": gps_age_s,
                 "gps_freshness": gps_freshness,
                 "gate_audit": gate_audit,
             })
 
-        # Sort: eligible candidates first (by score descending), then ineligible candidates
-        eligible.sort(key=lambda x: (1 if x["is_dispatch_ready"] else 0, x["score"]), reverse=True)
+        # Deterministic Sort:
+        # 1. Dispatch-ready first (0 vs 1)
+        # 2. Distance ascending (None treated as 999999.0)
+        # 3. Score descending (-score)
+        # 4. Employee ID ascending (emp.id)
+        eligible.sort(key=lambda x: (
+            0 if x["is_dispatch_ready"] else 1,
+            x["distance_km"] if x["distance_km"] is not None else 999999.0,
+            -x["score"],
+            x["id"]
+        ))
 
         return Response(eligible, status=status.HTTP_200_OK)
 
@@ -2122,11 +2243,163 @@ class WorkforceDispatchAssignView(APIView):
     permission_classes = [IsWorkforceAdmin]
 
     def post(self, request):
-        return Response({
-            "code": "MANUAL_DISPATCH_DISABLED",
-            "message": "Customer jobs are automatically assigned using live employee availability, GPS proximity and eligibility.",
-            "error": "Manual primary job assignment has been decommissioned. Automatic geo-based dispatch engine is active."
-        }, status=status.HTTP_410_GONE)
+        from workforce_api.services.geo_spatial import (
+            ADMIN_DISPATCH_RADIUS_KM,
+            MAX_GPS_AGE_SECONDS,
+            calculate_distance_km,
+            is_within_radius,
+            validate_coordinates,
+        )
+
+        job_id = request.data.get("job_id") or request.data.get("job")
+        employee_id = request.data.get("employee_id") or request.data.get("employee")
+        if not job_id or not employee_id:
+            return Response({
+                "error": "Both job_id and employee_id are required.",
+                "code": "INVALID_INPUT",
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            job = ServiceRequest.objects.select_for_update().filter(pk=job_id).first()
+            if not job:
+                return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+            emp = Employee.objects.select_for_update().filter(pk=employee_id).first()
+            if not emp:
+                return Response({"error": "Employee profile not found.", "code": "EMPLOYEE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+            # Tenant isolation check
+            if not getattr(request.user, "is_superuser", False):
+                user_company = resolve_actor_company(request)
+                if not user_company or not job.company_id or user_company.id != job.company_id:
+                    return Response({"error": "Unauthorized: Cross-company job dispatch forbidden.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+                if not emp.company_id or user_company.id != emp.company_id:
+                    return Response({"error": "Unauthorized: Technician belongs to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+
+            # Check job terminal status
+            if job.status in ["completed", "cancelled"]:
+                return Response({"error": f"Cannot dispatch job in '{job.status}' status.", "code": "INVALID_JOB_STATE"}, status=status.HTTP_409_CONFLICT)
+
+            # Check if already accepted/in-progress
+            if job.status in ["accepted", "on_the_way", "arrived", "in_progress"] and job.assigned_employee:
+                return Response({"error": f"Job is already accepted and in progress with Technician #{job.assigned_employee_id}.", "code": "JOB_ALREADY_ASSIGNED"}, status=status.HTTP_409_CONFLICT)
+
+            # Workload check (Single-Active-Job Isolation - concurrency conflict)
+            from workforce_api.services.workload import get_employee_active_job
+            busy_job = get_employee_active_job(emp)
+            if busy_job:
+                return Response({
+                    "error": f"Technician #{emp.id} is already busy on active Job #{busy_job.id}.",
+                    "code": "EMPLOYEE_ALREADY_BUSY",
+                }, status=status.HTTP_409_CONFLICT)
+
+            # Reuse authoritative 9-Gate candidate eligibility engine
+            from workforce_api.services.automatic_dispatch import (
+                check_candidate_eligibility,
+                DEFAULT_OFFER_DURATION_MINUTES,
+            )
+            is_eligible, reason, gate_results = check_candidate_eligibility(emp, job.service_category or job.issue_title)
+            if not is_eligible:
+                if gate_results.get("G9") is False:
+                    return Response({
+                        "error": f"Technician #{emp.id} is already busy on an active job.",
+                        "code": "EMPLOYEE_ALREADY_BUSY",
+                        "gate_results": gate_results,
+                    }, status=status.HTTP_409_CONFLICT)
+                return Response({
+                    "error": f"Cannot assign technician: {reason}",
+                    "code": "INELIGIBLE_TECHNICIAN",
+                    "gate_results": gate_results,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Customer coordinates verification
+            is_cust_valid, cust_lat, cust_lon, coord_err = validate_coordinates(job.latitude, job.longitude)
+            if not is_cust_valid:
+                return Response({
+                    "error": "Customer service location lacks valid GPS coordinates.",
+                    "code": "GPS_COORDINATES_MISSING",
+                    "details": coord_err,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Employee GPS extraction & validation
+            last_loc = getattr(emp.user, "last_known_location", None) or {}
+            emp_lat = last_loc.get("latitude") if last_loc.get("latitude") is not None else last_loc.get("lat")
+            emp_lon = last_loc.get("longitude") if last_loc.get("longitude") is not None else (last_loc.get("lng") or last_loc.get("lon"))
+            is_emp_valid, emp_lat_f, emp_lon_f, _ = validate_coordinates(emp_lat, emp_lon)
+            if not is_emp_valid:
+                return Response({"error": "Technician has no recorded GPS location.", "code": "GPS_MISSING"}, status=status.HTTP_400_BAD_REQUEST)
+
+            # GPS freshness verification
+            from django.utils.dateparse import parse_datetime
+            now = timezone.now()
+            gps_age_s = None
+            updated_at_str = last_loc.get("updated_at") or last_loc.get("captured_at")
+            if updated_at_str:
+                try:
+                    loc_dt = parse_datetime(str(updated_at_str))
+                    if loc_dt:
+                        if timezone.is_naive(loc_dt):
+                            loc_dt = timezone.make_aware(loc_dt)
+                        gps_age_s = (now - loc_dt).total_seconds()
+                except Exception:
+                    pass
+
+            if gps_age_s is None or gps_age_s > MAX_GPS_AGE_SECONDS or gps_age_s < -60:
+                return Response({
+                    "error": f"Technician GPS is stale ({gps_age_s:.0f}s old, max allowed {MAX_GPS_AGE_SECONDS}s).",
+                    "code": "GPS_STALE",
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Exact Haversine 20 KM radius check
+            dist_km = calculate_distance_km(cust_lat, cust_lon, emp_lat_f, emp_lon_f)
+            if not is_within_radius(dist_km, radius_km=ADMIN_DISPATCH_RADIUS_KM):
+                return Response({
+                    "error": f"Technician is outside the {ADMIN_DISPATCH_RADIUS_KM}km dispatch radius ({dist_km:.2f}km away).",
+                    "code": "RADIUS_EXCEEDED",
+                    "distance_km": round(dist_km, 2),
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Expire previous dangling offers for this job
+            WorkforceJobOffer.objects.filter(job=job, status=WorkforceJobOffer.Status.OFFERED).update(status=WorkforceJobOffer.Status.EXPIRED)
+
+            # Create 5-minute exclusive job offer
+            expires_at = now + timedelta(minutes=DEFAULT_OFFER_DURATION_MINUTES)
+            offer = WorkforceJobOffer.objects.create(
+                job=job,
+                employee=emp,
+                status=WorkforceJobOffer.Status.OFFERED,
+                expires_at=expires_at,
+            )
+
+            # Ensure job is unassigned awaiting acceptance
+            job.assigned_employee = None
+            job.status = "unassigned"
+            job.save(update_fields=["assigned_employee", "status"])
+
+            # Send notification
+            WorkforceNotification.objects.create(
+                recipient=emp.user,
+                title="New Job Offer Available!",
+                message=f"Admin dispatched a job offer for '{job.issue_title or job.service_category}'. Expiry: {expires_at.strftime('%H:%M:%S UTC')}. Open your dashboard to Accept.",
+                notification_type="JOB_OFFER",
+                company=job.company,
+                related_object_id=str(job.id),
+            )
+
+            WorkforceEventLog.objects.create(
+                user=request.user,
+                event_type="ADMIN_DISPATCHED",
+                payload={"job_id": job.id, "employee_id": emp.id, "offer_id": offer.id, "distance_km": dist_km}
+            )
+
+            return Response({
+                "message": f"Job #{job.id} dispatched to {emp.user.get_full_name() or emp.user.username}.",
+                "job_id": job.id,
+                "employee_id": emp.id,
+                "offer_id": offer.id,
+                "expires_at": expires_at.isoformat(),
+                "distance_km": dist_km,
+            }, status=status.HTTP_200_OK)
 
 
 # ─── Automatic Dispatch Engine ────────────────────────────────────────────────
@@ -2137,7 +2410,7 @@ def run_automatic_dispatch(job, excluded_employee_ids=None):
     workforce_api.services.automatic_dispatch.dispatch_job
     """
     from workforce_api.services.automatic_dispatch import dispatch_job
-    return dispatch_job(job, excluded_employee_ids=excluded_employee_ids)
+    return dispatch_job(job, exclude_employee_ids=excluded_employee_ids)
 
 
 from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES, supersede_other_offers_for_employee
@@ -2208,13 +2481,13 @@ class WorkforceJobAcceptOfferView(APIView):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             now = timezone.now()
-            cancellation_deadline = now + timedelta(minutes=5)
 
             if offer and offer.status == WorkforceJobOffer.Status.OFFERED:
                 if offer.expires_at < now:
                     offer.status = WorkforceJobOffer.Status.EXPIRED
                     offer.save()
-                    run_automatic_dispatch(job_obj)
+                    from workforce_api.services.automatic_dispatch import dispatch_next_candidate
+                    dispatch_next_candidate(job_obj)
                     return Response({
                         "error": "Job offer has expired.",
                         "code": "OFFER_EXPIRED"
@@ -2276,7 +2549,12 @@ class WorkforceJobAcceptOfferView(APIView):
                         }
                     )
 
+            # Mark employee busy
+            emp_obj.current_availability = "busy"
+            emp_obj.save(update_fields=["current_availability"])
+
             # Supersede all other pending OFFERED jobs for this winning employee
+            from workforce_api.services.workload import supersede_other_offers_for_employee
             supersede_other_offers_for_employee(emp_obj, job_obj)
 
             # Unset any prior primary EmployeeJob for this service request
@@ -2313,7 +2591,6 @@ class WorkforceJobAcceptOfferView(APIView):
                 previous_status=offer.status if offer else "OFFERED",
                 new_status="accepted",
                 accepted_at=now,
-                cancellation_deadline=cancellation_deadline,
                 metadata={"offer_id": offer.id if offer else None}
             )
 
@@ -2324,7 +2601,6 @@ class WorkforceJobAcceptOfferView(APIView):
                     "job_id": job_obj.id,
                     "employee_id": emp_obj.id,
                     "accepted_at": now.isoformat(),
-                    "cancellation_deadline": cancellation_deadline.isoformat(),
                 }
             )
             WorkforceEventLog.objects.create(
@@ -2352,7 +2628,6 @@ class WorkforceJobAcceptOfferView(APIView):
                 "job_id": job_obj.id,
                 "status": job_obj.status,
                 "accepted_at": now.isoformat(),
-                "cancellation_deadline": cancellation_deadline.isoformat(),
             }, status=status.HTTP_200_OK)
 
 
@@ -2427,14 +2702,22 @@ class WorkforceJobCancelAssignmentView(APIView):
                     "code": "UNAUTHORIZED_CANCELLATION",
                 }, status=status.HTTP_403_FORBIDDEN)
 
-            # State check: Allowed only from 'accepted' or 'on_the_way'
-            if job_obj.status not in ["accepted", "on_the_way"]:
+            # State check: Allowed prior to service start
+            if job_obj.status in ["in_progress", "proof_submitted", "completed", "cancelled", "unable_to_complete"]:
                 return Response({
-                    "error": f"Cannot cancel job in status '{job_obj.status}'. Cancellation is only allowed while 'accepted' or 'on_the_way'.",
+                    "error": f"Cannot cancel job in status '{job_obj.status}'. Cancellation is only allowed prior to service start.",
                     "code": "CANCELLATION_NOT_ALLOWED_IN_CURRENT_STATE",
                 }, status=status.HTTP_409_CONFLICT)
 
-            # 5-minute cancellation window check
+            # OTP verification check: cancellation is locked once customer OTP is verified
+            from workforce_api.models import PreServiceVerification
+            verification = PreServiceVerification.objects.filter(job=job_obj).first()
+            if verification and verification.otp_verified:
+                return Response({
+                    "error": "Cancellation is not allowed after customer OTP verification.",
+                    "code": "CANCELLATION_LOCKED_AFTER_OTP",
+                }, status=status.HTTP_409_CONFLICT)
+
             from service_requests.models import EmployeeJob
             from workforce_api.models import WorkforceJobLifecycleEvent, JobTrackingSession, WorkforceEventLog
 
@@ -2451,24 +2734,12 @@ class WorkforceJobCancelAssignmentView(APIView):
             )
 
             now = timezone.now()
-            cancellation_deadline = (
-                accept_event.cancellation_deadline if accept_event and accept_event.cancellation_deadline
-                else (accepted_at + timedelta(minutes=5))
-            )
-
-            if now > cancellation_deadline:
-                return Response({
-                    "error": "The 5-minute cancellation window for this job has expired. Please contact dispatch support.",
-                    "code": "CANCELLATION_WINDOW_EXPIRED",
-                    "cancellation_deadline": cancellation_deadline.isoformat(),
-                }, status=status.HTTP_409_CONFLICT)
-
             prev_status = job_obj.status
 
-            # Transition ServiceRequest to 'redispatching' and remove assignment via state machine
+            # Transition ServiceRequest to 'unassigned' and remove assignment
             job_obj.assigned_employee = None
-            job_obj.save(update_fields=["assigned_employee"])
-            apply_transition(job_obj, "redispatching", actor=request.user)
+            job_obj.status = "unassigned"
+            job_obj.save(update_fields=["assigned_employee", "status"])
 
             # Transition EmployeeJob to EMPLOYEE_CANCELLED and unset primary
             if emp_job:
@@ -2491,18 +2762,15 @@ class WorkforceJobCancelAssignmentView(APIView):
             WorkforceJobOffer.objects.filter(
                 job=job_obj,
                 employee=emp_obj,
-                status="ACCEPTED",
             ).update(
                 status="CANCELLED",
                 rejection_reason=f"[{reason_code}] {reason_text}".strip(),
             )
 
-            # Release Employee Availability: reconcile against remaining active jobs
-            from workforce_api.services.workload import reconcile_employee_availability
-            reconcile_employee_availability(emp_obj)
-            logger.info(f"[EMPLOYEE_RELEASED] employee={emp_obj.id} cancelled_job={job_obj.id} state={emp_obj.current_availability.upper()}")
-
-            window_seconds = max(0, int((now - accepted_at).total_seconds())) if accepted_at else None
+            # Release Employee Availability to AVAILABLE
+            emp_obj.current_availability = "available"
+            emp_obj.save(update_fields=["current_availability"])
+            logger.info(f"[EMPLOYEE_RELEASED] employee={emp_obj.id} cancelled_job={job_obj.id} state=AVAILABLE")
 
             # Create immutable audit log
             WorkforceJobLifecycleEvent.objects.create(
@@ -2512,14 +2780,11 @@ class WorkforceJobCancelAssignmentView(APIView):
                 actor_user=request.user,
                 event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_CANCELLED,
                 previous_status=prev_status,
-                new_status="redispatching",
+                new_status="unassigned",
                 accepted_at=accepted_at,
                 cancelled_at=now,
-                cancellation_deadline=cancellation_deadline,
                 reason_code=reason_code,
                 reason_text=reason_text,
-                cancellation_window_seconds=window_seconds,
-                metadata={"cancellation_window_seconds": window_seconds}
             )
 
             # Broadcast realtime events
@@ -2552,8 +2817,8 @@ class WorkforceJobCancelAssignmentView(APIView):
 
 class WorkforceJobTechnicianCancelView(APIView):
     """
-    Authoritative 5-minute cancellation endpoint for technicians.
-    Allows cancellation ONLY when status is ACCEPTED or ON_THE_WAY and within 5 minutes of acceptance.
+    Authoritative cancellation endpoint for technicians.
+    Allows cancellation before customer OTP verification.
     Requires structured cancellation reasons.
     Triggers automatic redispatch excluding the cancelling technician.
     """
@@ -2625,29 +2890,25 @@ class WorkforceJobTechnicianCancelView(APIView):
             if job.assigned_employee != emp:
                 return Response({"error": "You are not the assigned technician for this job.", "code": "NOT_ASSIGNED_TECHNICIAN"}, status=status.HTTP_403_FORBIDDEN)
 
-            # State check: ONLY allow cancellation during ACCEPTED or ON_THE_WAY
-            if job.status not in ["accepted", "on_the_way", "en_route"]:
+            # State check: Allowed prior to service start
+            if job.status in ["in_progress", "proof_submitted", "completed", "cancelled", "unable_to_complete"]:
                 return Response({
-                    "error": f"Cancellation is not allowed in current job state '{job.status}'. Cancellation window is only open prior to arrival.",
+                    "error": f"Cancellation is not allowed in current job state '{job.status}'. Cancellation is only allowed prior to service start.",
                     "code": "CANCELLATION_NOT_ALLOWED_IN_CURRENT_STATE",
                 }, status=status.HTTP_409_CONFLICT)
 
-            # 5-minute cancellation window check
-            from service_requests.models import EmployeeJob
-            emp_job = EmployeeJob.objects.filter(service_request=job, employee=emp).first()
-            accepted_at = (emp_job.accepted_date if emp_job and emp_job.accepted_date else None) or job.updated_at
-            
-            cancellation_deadline = accepted_at + timedelta(minutes=5)
-            now = timezone.now()
-            if now > cancellation_deadline:
+            # OTP verification check: cancellation is locked once customer OTP is verified
+            from workforce_api.models import PreServiceVerification
+            verification = PreServiceVerification.objects.filter(job=job).first()
+            if verification and verification.otp_verified:
                 return Response({
-                    "error": "Cancellation window has closed (5 minutes elapsed since acceptance).",
-                    "code": "CANCELLATION_WINDOW_EXPIRED",
-                    "accepted_at": accepted_at.isoformat(),
-                    "cancellation_deadline": cancellation_deadline.isoformat(),
+                    "error": "Cancellation is not allowed after customer OTP verification.",
+                    "code": "CANCELLATION_LOCKED_AFTER_OTP",
                 }, status=status.HTTP_409_CONFLICT)
 
             # 1. Update EmployeeJob record
+            from service_requests.models import EmployeeJob
+            emp_job = EmployeeJob.objects.filter(service_request=job, employee=emp).first()
             full_reason_str = f"[{reason_code}] {reason_detail}".strip()
             if emp_job:
                 emp_job.status = "CANCELLED"
@@ -2655,7 +2916,7 @@ class WorkforceJobTechnicianCancelView(APIView):
                 emp_job.save(update_fields=["status", "notes"])
 
             # 2. Terminate active JobTrackingSession
-            from workforce_api.models import JobTrackingSession, WorkforceJobOffer, WorkforceEventLog
+            from workforce_api.models import JobTrackingSession, WorkforceJobOffer, WorkforceEventLog, WorkforceJobLifecycleEvent
             JobTrackingSession.objects.filter(job=job, employee=emp, status=JobTrackingSession.SessionStatus.ACTIVE).update(
                 status=JobTrackingSession.SessionStatus.CANCELLED
             )
@@ -2663,12 +2924,29 @@ class WorkforceJobTechnicianCancelView(APIView):
             # 3. Mark offer as CANCELLED
             WorkforceJobOffer.objects.filter(job=job, employee=emp).update(status="CANCELLED")
 
-            # 4. Clear technician assignment on job & preserve customer booking
+            # 4. Release Employee Availability to AVAILABLE
+            emp.current_availability = "available"
+            emp.save(update_fields=["current_availability"])
+
+            # 5. Clear technician assignment on job & preserve customer booking
+            prev_status = job.status
             job.assigned_employee = None
-            job.status = "confirmed"
+            job.status = "unassigned"
             job.save(update_fields=["assigned_employee", "status"])
 
-            # 5. Log audit event
+            # 6. Log lifecycle & audit events
+            WorkforceJobLifecycleEvent.objects.create(
+                job=job,
+                employee=emp,
+                company=job.company,
+                actor_user=request.user,
+                event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_CANCELLED,
+                previous_status=prev_status,
+                new_status="unassigned",
+                reason_code=reason_code,
+                reason_text=reason_detail,
+            )
+
             WorkforceEventLog.objects.create(
                 user=emp.user,
                 event_type="JOB_CANCELLED_BY_TECH",
@@ -2680,7 +2958,7 @@ class WorkforceJobTechnicianCancelView(APIView):
                 }
             )
 
-            # 6. Automatic redispatch to next eligible candidate, excluding this technician
+            # 7. Automatic redispatch to next eligible candidate, excluding this technician
             try:
                 from workforce_api.services.automatic_dispatch import dispatch_job
                 dispatch_job(job, exclude_employee_ids=[emp.id])
@@ -6328,9 +6606,7 @@ class WorkforceEmployeeProfileMeView(APIView):
         if not emp:
             return Response({"error": "No employee profile found for user."}, status=status.HTTP_404_NOT_FOUND)
 
-        bank_details = emp.bank_details or {}
-        onboarding = bank_details.get("onboarding", {})
-        reg_status = onboarding.get("status", "not_started")
+        reg_status = get_employee_registration_status(emp)
         is_locked = reg_status in ["submitted", "under_review", "approved"]
 
         # Check if user is attempting to modify controlled fields directly
