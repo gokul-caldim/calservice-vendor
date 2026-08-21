@@ -177,35 +177,39 @@ def supersede_other_offers_for_employee(employee, accepted_job, reason: str = "E
     emp_id = employee.pk if hasattr(employee, "pk") else employee
     accepted_job_id = accepted_job.pk if hasattr(accepted_job, "pk") else accepted_job
 
-    other_offers = WorkforceJobOffer.objects.select_for_update().filter(
-        employee_id=emp_id,
-        status=WorkforceJobOffer.Status.OFFERED,
-    ).exclude(job_id=accepted_job_id)
+    other_offers = list(
+        WorkforceJobOffer.objects.select_for_update().filter(
+            employee_id=emp_id,
+            status=WorkforceJobOffer.Status.OFFERED,
+        ).exclude(job_id=accepted_job_id)
+    )
 
-    closed_count = 0
-    for offer in other_offers:
-        offer.status = WorkforceJobOffer.Status.SUPERSEDED_BY_ACCEPTANCE
-        offer.rejection_reason = reason
-        offer.save(update_fields=["status", "rejection_reason"])
-        closed_count += 1
+    if not other_offers:
+        return 0
 
-        logger.info(
-            f"[OFFER_SUPERSEDED] employee={emp_id} offer_job={offer.job_id} "
-            f"active_job={accepted_job_id} reason=EMPLOYEE_ALREADY_BUSY"
-        )
+    WorkforceJobOffer.objects.filter(
+        id__in=[o.id for o in other_offers]
+    ).update(
+        status=WorkforceJobOffer.Status.SUPERSEDED_BY_ACCEPTANCE,
+        rejection_reason=reason,
+    )
 
-        user_obj = getattr(employee, "user", None)
-        if user_obj:
-            WorkforceEventLog.objects.create(
+    user_obj = getattr(employee, "user", None)
+    if user_obj:
+        evs = [
+            WorkforceEventLog(
                 user=user_obj,
                 event_type="JOB_OFFER_CLOSED",
                 payload={
-                    "job_id": offer.job_id,
-                    "offer_id": offer.id,
+                    "job_id": o.job_id,
+                    "offer_id": o.id,
                     "reason": reason,
                     "active_job_id": accepted_job_id,
                     "message": "Offer closed automatically because you accepted another job.",
                 }
             )
+            for o in other_offers
+        ]
+        WorkforceEventLog.objects.bulk_create(evs)
 
-    return closed_count
+    return len(other_offers)

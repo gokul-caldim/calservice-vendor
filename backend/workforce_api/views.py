@@ -1399,6 +1399,13 @@ class WorkforceJobTransitionView(APIView):
             except Exception:
                 pass
 
+            if new_status in ["completed", "cancelled"]:
+                from workforce_api.services.workload import reconcile_employee_availability
+                if emp:
+                    reconcile_employee_availability(emp)
+                elif job.assigned_employee:
+                    reconcile_employee_availability(job.assigned_employee)
+
             return Response({
                 "message": f"Job transitioned to {new_status.upper()}.",
                 "job_id": job.id,
@@ -1472,6 +1479,11 @@ class WorkforceJobProofView(APIView):
         if is_paid:
             try:
                 apply_transition(job, "completed", actor=request.user)
+                from workforce_api.services.workload import reconcile_employee_availability
+                if emp:
+                    reconcile_employee_availability(emp)
+                elif job.assigned_employee:
+                    reconcile_employee_availability(job.assigned_employee)
                 msg = "After-service proof submitted and payment verified! Job is COMPLETED."
             except ValidationError as ve:
                 msg = f"After-service proof submitted. Completion note: {ve}"
@@ -1779,6 +1791,11 @@ class WorkforceJobPaymentVerifyOTPView(APIView):
             if job.status == "proof_submitted":
                 try:
                     apply_transition(job, "completed", actor=request.user)
+                    from workforce_api.services.workload import reconcile_employee_availability
+                    if emp:
+                        reconcile_employee_availability(emp)
+                    elif job.assigned_employee:
+                        reconcile_employee_availability(job.assigned_employee)
                 except ValidationError as ve:
                     logger.warning("Could not complete job #%s after payment OTP verification: %s", job.id, ve)
                     job.save(update_fields=["payment_status"])
@@ -2404,26 +2421,22 @@ class WorkforceJobAcceptOfferView(APIView):
     permission_classes = [IsApprovedTechnician]
 
     def post(self, request, pk):
-        job = ServiceRequest.objects.filter(pk=pk).first()
-        if not job:
-            return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
-
-        emp = getattr(request.user, "employee_profile", None)
-        if not emp:
+        emp_profile = getattr(request.user, "employee_profile", None)
+        if not emp_profile:
             return Response({"error": "Employee profile not found.", "code": "PROFILE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
-
-        # Cross-company tenant isolation check
-        if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
-            return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         with transaction.atomic():
             job_obj = ServiceRequest.objects.select_for_update().filter(pk=pk).first()
             if not job_obj:
                 return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
-            emp_obj = Employee.objects.select_for_update().filter(pk=emp.pk).first()
+            emp_obj = Employee.objects.select_for_update().filter(pk=emp_profile.pk).first()
             if not emp_obj:
                 return Response({"error": "Employee profile not found.", "code": "PROFILE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+            # Cross-company tenant isolation check
+            if not emp_obj.company_id or not job_obj.company_id or emp_obj.company_id != job_obj.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
             # Prevent duplicate acceptance by the same employee on the same job (Idempotent success)
             if job_obj.assigned_employee == emp_obj and job_obj.status in ACTIVE_WORKLOAD_STATUSES:
@@ -2434,7 +2447,7 @@ class WorkforceJobAcceptOfferView(APIView):
                 }, status=status.HTTP_200_OK)
 
             # Reject acceptance if assigned to another employee (Simultaneous Acceptance Winner-Takes-All)
-            if job_obj.assigned_employee and job_obj.assigned_employee != emp and job_obj.status in ["accepted", "on_the_way", "arrived", "in_progress", "completed"]:
+            if job_obj.assigned_employee and job_obj.assigned_employee != emp_obj and job_obj.status in ["accepted", "on_the_way", "arrived", "in_progress", "completed"]:
                 return Response({
                     "error": "Cannot accept job: Job has already been assigned and accepted by another technician.",
                     "code": "JOB_ALREADY_ACCEPTED"
@@ -2455,14 +2468,14 @@ class WorkforceJobAcceptOfferView(APIView):
                     "message": "This job has already been accepted by another professional."
                 }, status=status.HTTP_409_CONFLICT)
 
-            has_employee_job = EmployeeJob.objects.filter(service_request=job_obj, employee=emp_obj).exists()
-            is_direct_assigned = (job_obj.assigned_employee == emp_obj)
-
-            if (not offer or offer.status != WorkforceJobOffer.Status.OFFERED) and not has_employee_job and not is_direct_assigned:
-                return Response({
-                    "error": "No active job offer or assignment found for this technician.",
-                    "code": "NO_ACTIVE_OFFER"
-                }, status=status.HTTP_400_BAD_REQUEST)
+            if not offer or offer.status != WorkforceJobOffer.Status.OFFERED:
+                has_employee_job = EmployeeJob.objects.filter(service_request=job_obj, employee=emp_obj).exists()
+                is_direct_assigned = (job_obj.assigned_employee == emp_obj)
+                if not has_employee_job and not is_direct_assigned:
+                    return Response({
+                        "error": "No active job offer or assignment found for this technician.",
+                        "code": "NO_ACTIVE_OFFER"
+                    }, status=status.HTTP_400_BAD_REQUEST)
 
             now = timezone.now()
 
@@ -2479,17 +2492,13 @@ class WorkforceJobAcceptOfferView(APIView):
                     }, status=status.HTTP_409_CONFLICT)
 
             # 2. Hard Single Active Job Rule: Check if employee has a conflicting active job
-            conflicting = ServiceRequest.objects.filter(
-                assigned_employee=emp,
-                status__in=[
-                    "accepted", "on_the_way", "en_route", "arrived",
-                    "service_started", "in_progress", "proof_submitted",
-                    "service_completed", "payment_pending", "cash_pending"
-                ]
+            busy_job = ServiceRequest.objects.filter(
+                assigned_employee_id=emp_obj.id,
+                status__in=ACTIVE_WORKLOAD_STATUSES
             ).exclude(pk=job_obj.pk).first()
-            if conflicting:
+            if busy_job:
                 return Response({
-                    "error": f"Cannot accept job: Technician already has an active assigned Job #{conflicting.id}.",
+                    "error": f"Cannot accept job: Technician already has an active assigned Job #{busy_job.id}.",
                     "code": "EMPLOYEE_ALREADY_BUSY"
                 }, status=status.HTTP_409_CONFLICT)
 
@@ -2507,15 +2516,15 @@ class WorkforceJobAcceptOfferView(APIView):
                 offer.save(update_fields=["status"])
 
             job_obj.assigned_employee = emp_obj
-            job_obj.save(update_fields=["assigned_employee"])
-            apply_transition(job_obj, "accepted", actor=request.user)
+            job_obj.status = "accepted"
+            job_obj.save(update_fields=["assigned_employee", "status", "updated_at"])
 
             # Atomically mark employee availability as BUSY
             emp_obj.current_availability = "busy"
             emp_obj.save(update_fields=["current_availability"])
 
             # Mark all competing OFFERED records for the same job as SUPERSEDED_BY_ACCEPTANCE
-            WorkforceJobOffer.objects.select_for_update().filter(
+            WorkforceJobOffer.objects.filter(
                 job=job_obj,
                 status=WorkforceJobOffer.Status.OFFERED
             ).exclude(employee=emp_obj).update(
@@ -2564,33 +2573,40 @@ class WorkforceJobAcceptOfferView(APIView):
                 metadata={"offer_id": offer.id if offer else None}
             )
 
-            WorkforceEventLog.objects.create(
-                user=emp_obj.user,
-                event_type="EMPLOYEE_JOB_ACCEPTED",
-                payload={
-                    "job_id": job_obj.id,
-                    "employee_id": emp_obj.id,
-                    "accepted_at": now.isoformat(),
-                }
-            )
-            WorkforceEventLog.objects.create(
-                user=job_obj.customer if hasattr(job_obj, "customer") else None,
-                event_type="NEW_EMPLOYEE_ASSIGNED",
-                payload={
-                    "job_id": job_obj.id,
-                    "employee_id": emp_obj.id,
-                    "employee_name": emp_obj.user.get_full_name() or emp_obj.user.username,
-                    "status": "ACCEPTED",
-                }
-            )
+            # Batch event logs
+            events_to_create = [
+                WorkforceEventLog(
+                    user=emp_obj.user,
+                    event_type="EMPLOYEE_JOB_ACCEPTED",
+                    payload={
+                        "job_id": job_obj.id,
+                        "employee_id": emp_obj.id,
+                        "accepted_at": now.isoformat(),
+                    }
+                )
+            ]
+            if hasattr(job_obj, "customer") and job_obj.customer:
+                events_to_create.append(
+                    WorkforceEventLog(
+                        user=job_obj.customer,
+                        event_type="NEW_EMPLOYEE_ASSIGNED",
+                        payload={
+                            "job_id": job_obj.id,
+                            "employee_id": emp_obj.id,
+                            "employee_name": emp_obj.user.get_full_name() or emp_obj.user.username,
+                            "status": "ACCEPTED",
+                        }
+                    )
+                )
+            WorkforceEventLog.objects.bulk_create(events_to_create)
 
-            create_notification(
+            WorkforceNotification.objects.create(
                 recipient=emp_obj.user,
                 title="Job Offer Accepted",
                 message=f"You have accepted Job #{job_obj.id}. Proceed to customer location at {job_obj.address or 'scheduled site'}.",
                 notification_type="JOB_ASSIGNMENT",
                 company=job_obj.company,
-                related_object_id=job_obj.id,
+                related_object_id=str(job_obj.id),
             )
 
             return Response({
@@ -5648,8 +5664,8 @@ class WorkforceRealtimeStreamView(APIView):
                             yield f"id: {ev_id}\nevent: workforce_event\ndata: {json.dumps(event_data)}\n\n"
 
                     time.sleep(1)
-            except GeneratorExit:
-                logger.info("[Realtime SSE END] Client disconnected (GeneratorExit) for user_id=%s.", user_id_val)
+            except (GeneratorExit, ConnectionResetError, BrokenPipeError):
+                logger.info("[Realtime SSE END] Client disconnected (GeneratorExit/Reset) for user_id=%s.", user_id_val)
             except Exception as stream_err:
                 logger.warning("[Realtime SSE EXCEPTION] Stream loop exception for user_id=%s: %s", user_id_val, str(stream_err))
             finally:

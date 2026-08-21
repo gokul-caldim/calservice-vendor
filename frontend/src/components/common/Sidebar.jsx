@@ -19,6 +19,10 @@ import {
   User,
   Star,
   MapPin,
+  Wallet,
+  ArrowDownCircle,
+  CreditCard,
+  ReceiptText,
 } from 'lucide-react';
 
 export function Sidebar({ onCloseMobile = () => {} }) {
@@ -29,8 +33,10 @@ export function Sidebar({ onCloseMobile = () => {} }) {
   const [collapsed, setCollapsed] = useState({
     workforce: false,
     operations: false,
+    finance: false,
     myWork: false,
     profile: false,
+    earnings: false,
   });
 
   const toggleSection = (section) => {
@@ -152,6 +158,59 @@ export function Sidebar({ onCloseMobile = () => {} }) {
                 >
                   <Navigation className="w-3.5 h-3.5 text-slate-400" />
                   <span>Live Workforce</span>
+                </NavLink>
+              </div>
+            )}
+          </div>
+
+          {/* Group 3: FINANCE */}
+          <div>
+            <button
+              type="button"
+              onClick={() => toggleSection('finance')}
+              className="w-full flex items-center justify-between px-2 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider hover:text-slate-600 transition-colors"
+            >
+              <span>Finance</span>
+              {collapsed.finance ? (
+                <ChevronRight className="w-3 h-3" />
+              ) : (
+                <ChevronDown className="w-3 h-3" />
+              )}
+            </button>
+            {!collapsed.finance && (
+              <div className="mt-1 space-y-0.5 pl-1">
+                <NavLink
+                  to="/workforce/admin/wallet"
+                  end
+                  onClick={onCloseMobile}
+                  className={navItemClass}
+                >
+                  <Wallet className="w-3.5 h-3.5 text-emerald-500" />
+                  <span>Wallet</span>
+                </NavLink>
+                <NavLink
+                  to="/workforce/admin/wallet/transactions"
+                  onClick={onCloseMobile}
+                  className={navItemClass}
+                >
+                  <ReceiptText className="w-3.5 h-3.5 text-slate-400" />
+                  <span>Transactions</span>
+                </NavLink>
+                <NavLink
+                  to="/workforce/admin/wallet/withdrawals"
+                  onClick={onCloseMobile}
+                  className={navItemClass}
+                >
+                  <ArrowDownCircle className="w-3.5 h-3.5 text-slate-400" />
+                  <span>Withdrawals</span>
+                </NavLink>
+                <NavLink
+                  to="/workforce/admin/wallet/payout-accounts"
+                  onClick={onCloseMobile}
+                  className={navItemClass}
+                >
+                  <CreditCard className="w-3.5 h-3.5 text-slate-400" />
+                  <span>Bank Accounts</span>
                 </NavLink>
               </div>
             )}
@@ -358,6 +417,59 @@ export function Sidebar({ onCloseMobile = () => {} }) {
               >
                 <MapPin className="w-3.5 h-3.5 text-slate-400" />
                 <span>My Locations</span>
+              </NavLink>
+            </div>
+          )}
+        </div>
+
+        {/* Group: EARNINGS */}
+        <div>
+          <button
+            type="button"
+            onClick={() => toggleSection('earnings')}
+            className="w-full flex items-center justify-between px-2 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider hover:text-slate-600 transition-colors"
+          >
+            <span>Earnings</span>
+            {collapsed.earnings ? (
+              <ChevronRight className="w-3 h-3" />
+            ) : (
+              <ChevronDown className="w-3 h-3" />
+            )}
+          </button>
+          {!collapsed.earnings && (
+            <div className="mt-1 space-y-0.5 pl-1">
+              <NavLink
+                to="/workforce/employee/wallet"
+                end
+                onClick={onCloseMobile}
+                className={navItemClass}
+              >
+                <Wallet className="w-3.5 h-3.5 text-emerald-500" />
+                <span>My Wallet</span>
+              </NavLink>
+              <NavLink
+                to="/workforce/employee/wallet/transactions"
+                onClick={onCloseMobile}
+                className={navItemClass}
+              >
+                <ReceiptText className="w-3.5 h-3.5 text-slate-400" />
+                <span>Transactions</span>
+              </NavLink>
+              <NavLink
+                to="/workforce/employee/wallet/withdrawals"
+                onClick={onCloseMobile}
+                className={navItemClass}
+              >
+                <ArrowDownCircle className="w-3.5 h-3.5 text-slate-400" />
+                <span>Withdrawals</span>
+              </NavLink>
+              <NavLink
+                to="/workforce/employee/wallet/payout-accounts"
+                onClick={onCloseMobile}
+                className={navItemClass}
+              >
+                <CreditCard className="w-3.5 h-3.5 text-slate-400" />
+                <span>Bank Accounts</span>
               </NavLink>
             </div>
           )}

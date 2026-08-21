@@ -45,6 +45,18 @@ import { AdminReportsPage } from './pages/admin/AdminReportsPage.jsx';
 import { AdminSkillsPage } from './pages/admin/AdminSkillsPage.jsx';
 import { CustomerTrackingPage } from './pages/customer/CustomerTrackingPage.jsx';
 
+// Employee Wallet Pages
+import { EmployeeWalletDashboardPage } from './pages/employee/wallet/EmployeeWalletDashboardPage.jsx';
+import { EmployeeWalletTransactionsPage } from './pages/employee/wallet/EmployeeWalletTransactionsPage.jsx';
+import { EmployeeWalletWithdrawalsPage } from './pages/employee/wallet/EmployeeWalletWithdrawalsPage.jsx';
+import { EmployeePayoutAccountsPage } from './pages/employee/wallet/EmployeePayoutAccountsPage.jsx';
+
+// Admin Wallet Pages
+import { WalletDashboardPage } from './pages/admin/wallet/WalletDashboardPage.jsx';
+import { WalletTransactionsPage } from './pages/admin/wallet/WalletTransactionsPage.jsx';
+import { WalletWithdrawalsPage } from './pages/admin/wallet/WalletWithdrawalsPage.jsx';
+import { WalletPayoutAccountsPage } from './pages/admin/wallet/WalletPayoutAccountsPage.jsx';
+
 function RootRedirect() {
   const { isReady, isAuthenticated, isAdmin, registrationStatus } = useAuth();
 
@@ -151,7 +163,11 @@ export function App() {
             <Route path="schedule" element={<Navigate to="/workforce/employee/dashboard" replace />} />
             <Route path="attendance" element={<Navigate to="/workforce/employee/dashboard" replace />} />
             <Route path="leave" element={<Navigate to="/workforce/employee/dashboard" replace />} />
-            <Route path="earnings" element={<Navigate to="/workforce/employee/dashboard" replace />} />
+            <Route path="earnings" element={<EmployeeWalletDashboardPage />} />
+            <Route path="wallet" element={<EmployeeWalletDashboardPage />} />
+            <Route path="wallet/transactions" element={<EmployeeWalletTransactionsPage />} />
+            <Route path="wallet/withdrawals" element={<EmployeeWalletWithdrawalsPage />} />
+            <Route path="wallet/payout-accounts" element={<EmployeePayoutAccountsPage />} />
             <Route path="documents" element={<EmployeeDashboardPage />} />
             <Route path="services" element={<EmployeeDashboardPage />} />
             <Route path="profile" element={<EmployeeProfilePage />} />
@@ -258,6 +274,40 @@ export function App() {
             element={
               <AdminRoute>
                 <AdminDashboardPage />
+              </AdminRoute>
+            }
+          />
+
+          {/* Vendor Wallet Module — Admin/Manager only */}
+          <Route
+            path="/workforce/admin/wallet"
+            element={
+              <AdminRoute>
+                <WalletDashboardPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/workforce/admin/wallet/transactions"
+            element={
+              <AdminRoute>
+                <WalletTransactionsPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/workforce/admin/wallet/withdrawals"
+            element={
+              <AdminRoute>
+                <WalletWithdrawalsPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/workforce/admin/wallet/payout-accounts"
+            element={
+              <AdminRoute>
+                <WalletPayoutAccountsPage />
               </AdminRoute>
             }
           />

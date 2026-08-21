@@ -513,7 +513,7 @@ def test_j_admin_dispatch_revalidation_and_race_protection():
     offer = WorkforceJobOffer.objects.filter(job=job, employee=tech, status=WorkforceJobOffer.Status.OFFERED).first()
     assert_true(offer is not None, f"WorkforceJobOffer created for Job #{job.id} and Tech #{tech.id}")
     time_diff = (offer.expires_at - offer.offered_at).total_seconds()
-    assert_true(290 <= time_diff <= 310, f"Offer duration is exactly 5 minutes ({time_diff}s)")
+    assert_true(110 <= time_diff <= 130, f"Offer duration is exactly 2 minutes ({time_diff}s)")
 
     # 2. Race condition: Technician becomes busy on another job, Admin tries to dispatch another job to same tech
     job_2 = create_customer_job(company, "ADMIN_DISPATCH_RACE_2")

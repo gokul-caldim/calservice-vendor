@@ -18,7 +18,7 @@ export const ERROR_CODES = {
 export const CONFLICT_CODES = {
   JOB_ALREADY_ACCEPTED: 'JOB_ALREADY_ACCEPTED',
   EMPLOYEE_ALREADY_BUSY: 'EMPLOYEE_ALREADY_BUSY',
-  CANCELLATION_WINDOW_EXPIRED: 'CANCELLATION_WINDOW_EXPIRED',
+  CANCELLATION_LOCKED_AFTER_OTP: 'CANCELLATION_LOCKED_AFTER_OTP',
   CANCELLATION_NOT_ALLOWED_IN_CURRENT_STATE: 'CANCELLATION_NOT_ALLOWED_IN_CURRENT_STATE',
   STALE_LOCATION: 'STALE_LOCATION',
   INVALID_STATE: 'INVALID_STATE',
@@ -70,8 +70,8 @@ export function getFriendlyErrorMessage(error) {
     if (code === CONFLICT_CODES.EMPLOYEE_ALREADY_BUSY) {
       return 'You currently have an active job in progress.';
     }
-    if (code === CONFLICT_CODES.CANCELLATION_WINDOW_EXPIRED) {
-      return 'The cancellation window for this job has expired.';
+    if (code === CONFLICT_CODES.CANCELLATION_LOCKED_AFTER_OTP || code === 'CANCELLATION_LOCKED_AFTER_OTP') {
+      return 'Cancellation is locked after customer Work Start OTP verification.';
     }
     if (code === CONFLICT_CODES.CANCELLATION_NOT_ALLOWED_IN_CURRENT_STATE) {
       return 'Cancellation is not permitted in the current job state.';

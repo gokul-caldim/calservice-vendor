@@ -53,6 +53,9 @@ INSTALLED_APPS = [
     "service_requests",
     "workforce_api",
     "time_tracking",
+
+    # Vendor Wallet financial module
+    "vendor_wallet",
 ]
 
 MIDDLEWARE = [

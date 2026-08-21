@@ -156,6 +156,12 @@ export function ClockInCard({
   };
 
   const currentActiveJob = activeJob || serverActiveJob;
+  const isCashPaymentPending = Boolean(
+    currentActiveJob &&
+    ['in_progress', 'proof_submitted'].includes((currentActiveJob.status || '').toLowerCase()) &&
+    ((currentActiveJob.payment?.payment_method || currentActiveJob.payment_method || '').toUpperCase() === 'CASH_ON_SERVICE') &&
+    !(currentActiveJob.payment?.is_cash_collected || currentActiveJob.is_cash_collected || currentActiveJob.payment?.payment_status === 'PAID' || currentActiveJob.payment_status === 'paid')
+  );
   const readiness = getClockInReadiness(currentActiveJob, null, isClockedIn);
 
   // Perform Clock-In using centralized runtime action
@@ -456,21 +462,27 @@ export function ClockInCard({
                   Mandatory Before Clock-In: 1. Auto-Arrival (&le;250m) &bull; 2. Customer OTP &bull; 3. Presence Selfie
                 </p>
 
-                <button
-                  type="button"
-                  onClick={handleClockIn}
-                  disabled={loading || !readiness.canClockIn}
-                  className={`w-full py-2 px-4 rounded font-bold text-xs transition-colors flex items-center justify-center gap-2 shadow-sm active:scale-95 ${
-                    readiness.canClockIn
-                      ? 'bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer'
-                      : 'bg-slate-100 border border-slate-200 text-slate-400 cursor-not-allowed opacity-75'
-                  }`}
-                >
-                  <Play className="w-4 h-4" />
-                  <span>
-                    {readiness.canClockIn ? 'Clock In & Start Work' : `Clock In Locked (${readiness.label})`}
-                  </span>
-                </button>
+                {readiness.canClockIn ? (
+                  <div className="w-full py-2.5 px-4 rounded font-bold text-xs flex items-center justify-center gap-2 shadow-xs bg-emerald-50 border border-emerald-300 text-emerald-800">
+                    <span className="w-2 h-2 rounded-full bg-emerald-600 animate-ping" />
+                    <span>
+                      {loading ? 'Clocking In...' : '✓ Pre-Verification Complete — Auto Clocking In...'}
+                    </span>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const el = document.getElementById('arrival-verification-checklist');
+                      if (el) el.scrollIntoView({ behavior: 'smooth' });
+                    }}
+                    disabled={true}
+                    className="w-full py-2 px-4 rounded font-bold text-xs flex items-center justify-center gap-2 bg-slate-100 border border-slate-200 text-slate-400 cursor-not-allowed opacity-75"
+                  >
+                    <Play className="w-4 h-4" />
+                    <span>{`Clock In Locked (${readiness.label})`}</span>
+                  </button>
+                )}
               </div>
             ) : (
               <div className="space-y-2">
@@ -502,40 +514,52 @@ export function ClockInCard({
               </div>
             )
           ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <button
-                type="button"
-                onClick={handleClockOut}
-                disabled={loading}
-                className="w-full py-2 px-4 rounded bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs transition-colors flex items-center justify-center gap-2 shadow-sm disabled:opacity-50 active:scale-95"
-              >
-                <Clock className="w-4 h-4" />
-                <span>Clock Out of Shift</span>
-              </button>
+            <div className="space-y-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={handleClockOut}
+                  disabled={loading || isCashPaymentPending}
+                  title={isCashPaymentPending ? 'Cash payment must be collected and recorded before clocking out.' : 'Clock out of active shift'}
+                  className={`w-full py-2 px-4 rounded font-bold text-xs transition-colors flex items-center justify-center gap-2 shadow-xs active:scale-95 ${
+                    isCashPaymentPending
+                      ? 'bg-slate-100 border border-slate-300 text-slate-400 cursor-not-allowed opacity-75'
+                      : 'bg-rose-600 hover:bg-rose-700 text-white cursor-pointer disabled:opacity-50'
+                  }`}
+                >
+                  <Clock className="w-4 h-4" />
+                  <span>{isCashPaymentPending ? 'Clock Out (Cash Pending)' : 'Clock Out of Shift'}</span>
+                </button>
 
-              <div>
-                {!activeBreak ? (
-                  <button
-                    type="button"
-                    onClick={() => setShowBreakModal(true)}
-                    disabled={loading}
-                    className="w-full py-2 px-4 rounded bg-amber-50 hover:bg-amber-100 border border-amber-300 text-amber-900 font-bold text-xs transition-colors flex items-center justify-center gap-2"
-                  >
-                    <Coffee className="w-4 h-4 text-amber-700" />
-                    <span>Take Break</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => handleBreakAction(activeBreak)}
-                    disabled={loading}
-                    className="w-full py-2 px-4 rounded bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs transition-colors flex items-center justify-center gap-2 shadow-sm"
-                  >
-                    <CheckCircle2 className="w-4 h-4" />
-                    <span>End {activeBreak.toUpperCase()} Break</span>
-                  </button>
-                )}
+                <div>
+                  {!activeBreak ? (
+                    <button
+                      type="button"
+                      onClick={() => setShowBreakModal(true)}
+                      disabled={loading}
+                      className="w-full py-2 px-4 rounded bg-amber-50 hover:bg-amber-100 border border-amber-300 text-amber-900 font-bold text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <Coffee className="w-4 h-4 text-amber-700" />
+                      <span>Take Break</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleBreakAction(activeBreak)}
+                      disabled={loading}
+                      className="w-full py-2 px-4 rounded bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs transition-colors flex items-center justify-center gap-2 shadow-xs cursor-pointer"
+                    >
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>End {activeBreak.toUpperCase()} Break</span>
+                    </button>
+                  )}
+                </div>
               </div>
+              {isCashPaymentPending && (
+                <p className="text-[10.5px] text-amber-800 bg-amber-50 p-2 rounded border border-amber-200 font-medium">
+                  ⚠️ Cash collection pending on active job. Collect & record cash in your active job view to enable clock-out.
+                </p>
+              )}
             </div>
           )}
         </div>

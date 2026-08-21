@@ -1254,6 +1254,11 @@ class JobPayment(models.Model):
         """Authoritative check if cash collection is persisted or job is fully paid."""
         return bool(self.cash_collected_at is not None or self.payment_status == self.PaymentStatus.PAID)
 
+    @property
+    def is_cash_received(self):
+        """Authoritative check if cash collection is persisted or job is fully paid (Phase 2 Requirement)."""
+        return self.is_cash_collected
+
     def __str__(self):
         return f"Payment #{self.id} for Job #{self.job_id} ({self.payment_method} - {self.payment_status} - ₹{self.amount_due})"
 

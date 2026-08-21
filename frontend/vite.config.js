@@ -18,6 +18,18 @@ export default defineConfig(({ mode }) => {
           target: apiUrl,
           changeOrigin: true,
           secure: false,
+          ws: true,
+          timeout: 0,
+          proxyTimeout: 0,
+          configure: (proxy) => {
+            proxy.on('error', (err, _req, _res) => {
+              // Gracefully handle expected disconnects during HMR, browser reloads, or backend server restarts
+              if (['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT'].includes(err.code)) {
+                return;
+              }
+              console.warn('[vite proxy error]', err.message);
+            });
+          },
         },
         '/media': {
           target: apiUrl,

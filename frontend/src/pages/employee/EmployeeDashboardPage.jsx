@@ -136,6 +136,7 @@ export function EmployeeDashboardPage() {
     selectedJob,
     setSelectedJob,
     incomingOffer,
+    incomingOffers: runtimeIncomingOffers,
     hasActiveJob,
     isJobsLoading: isRuntimeJobsLoading,
     refreshActiveJobs,
@@ -186,8 +187,11 @@ export function EmployeeDashboardPage() {
 
   // Incoming offers are visible even if technician is currently on an active job (Accept is gated)
   const incomingOffers = useMemo(() => {
+    if (runtimeIncomingOffers && runtimeIncomingOffers.length > 0) {
+      return runtimeIncomingOffers;
+    }
     return incomingOffer ? [incomingOffer] : [];
-  }, [incomingOffer]);
+  }, [runtimeIncomingOffers, incomingOffer]);
 
   const displayedJobs = useMemo(() => {
     if (jobQueueTab === 'completed') return completedJobs;
@@ -297,26 +301,12 @@ export function EmployeeDashboardPage() {
 
   const getRemainingCancellationTime = (job) => {
     if (!job) return null;
-    const isStateAllowed = ['accepted', 'on_the_way', 'en_route'].includes((job.status || '').toLowerCase());
+    const isStateAllowed = ['accepted', 'on_the_way', 'en_route', 'arrived'].includes((job.status || '').toLowerCase());
     if (!isStateAllowed) return null;
-
-    const cancelInfo = job.cancellation_info;
-    const deadline = cancelInfo?.cancellation_deadline || (
-      cancelInfo?.accepted_at ? new Date(new Date(cancelInfo.accepted_at).getTime() + 5 * 60 * 1000).toISOString() : (
-        job.created_at ? new Date(new Date(job.created_at).getTime() + 5 * 60 * 1000).toISOString() : null
-      )
-    );
-
-    if (!deadline) return null;
-    const deadlineMs = new Date(deadline).getTime();
-    const remainingMs = deadlineMs - currentTimeTick;
-    if (remainingMs <= 0) {
-      return { expired: true, text: 'Cancellation window closed' };
+    if (job.pre_service_verification?.otp_verified || preServiceState?.otp_verified) {
+      return { expired: true, text: 'Locked (OTP Verified)' };
     }
-    const totalSec = Math.floor(remainingMs / 1000);
-    const mins = Math.floor(totalSec / 60).toString().padStart(2, '0');
-    const secs = (totalSec % 60).toString().padStart(2, '0');
-    return { expired: false, text: `${mins}:${secs}`, totalSec };
+    return { expired: false, text: 'Available before OTP' };
   };
 
   // Track jobs that returned 403 or are forbidden to prevent looping console errors
@@ -373,6 +363,33 @@ export function EmployeeDashboardPage() {
       clearInterval(interval);
     };
   }, [selectedJob?.id, selectedJob?.status, preServiceState.geofence_passed]);
+
+  // Centralized Auto Clock-In Effect: Triggers automatically when geofence_passed && otp_verified && presence_photo
+  // regardless of which prerequisite was satisfied last (Geofence last, OTP last, or Selfie last).
+  useEffect(() => {
+    if (!selectedJob?.id) return;
+    const st = (selectedJob.status || '').toLowerCase();
+    if (!['accepted', 'on_the_way', 'en_route', 'arrived'].includes(st)) return;
+    if (isClockedIn || isClockingInRef.current) return;
+
+    const isAllReady = Boolean(
+      preServiceState.is_complete ||
+      (preServiceState.geofence_passed && preServiceState.otp_verified && preServiceState.presence_photo)
+    );
+
+    if (isAllReady) {
+      console.info(`[EmployeeDashboard] Auto Clock-In condition satisfied for Job #${selectedJob.id}. Executing auto clock-in...`);
+      handleDirectJobClockIn();
+    }
+  }, [
+    preServiceState.is_complete,
+    preServiceState.geofence_passed,
+    preServiceState.otp_verified,
+    preServiceState.presence_photo,
+    selectedJob?.id,
+    selectedJob?.status,
+    isClockedIn,
+  ]);
 
   const handleVerifyOtpSubmit = async () => {
     if (!selectedJob || !otpInput.trim()) return;
@@ -1695,24 +1712,32 @@ export function EmployeeDashboardPage() {
                             )}
                           </div>
 
+                          {hasActiveJob && (
+                            <div className="pt-0.5">
+                              <span className="text-[10px] font-bold text-amber-900 bg-amber-100/90 px-2 py-0.5 rounded border border-amber-300 inline-block">
+                                Offer held for you — Finish current job first to accept
+                              </span>
+                            </div>
+                          )}
+
                           <div className="flex items-center gap-2 pt-1">
                             <button
                               type="button"
                               onClick={() => handleAcceptOffer(offerJob.id)}
                               disabled={actionLoading === offerJob.id || hasActiveJob}
-                              className={`flex-1 py-2 font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 ${
+                              className={`flex-1 py-2 font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 ${
                                 hasActiveJob
-                                  ? 'bg-slate-400 text-white cursor-not-allowed'
-                                  : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                  ? 'bg-slate-400 text-white cursor-not-allowed opacity-80'
+                                  : 'bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer'
                               }`}
-                              title={hasActiveJob ? 'Finish your current active job to accept this offer' : 'Accept Job'}
+                              title={hasActiveJob ? 'Finish current job first to accept this offer' : 'Accept Job'}
                             >
                               <CheckCircle2 className="w-4 h-4" />
                               <span>
                                 {actionLoading === offerJob.id
                                   ? 'Accepting...'
                                   : hasActiveJob
-                                  ? 'BUSY ON CURRENT JOB'
+                                  ? 'Finish current job first'
                                   : 'ACCEPT JOB'}
                               </span>
                             </button>
@@ -1894,8 +1919,8 @@ export function EmployeeDashboardPage() {
                   </div>
                 )}
 
-                {/* ⚡ Dedicated Incoming Job Offers Section (Render ONLY when no active job is in progress) */}
-                {!hasActiveJob && incomingOffers.length > 0 && (
+                {/* ⚡ Dedicated Incoming Job Offers Section (Rendered for all valid offers; Accept is disabled if busy) */}
+                {incomingOffers.length > 0 && (
                   <div className="space-y-3 bg-amber-50 border-2 border-amber-400 rounded-lg p-4 shadow-md">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
@@ -1956,24 +1981,32 @@ export function EmployeeDashboardPage() {
                               )}
                             </div>
 
+                            {hasActiveJob && (
+                              <div className="pt-0.5">
+                                <span className="text-[10px] font-bold text-amber-900 bg-amber-100/90 px-2 py-0.5 rounded border border-amber-300 inline-block">
+                                  Offer held for you — Finish current job first to accept
+                                </span>
+                              </div>
+                            )}
+
                             <div className="flex items-center gap-2 pt-1">
                               <button
                                 type="button"
                                 onClick={() => handleAcceptOffer(offerJob.id)}
                                 disabled={actionLoading === offerJob.id || hasActiveJob}
-                                className={`flex-1 py-2 font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 ${
+                                className={`flex-1 py-2 font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 ${
                                   hasActiveJob
-                                    ? 'bg-slate-400 text-white cursor-not-allowed'
-                                    : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                    ? 'bg-slate-400 text-white cursor-not-allowed opacity-80'
+                                    : 'bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer'
                                 }`}
-                                title={hasActiveJob ? 'Finish your current active job to accept this offer' : 'Accept Job'}
+                                title={hasActiveJob ? 'Finish current job first to accept this offer' : 'Accept Job'}
                               >
                                 <CheckCircle2 className="w-4 h-4" />
                                 <span>
                                   {actionLoading === offerJob.id
                                     ? 'Accepting...'
                                     : hasActiveJob
-                                    ? 'BUSY ON CURRENT JOB'
+                                    ? 'Finish current job first'
                                     : 'ACCEPT JOB'}
                                 </span>
                               </button>
@@ -2225,14 +2258,14 @@ export function EmployeeDashboardPage() {
                                 type="button"
                                 onClick={(e) => { e.stopPropagation(); handleAcceptOffer(job.id); }}
                                 disabled={actionLoading === job.id || hasActiveJob}
-                                className={`flex-1 py-1.5 font-bold rounded-lg text-xs shadow-xs transition-colors cursor-pointer disabled:opacity-60 ${
+                                className={`flex-1 py-1.5 font-bold rounded-lg text-xs shadow-xs transition-colors ${
                                   hasActiveJob
-                                    ? 'bg-slate-400 text-white cursor-not-allowed'
-                                    : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                    ? 'bg-slate-400 text-white cursor-not-allowed opacity-80'
+                                    : 'bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer'
                                 }`}
-                                title={hasActiveJob ? 'Finish your current active job to accept this offer' : 'Accept Job'}
+                                title={hasActiveJob ? 'Finish current job first to accept this offer' : 'Accept Job'}
                               >
-                                {actionLoading === job.id ? 'ACCEPTING...' : hasActiveJob ? 'BUSY' : 'ACCEPT'}
+                                {actionLoading === job.id ? 'ACCEPTING...' : hasActiveJob ? 'Finish current job first' : 'ACCEPT'}
                               </button>
                               <button
                                 type="button"
@@ -2438,15 +2471,33 @@ export function EmployeeDashboardPage() {
                               />
                             )}
                           </div>
+                          {hasActiveJob && (
+                            <div className="pt-0.5">
+                              <span className="text-[11px] font-bold text-amber-900 bg-amber-100/90 px-2.5 py-1 rounded border border-amber-300 inline-block">
+                                Offer held for you — Finish current job first to accept
+                              </span>
+                            </div>
+                          )}
                           <div className="flex items-center gap-2">
                             <button
                               type="button"
-                              disabled={actionLoading === selectedJob.id}
+                              disabled={actionLoading === selectedJob.id || hasActiveJob}
                               onClick={() => handleAcceptOffer(selectedJob.id)}
-                              className="flex-1 py-2 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                              className={`flex-1 py-2 rounded font-bold text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 ${
+                                hasActiveJob
+                                  ? 'bg-slate-400 text-white cursor-not-allowed opacity-80'
+                                  : 'bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer'
+                              }`}
+                              title={hasActiveJob ? 'Finish current job first to accept this offer' : 'Accept Job'}
                             >
                               <CheckCircle2 className="w-4 h-4" />
-                              <span>{actionLoading === selectedJob.id ? 'Accepting...' : 'ACCEPT JOB'}</span>
+                              <span>
+                                {actionLoading === selectedJob.id
+                                  ? 'Accepting...'
+                                  : hasActiveJob
+                                  ? 'Finish current job first'
+                                  : 'ACCEPT JOB'}
+                              </span>
                             </button>
                             <button
                               type="button"
@@ -2460,30 +2511,24 @@ export function EmployeeDashboardPage() {
                         </div>
                       )}
 
-                      {/* 2. STATE: ACCEPTED / ON_THE_WAY (5-Minute Cancellation Window) */}
-                      {['accepted', 'on_the_way', 'en_route'].includes((selectedJob.status || '').toLowerCase()) && (
+                      {/* 2. STATE: ACCEPTED / ON_THE_WAY / ARRIVED (Cancellation available prior to customer OTP) */}
+                      {['accepted', 'on_the_way', 'en_route', 'arrived'].includes((selectedJob.status || '').toLowerCase()) && !preServiceState?.otp_verified && (
                         <div className="w-full p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-2">
                           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                             <div>
                               <div className="flex items-center gap-1.5">
-                                <Clock className="w-4 h-4 text-slate-600" />
-                                <span className="font-bold text-xs text-slate-800">5-Minute Cancellation Window</span>
+                                <Ban className="w-4 h-4 text-slate-600" />
+                                <span className="font-bold text-xs text-slate-800">Job Assignment Cancellation</span>
                               </div>
                               <p className="text-[10px] text-slate-500 mt-0.5">
-                                Authoritative server countdown. If you experience an emergency, you may cancel before site arrival.
+                                Cancellation is permitted at any time prior to customer Work Start OTP verification.
                               </p>
                             </div>
                             <div className="flex items-center gap-2 flex-wrap">
-                              <CountdownBadge
-                                targetTime={selectedJob.cancellation_info?.cancellation_deadline || (selectedJob.created_at ? new Date(new Date(selectedJob.created_at).getTime() + 5 * 60000) : null)}
-                                prefix="Cancellation available for "
-                                expiredText="Cancellation window closed"
-                                tone="rose"
-                              />
                               <button
                                 type="button"
                                 onClick={() => handleOpenCancelModal(selectedJob)}
-                                disabled={actionLoading === selectedJob.id || (selectedJob.cancellation_info?.can_cancel === false && selectedJob.cancellation_info?.remaining_seconds === 0)}
+                                disabled={actionLoading === selectedJob.id || preServiceState?.otp_verified}
                                 className="px-3 py-1.5 text-xs font-bold text-rose-700 bg-white hover:bg-rose-50 border border-rose-300 rounded shadow-xs transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shrink-0 flex items-center gap-1"
                               >
                                 <Ban className="w-3.5 h-3.5" />
@@ -2603,7 +2648,7 @@ export function EmployeeDashboardPage() {
                               {/* Identity Presence Photo */}
                               <div className="flex items-center justify-between text-xs pt-1">
                                 <div>
-                                  <span className="font-semibold text-slate-800">Before Face Selfie (Technician Identity)</span>
+                                  <span className="font-semibold text-slate-800">Technician Presence Selfie (Face Identity)</span>
                                   <p className="text-[10px] text-slate-500">Live selfie at job location showing identity before starting work</p>
                                 </div>
                                 {preServiceState.presence_photo ? (
@@ -2672,18 +2717,13 @@ export function EmployeeDashboardPage() {
                                   Pre-Service Verification Complete!
                                 </h4>
                                 <p className="text-[10px] text-emerald-700 mt-0.5">
-                                  All arrival, OTP, and presence identity verified. Shift clock-in is ready.
+                                  All arrival, OTP, and presence identity verified. Starting work automatically...
                                 </p>
                               </div>
-                              <button
-                                type="button"
-                                onClick={handleDirectJobClockIn}
-                                disabled={actionLoading === selectedJob.id}
-                                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs shadow transition-colors flex items-center gap-1.5 shrink-0 justify-center cursor-pointer"
-                              >
-                                <Play className="w-3.5 h-3.5" />
-                                <span>{actionLoading === selectedJob.id ? 'Clocking In...' : 'CLOCK IN & START WORK'}</span>
-                              </button>
+                              <div className="px-3 py-1.5 bg-emerald-100 border border-emerald-300 text-emerald-800 font-bold rounded text-xs flex items-center gap-1.5 shrink-0 justify-center">
+                                <span className="w-2 h-2 rounded-full bg-emerald-600 animate-ping" />
+                                <span>{actionLoading === selectedJob.id ? 'Clocking In...' : 'Auto Clock-In Active'}</span>
+                              </div>
                             </div>
                           ) : null}
                         </div>

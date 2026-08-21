@@ -201,11 +201,11 @@ def is_within_automatic_radius(distance_km: float) -> bool:
 def is_within_radius(
     distance_km: float,
     radius_km: float = ADMIN_DISPATCH_RADIUS_KM,
-    tolerance_km: float = DISTANCE_TOLERANCE_KM,
+    tolerance_km: float = 0.0,
 ) -> bool:
     """
-    Authoritatively checks if distance_km is within radius_km,
-    accounting for numerical precision buffer.
+    Authoritatively checks if distance_km is within radius_km.
+    Strictly adheres to boundary: <= 20.000 km eligible, > 20.000 km ineligible.
     """
     if distance_km is None:
         return False

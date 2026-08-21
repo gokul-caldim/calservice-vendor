@@ -103,16 +103,25 @@ export function EmployeeRuntimeProvider({ children }) {
     });
   }, [activeJobs, user?.id]);
 
+  const incomingOffers = useMemo(() => {
+    const currentNow = Date.now() + (serverTimeOffset || 0);
+    return activeJobs.filter((j) => {
+      const isOffer = j.is_offer === true || j.active_offer?.status === 'OFFERED';
+      if (!isOffer || j.is_assigned_to_current_employee) return false;
+      const expStr = j.offer_expires_at || j.active_offer?.expires_at;
+      if (expStr) {
+        const expMs = Date.parse(expStr);
+        if (!isNaN(expMs) && expMs <= currentNow) {
+          return false;
+        }
+      }
+      return !j.active_offer?.is_expired;
+    });
+  }, [activeJobs, serverTimeOffset]);
+
   const incomingOffer = useMemo(() => {
-    return (
-      activeJobs.find(
-        (j) =>
-          (j.is_offer === true || j.active_offer?.status === 'OFFERED') &&
-          !j.active_offer?.is_expired &&
-          !j.is_assigned_to_current_employee
-      ) || null
-    );
-  }, [activeJobs]);
+    return incomingOffers[0] || null;
+  }, [incomingOffers]);
 
   // ── 3. Notification Deduplication ──────────────────────────────────────────
   const knownOfferIdsRef = useRef(new Set());
@@ -189,24 +198,33 @@ export function EmployeeRuntimeProvider({ children }) {
               }
             }
 
-            const currentOffer = jobsData.find(
+            // Filter all currently valid incoming offers
+            const validOffers = jobsData.filter(
               (j) =>
                 (j.is_offer === true || j.active_offer?.status === 'OFFERED') &&
                 !j.active_offer?.is_expired &&
                 !j.is_assigned_to_current_employee
             );
 
-            if (currentOffer) {
-              const offerId = currentOffer.active_offer?.id || currentOffer.offer_id || `job_${currentOffer.id}`;
-              if (!isInitialOffersLoadedRef.current) {
+            if (!isInitialOffersLoadedRef.current) {
+              // Seed ALL initial offers to prevent duplicate notification triggers on initial mount
+              validOffers.forEach((offer) => {
+                const offerId = offer.active_offer?.id || offer.offer_id || `job_${offer.id}`;
                 knownOfferIdsRef.current.add(offerId);
-                isInitialOffersLoadedRef.current = true;
-              } else {
-                triggerOfferBrowserNotification(currentOffer);
-              }
-            } else {
+              });
               isInitialOffersLoadedRef.current = true;
+            } else {
+              // Trigger notification ONLY for genuinely new offer IDs
+              validOffers.forEach((offer) => {
+                const offerId = offer.active_offer?.id || offer.offer_id || `job_${offer.id}`;
+                if (!knownOfferIdsRef.current.has(offerId)) {
+                  knownOfferIdsRef.current.add(offerId);
+                  triggerOfferBrowserNotification(offer);
+                }
+              });
             }
+
+            const currentOffer = validOffers[0] || null;
 
             setSelectedJob((prev) => {
               if (!prev) {
@@ -616,7 +634,7 @@ export function EmployeeRuntimeProvider({ children }) {
       const type = eventData.event_type;
       console.info(`[EmployeeRuntime SSE Event] ${type}`, eventData);
 
-      if (type === 'OFFER_CREATED' || type === 'JOB_OFFER') {
+      if (type === 'OFFER_CREATED' || type === 'JOB_OFFER' || type === 'EMPLOYEE_JOB_OFFERED') {
         const payload = eventData.payload || {};
         if (payload.offer_id || payload.id) {
           triggerOfferBrowserNotification(payload);
@@ -625,15 +643,22 @@ export function EmployeeRuntimeProvider({ children }) {
       } else if (
         [
           'JOB_ASSIGNED',
+          'EMPLOYEE_JOB_ACCEPTED',
           'ARRIVAL_DETECTED',
           'JOB_COMPLETED',
+          'EMPLOYEE_JOB_COMPLETED',
+          'EMPLOYEE_JOB_CANCELLED',
+          'EMPLOYEE_CANCELLED',
+          'EMPLOYEE_AVAILABILITY_CHANGED',
+          'PRE_SERVICE_COMPLETED',
           'JOB_LOCATION_UPDATE',
           'STATUS_CHANGE',
           'EXTENSION_DECIDED',
           'PAYMENT_COLLECTED',
+          'PAYMENT_OTP_VERIFIED',
         ].includes(type)
       ) {
-        scheduleCoalescedRefresh(300);
+        scheduleCoalescedRefresh(200);
       } else if (type === 'NOTIFICATION_CREATED') {
         syncNotifications();
       }
@@ -704,6 +729,7 @@ export function EmployeeRuntimeProvider({ children }) {
       selectedJob,
       setSelectedJob,
       incomingOffer,
+      incomingOffers,
       hasActiveJob,
       isJobsLoading,
       isCompletedLoading,
@@ -745,6 +771,7 @@ export function EmployeeRuntimeProvider({ children }) {
       completedJobs,
       selectedJob,
       incomingOffer,
+      incomingOffers,
       hasActiveJob,
       isJobsLoading,
       isCompletedLoading,

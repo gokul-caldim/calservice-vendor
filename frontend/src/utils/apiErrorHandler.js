@@ -162,11 +162,11 @@ export function classifyApiError(err) {
       msg = 'You already have an active job. Complete it before accepting another job.';
       action = 'View Current Job';
     } else if (
-      rawCode === 'CANCELLATION_WINDOW_EXPIRED' ||
-      rawMsg.toLowerCase().includes('cancellation window')
+      rawCode === 'CANCELLATION_LOCKED_AFTER_OTP' ||
+      rawMsg.toLowerCase().includes('otp')
     ) {
-      title = 'Cancellation Window Closed';
-      msg = 'The 5-minute cancellation window has expired. Please coordinate with support if assistance is needed.';
+      title = 'Cancellation Locked';
+      msg = 'Cancellation is not permitted once customer Work Start OTP is verified.';
       action = 'Dismiss';
     } else if (
       rawCode === 'CANCELLATION_NOT_ALLOWED_IN_CURRENT_STATE' ||
