@@ -106,11 +106,15 @@ from .views import (
     WorkforceEmployeeSavedLocationDetailView,
     WorkforceAdminLocationToggleView,
     WorkforceAdminLocationAssignEmployeeView,
+    WorkforcePublicSupportInquiryView,
 )
 
 
 
 urlpatterns = [
+    # Public Operations & Support Inquiries
+    path("support/inquiry/", WorkforcePublicSupportInquiryView.as_view(), name="workforce-support-inquiry"),
+
     # Technician Auth & Onboarding Lifecycle (Phases 4–8)
     path("signup/", WorkforceSignupView.as_view(), name="workforce-signup"),
     path("onboarding/me/", WorkforceOnboardingMeView.as_view(), name="workforce-onboarding-me"),

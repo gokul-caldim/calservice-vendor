@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthProvider.jsx';
-import { Lock, User, Eye, EyeOff } from 'lucide-react';
+import { Lock, User, Eye, EyeOff, HelpCircle } from 'lucide-react';
 import { ErrorState } from '../../components/enterprise/ErrorState.jsx';
+import { LegalComplianceModal } from '../../components/common/LegalComplianceModal.jsx';
 
 export function LoginPage() {
   const { login } = useAuth();
@@ -13,6 +14,15 @@ export function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Legal & Corporate Information Modal Popup
+  const [legalModalOpen, setLegalModalOpen] = useState(false);
+  const [legalModalTab, setLegalModalTab] = useState('contact');
+
+  const openLegalModal = (tab = 'contact') => {
+    setLegalModalTab(tab);
+    setLegalModalOpen(true);
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -75,6 +85,13 @@ export function LoginPage() {
 
   return (
     <div className="min-h-screen w-full flex bg-slate-900 font-sans text-slate-900 antialiased">
+      {/* ── LEGAL & COMPLIANCE POPUP MODAL ── */}
+      <LegalComplianceModal
+        isOpen={legalModalOpen}
+        onClose={() => setLegalModalOpen(false)}
+        initialTab={legalModalTab}
+      />
+
       {/* ── LEFT: QUIET BRAND PANEL (Desktop Only) ── */}
       <div className="hidden lg:flex lg:w-5/12 xl:w-[42%] flex-col justify-between bg-slate-900 text-white p-10 xl:p-14 border-r border-slate-800">
         <div>
@@ -82,25 +99,87 @@ export function LoginPage() {
             CAL SERVICES
           </div>
           <div className="text-xs text-blue-400 font-medium tracking-wide">
-            Workforce
+            Workforce Operations
           </div>
         </div>
 
-        <div>
+        <div className="space-y-2">
           <h1 className="text-2xl xl:text-3xl font-bold text-white tracking-tight">
-            Field Operations
+            Field Operations & Engineering Network
           </h1>
+          <p className="text-xs text-slate-400 max-w-sm leading-relaxed">
+            Enterprise dispatching, real-time spatial telemetry, and verified precision service delivery.
+          </p>
         </div>
 
-
-        <div className="text-[11px] text-slate-500 font-normal">
-          &copy; CalServices. All rights reserved.
+        {/* Desktop Left Brand Footer */}
+        <div className="space-y-2 pt-6 border-t border-slate-800/80">
+          <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-slate-400">
+            <button
+              type="button"
+              onClick={() => openLegalModal('terms')}
+              className="hover:text-white transition-colors cursor-pointer"
+            >
+              Terms
+            </button>
+            <span className="text-slate-600">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('privacy')}
+              className="hover:text-white transition-colors cursor-pointer"
+            >
+              Privacy
+            </button>
+            <span className="text-slate-600">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('contact')}
+              className="hover:text-white transition-colors cursor-pointer"
+            >
+              Contact & Support
+            </button>
+            <span className="text-slate-600">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('refunds')}
+              className="hover:text-white transition-colors cursor-pointer"
+            >
+              Refunds
+            </button>
+            <span className="text-slate-600">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('shipping')}
+              className="hover:text-white transition-colors cursor-pointer"
+            >
+              Fulfillment
+            </button>
+          </div>
+          <div className="text-[10px] text-slate-500 font-normal">
+            &copy; {new Date().getFullYear()} CALDIM ENGINEERING PRIVATE LIMITED. All rights reserved.
+          </div>
         </div>
       </div>
 
-      {/* ── RIGHT: LOGIN AREA ── */}
-      <div className="flex-1 flex flex-col justify-center items-center p-6 sm:p-12 lg:p-16 bg-white">
-        <div className="w-full max-w-[380px] space-y-6">
+      {/* ── RIGHT: LOGIN AREA WITH FOOTER ── */}
+      <div className="flex-1 flex flex-col justify-between items-center p-6 sm:p-10 lg:p-12 bg-white min-h-screen overflow-y-auto">
+        {/* Top Spacer / Mobile Brand Badge */}
+        <div className="w-full flex justify-between items-center lg:justify-end">
+          <div className="lg:hidden text-xs font-bold text-slate-800 uppercase tracking-wider">
+            CAL SERVICES
+          </div>
+          <button
+            type="button"
+            onClick={() => openLegalModal('contact')}
+            className="text-[11px] font-semibold text-slate-500 hover:text-blue-600 transition-colors flex items-center gap-1 cursor-pointer"
+          >
+            <HelpCircle className="w-3.5 h-3.5" />
+            <span>Need Help? Contact Us</span>
+          </button>
+        </div>
+
+        {/* Center Login Form Card */}
+        <div className="w-full max-w-[380px] my-auto py-6 space-y-6">
           {/* Header */}
           <div>
             <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">
@@ -170,7 +249,7 @@ export function LoginPage() {
             <button
               type="submit"
               disabled={isSubmitting}
-              className="w-full py-2.5 px-4 rounded-md bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold text-xs shadow-sm transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+              className="w-full py-2.5 px-4 rounded-md bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold text-xs shadow-sm transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >
               {isSubmitting ? 'Signing In...' : 'Sign In'}
             </button>
@@ -189,6 +268,54 @@ export function LoginPage() {
             </p>
           </div>
         </div>
+
+        {/* ── FOOTER: PRIVACY, TERMS, SUPPORT & COMPLIANCE ── */}
+        <footer className="w-full pt-6 pb-2 text-center">
+          <div className="flex flex-wrap justify-center items-center gap-x-3.5 gap-y-1.5 text-[11px] text-slate-500 font-medium">
+            <button
+              type="button"
+              onClick={() => openLegalModal('privacy')}
+              className="text-slate-500 hover:text-blue-600 transition-colors cursor-pointer"
+            >
+              Privacy Policy
+            </button>
+            <span className="text-slate-300 select-none">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('terms')}
+              className="text-slate-500 hover:text-blue-600 transition-colors cursor-pointer"
+            >
+              Terms of Service
+            </button>
+            <span className="text-slate-300 select-none">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('contact')}
+              className="text-slate-500 hover:text-blue-600 transition-colors cursor-pointer"
+            >
+              Support & Contact
+            </button>
+            <span className="text-slate-300 select-none">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('refunds')}
+              className="text-slate-500 hover:text-blue-600 transition-colors cursor-pointer"
+            >
+              Cancellation & Refunds
+            </button>
+            <span className="text-slate-300 select-none">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('shipping')}
+              className="text-slate-500 hover:text-blue-600 transition-colors cursor-pointer"
+            >
+              Service Delivery
+            </button>
+          </div>
+          <p className="text-[10px] text-slate-400 mt-2">
+            &copy; {new Date().getFullYear()} CALDIM ENGINEERING PRIVATE LIMITED. All rights reserved.
+          </p>
+        </footer>
       </div>
     </div>
   );

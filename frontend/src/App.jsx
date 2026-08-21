@@ -7,6 +7,12 @@ import { AdminRoute, EmployeeRoute, AuthenticatedRoute } from './components/comm
 import { LoginPage } from './pages/auth/LoginPage.jsx';
 import { SignupPage } from './pages/auth/SignupPage.jsx';
 
+import { TermsAndConditionsPage } from './pages/public/TermsAndConditionsPage.jsx';
+import { PrivacyPolicyPage } from './pages/public/PrivacyPolicyPage.jsx';
+import { SupportAndContactPage } from './pages/public/SupportAndContactPage.jsx';
+import { CancellationRefundsPage } from './pages/public/CancellationRefundsPage.jsx';
+import { ShippingPolicyPage } from './pages/public/ShippingPolicyPage.jsx';
+
 import { OnboardingWizardPage } from './pages/onboarding/OnboardingWizardPage.jsx';
 import { PendingReviewPage } from './pages/onboarding/PendingReviewPage.jsx';
 import { CorrectionRequiredPage } from './pages/onboarding/CorrectionRequiredPage.jsx';
@@ -38,6 +44,18 @@ import { AdminOperationsPage } from './pages/admin/AdminOperationsPage.jsx';
 import { AdminReportsPage } from './pages/admin/AdminReportsPage.jsx';
 import { AdminSkillsPage } from './pages/admin/AdminSkillsPage.jsx';
 import { CustomerTrackingPage } from './pages/customer/CustomerTrackingPage.jsx';
+
+// Employee Wallet Pages
+import { EmployeeWalletDashboardPage } from './pages/employee/wallet/EmployeeWalletDashboardPage.jsx';
+import { EmployeeWalletTransactionsPage } from './pages/employee/wallet/EmployeeWalletTransactionsPage.jsx';
+import { EmployeeWalletWithdrawalsPage } from './pages/employee/wallet/EmployeeWalletWithdrawalsPage.jsx';
+import { EmployeePayoutAccountsPage } from './pages/employee/wallet/EmployeePayoutAccountsPage.jsx';
+
+// Admin Wallet Pages
+import { WalletDashboardPage } from './pages/admin/wallet/WalletDashboardPage.jsx';
+import { WalletTransactionsPage } from './pages/admin/wallet/WalletTransactionsPage.jsx';
+import { WalletWithdrawalsPage } from './pages/admin/wallet/WalletWithdrawalsPage.jsx';
+import { WalletPayoutAccountsPage } from './pages/admin/wallet/WalletPayoutAccountsPage.jsx';
 
 function RootRedirect() {
   const { isReady, isAuthenticated, isAdmin, registrationStatus } = useAuth();
@@ -89,6 +107,20 @@ export function App() {
           <Route path="/workforce/login" element={<LoginPage />} />
           <Route path="/workforce/signup" element={<SignupPage />} />
 
+          {/* Public Legal, Compliance & Support Hub */}
+          <Route path="/terms" element={<TermsAndConditionsPage />} />
+          <Route path="/workforce/terms" element={<TermsAndConditionsPage />} />
+          <Route path="/privacy" element={<PrivacyPolicyPage />} />
+          <Route path="/workforce/privacy" element={<PrivacyPolicyPage />} />
+          <Route path="/support" element={<SupportAndContactPage />} />
+          <Route path="/contact" element={<SupportAndContactPage />} />
+          <Route path="/workforce/support" element={<SupportAndContactPage />} />
+          <Route path="/cancellation-refunds" element={<CancellationRefundsPage />} />
+          <Route path="/refunds" element={<CancellationRefundsPage />} />
+          <Route path="/workforce/cancellation-refunds" element={<CancellationRefundsPage />} />
+          <Route path="/shipping-policy" element={<ShippingPolicyPage />} />
+          <Route path="/workforce/shipping-policy" element={<ShippingPolicyPage />} />
+
           {/* Technician Onboarding Lifecycle */}
           <Route
             path="/workforce/onboarding/wizard"
@@ -131,7 +163,11 @@ export function App() {
             <Route path="schedule" element={<Navigate to="/workforce/employee/dashboard" replace />} />
             <Route path="attendance" element={<Navigate to="/workforce/employee/dashboard" replace />} />
             <Route path="leave" element={<Navigate to="/workforce/employee/dashboard" replace />} />
-            <Route path="earnings" element={<Navigate to="/workforce/employee/dashboard" replace />} />
+            <Route path="earnings" element={<EmployeeWalletDashboardPage />} />
+            <Route path="wallet" element={<EmployeeWalletDashboardPage />} />
+            <Route path="wallet/transactions" element={<EmployeeWalletTransactionsPage />} />
+            <Route path="wallet/withdrawals" element={<EmployeeWalletWithdrawalsPage />} />
+            <Route path="wallet/payout-accounts" element={<EmployeePayoutAccountsPage />} />
             <Route path="documents" element={<EmployeeDashboardPage />} />
             <Route path="services" element={<EmployeeDashboardPage />} />
             <Route path="profile" element={<EmployeeProfilePage />} />
@@ -238,6 +274,40 @@ export function App() {
             element={
               <AdminRoute>
                 <AdminDashboardPage />
+              </AdminRoute>
+            }
+          />
+
+          {/* Vendor Wallet Module — Admin/Manager only */}
+          <Route
+            path="/workforce/admin/wallet"
+            element={
+              <AdminRoute>
+                <WalletDashboardPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/workforce/admin/wallet/transactions"
+            element={
+              <AdminRoute>
+                <WalletTransactionsPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/workforce/admin/wallet/withdrawals"
+            element={
+              <AdminRoute>
+                <WalletWithdrawalsPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/workforce/admin/wallet/payout-accounts"
+            element={
+              <AdminRoute>
+                <WalletPayoutAccountsPage />
               </AdminRoute>
             }
           />

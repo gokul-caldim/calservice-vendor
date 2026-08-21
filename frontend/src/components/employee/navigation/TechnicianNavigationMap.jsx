@@ -183,7 +183,7 @@ export function TechnicianNavigationMap({
                 ${job?.address || 'Authorized Service Address'}
               </div>
               <div style="font-size: 10px; color: #10B981; font-weight: 700;">
-                300m Arrival Geofence Active
+                250m Arrival Geofence Active
               </div>
             </div>
           `;

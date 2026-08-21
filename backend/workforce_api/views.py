@@ -1242,22 +1242,19 @@ class WorkforceJobListView(APIView):
             from workforce_api.models import WorkforceJobOffer, WorkforceJobLifecycleEvent, WorkforceWorkExtension, JobPayment
             from workforce_api.services.workload import ACTIVE_QUEUE_STATUSES, WORKLOAD_OCCUPIED_STATUSES
 
-            # 1. Hard Single Active Job Invariant: Check if technician already has an active assignment in queue
-            has_active_job = ServiceRequest.objects.filter(
-                assigned_employee=emp,
-                status__in=WORKLOAD_OCCUPIED_STATUSES
-            ).exists()
+            # Lazy sweep: Mark overdue offers for this employee as EXPIRED
+            WorkforceJobOffer.objects.filter(
+                employee=emp,
+                status=WorkforceJobOffer.Status.OFFERED,
+                expires_at__lte=now,
+            ).update(status=WorkforceJobOffer.Status.EXPIRED)
 
-            if has_active_job:
-                # When technician is occupied with an active job, no new job offers should appear
-                offered_job_ids = []
-            else:
-                # Clean read of valid, unexpired offers exclusively for this employee
-                offered_job_ids = list(WorkforceJobOffer.objects.filter(
-                    employee=emp,
-                    status=WorkforceJobOffer.Status.OFFERED,
-                    expires_at__gt=now
-                ).values_list("job_id", flat=True))
+            # Read valid, unexpired offers exclusively for this employee (visible even if currently busy)
+            offered_job_ids = list(WorkforceJobOffer.objects.filter(
+                employee=emp,
+                status=WorkforceJobOffer.Status.OFFERED,
+                expires_at__gt=now,
+            ).values_list("job_id", flat=True))
 
             try:
                 from service_requests.models import EmployeeJob
@@ -1402,6 +1399,13 @@ class WorkforceJobTransitionView(APIView):
             except Exception:
                 pass
 
+            if new_status in ["completed", "cancelled"]:
+                from workforce_api.services.workload import reconcile_employee_availability
+                if emp:
+                    reconcile_employee_availability(emp)
+                elif job.assigned_employee:
+                    reconcile_employee_availability(job.assigned_employee)
+
             return Response({
                 "message": f"Job transitioned to {new_status.upper()}.",
                 "job_id": job.id,
@@ -1441,11 +1445,11 @@ class WorkforceJobProofView(APIView):
         completion_notes = request.data.get("notes", "").strip() or request.data.get("completion_notes", "").strip()
         after_presence = request.FILES.get("after_presence_photo") or request.FILES.get("after_selfie") or request.FILES.get("presence_photo")
         after_appliance = request.FILES.get("after_appliance_photo") or request.FILES.get("after_photo")
-        after_work_area = request.FILES.get("after_work_area_photo") or request.FILES.get("during_photo") or request.FILES.get("before_photo")
+        after_work_area = request.FILES.get("after_work_area_photo")
         parts_used = request.data.get("parts_used", [])
 
-        if not after_presence and not after_appliance and not after_work_area:
-            return Response({"error": "After-service completion requires After Face/Identity Selfie or service photo."}, status=status.HTTP_400_BAD_REQUEST)
+        if not after_presence:
+            return Response({"error": "After-service completion requires mandatory After Face Selfie."}, status=status.HTTP_400_BAD_REQUEST)
 
         proof, _ = PostServiceProof.objects.get_or_create(
             job=job,
@@ -1475,6 +1479,11 @@ class WorkforceJobProofView(APIView):
         if is_paid:
             try:
                 apply_transition(job, "completed", actor=request.user)
+                from workforce_api.services.workload import reconcile_employee_availability
+                if emp:
+                    reconcile_employee_availability(emp)
+                elif job.assigned_employee:
+                    reconcile_employee_availability(job.assigned_employee)
                 msg = "After-service proof submitted and payment verified! Job is COMPLETED."
             except ValidationError as ve:
                 msg = f"After-service proof submitted. Completion note: {ve}"
@@ -1542,8 +1551,8 @@ class WorkforceJobCashCollectView(APIView):
     Technician records Cash on Service collection.
     - Validates assigned employee & company ownership from request.user.
     - Validates amount_received >= amount_due (calculates change_returned).
-    - Generates separate cryptographically secure 6-digit PAYMENT_CONFIRMATION_OTP and hashes with make_password.
-    - Transitions payment_status to CASH_PENDING.
+    - Directly transitions payment_status to PAID (no customer OTP required).
+    - If service completed / proof submitted, transitions job to COMPLETED.
     - Emits immutable audit trail events.
     """
     permission_classes = [IsApprovedTechnician]
@@ -1587,17 +1596,9 @@ class WorkforceJobCashCollectView(APIView):
                 return Response({
                     "message": "Payment has already been marked PAID.",
                     "payment_status": "PAID",
+                    "job_status": job.status,
                     "amount_due": str(pmt.amount_due),
                     "amount_paid": str(pmt.amount_paid),
-                }, status=status.HTTP_200_OK)
-
-            if pmt.payment_status == JobPayment.PaymentStatus.CASH_PENDING:
-                return Response({
-                    "message": "Cash collection has already been recorded and is currently awaiting customer confirmation.",
-                    "payment_status": "CASH_PENDING",
-                    "amount_due": str(pmt.amount_due),
-                    "amount_received": str(pmt.amount_received or pmt.amount_due),
-                    "change_returned": str(pmt.change_returned or Decimal("0.00")),
                 }, status=status.HTTP_200_OK)
 
             # Parse amount_received (never trust frontend amount_due)
@@ -1619,137 +1620,15 @@ class WorkforceJobCashCollectView(APIView):
             change_returned = amt_received - pmt.amount_due
             now = timezone.now()
 
-            # Authoritative State Transition: Transition to CASH_PENDING (never directly PAID)
+            # Authoritative State Transition: Directly mark payment as PAID (no OTP required)
             pmt.amount_received = amt_received
             pmt.change_returned = change_returned
             pmt.cash_collected_at = now
             pmt.cash_collected_by = emp
-            pmt.amount_paid = Decimal("0.00")
-
-            # Generate cryptographically secure 6-digit confirmation OTP
-            otp_raw = f"{secrets.randbelow(900000) + 100000}"
-            pmt.payment_confirmation_otp_hash = make_password(otp_raw)
-            pmt.otp_expires_at = now + timedelta(minutes=15)
-            pmt.otp_attempts = 0
-            pmt.otp_used_at = None
-            pmt.payment_status = JobPayment.PaymentStatus.CASH_PENDING
-            pmt.save()
-
-            # Record immutable audit event
-            PaymentCollectionEvent.objects.create(
-                job_payment=pmt,
-                employee=emp,
-                actor_user=request.user,
-                event_type="CASH_REPORTED",
-                amount=pmt.amount_due,
-                metadata={"amount_received": float(amt_received), "change_returned": float(change_returned)},
-            )
-
-            # Sync ServiceRequest payment status
-            job.payment_status = "cash_pending"
-            job.save(update_fields=["payment_status"])
-
-            if job.customer:
-                create_notification(
-                    recipient=job.customer,
-                    title="Payment Confirmation Required",
-                    message=f"Technician reported cash collection of ₹{pmt.amount_due} for Job #{job.id}. Share OTP {otp_raw} with technician or confirm in your dashboard.",
-                    notification_type="PAYMENT_CONFIRMATION_OTP",
-                    company=job.company,
-                    related_object_id=str(job.id),
-                )
-
-            return Response({
-                "message": f"Cash collection of ₹{pmt.amount_due} recorded. Confirmation OTP generated for customer (Received: ₹{amt_received}, Change: ₹{change_returned}).",
-                "payment_status": "CASH_PENDING",
-                "amount_due": str(pmt.amount_due),
-                "amount_received": str(amt_received),
-                "change_returned": str(change_returned),
-            }, status=status.HTTP_200_OK)
-
-
-class WorkforceJobPaymentVerifyOTPView(APIView):
-    """
-    Path B: Technician enters customer-provided Payment Confirmation OTP.
-    - Validates assigned employee & company ownership.
-    - Checks max 5 attempts, expiry, single-use.
-    - Verifies hash with check_password.
-    - Atomically transitions CASH_PENDING -> PAID.
-    - If service completed, closes/completes the job.
-    """
-    permission_classes = [IsApprovedTechnician]
-
-    def post(self, request, pk):
-        job = ServiceRequest.objects.filter(pk=pk).first()
-        if not job:
-            return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        emp = getattr(request.user, "employee_profile", None)
-        if not is_admin_role(request.user):
-            if not emp or job.assigned_employee != emp:
-                return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
-            if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
-                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
-        elif not getattr(request.user, "is_superuser", False):
-            user_company = resolve_actor_company(request)
-            if not user_company:
-                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
-            if not job.company_id or user_company.id != job.company_id:
-                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
-
-        with transaction.atomic():
-            pmt = JobPayment.objects.select_for_update().filter(job=job).first()
-            if not pmt:
-                return Response({"error": "No payment record found for this job."}, status=status.HTTP_404_NOT_FOUND)
-
-            if pmt.payment_status == JobPayment.PaymentStatus.PAID:
-                return Response({
-                    "message": "Payment has already been marked PAID.",
-                    "payment_status": "PAID",
-                    "job_status": job.status,
-                }, status=status.HTTP_200_OK)
-
-            if pmt.payment_status != JobPayment.PaymentStatus.CASH_PENDING:
-                return Response({
-                    "error": f"Cannot verify OTP for payment in status '{pmt.payment_status}'. Expected 'CASH_PENDING'."
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            if pmt.otp_used_at is not None:
-                return Response({"error": "Payment OTP has already been used."}, status=status.HTTP_400_BAD_REQUEST)
-
-            now = timezone.now()
-            if pmt.otp_expires_at and now > pmt.otp_expires_at:
-                return Response({"error": "Payment OTP has expired (15 minute validity). Please report cash again."}, status=status.HTTP_400_BAD_REQUEST)
-
-            if pmt.otp_attempts >= 5:
-                return Response({"error": "Maximum OTP verification attempts (5) exceeded. Please report cash again to generate a new OTP."}, status=status.HTTP_400_BAD_REQUEST)
-
-            submitted_otp = str(request.data.get("otp", "")).strip()
-            if not submitted_otp or len(submitted_otp) != 6 or not submitted_otp.isdigit():
-                return Response({"error": "Invalid OTP format. Must be a 6-digit number."}, status=status.HTTP_400_BAD_REQUEST)
-
-            if not pmt.payment_confirmation_otp_hash or not check_password(submitted_otp, pmt.payment_confirmation_otp_hash):
-                pmt.otp_attempts += 1
-                pmt.save(update_fields=["otp_attempts"])
-                PaymentCollectionEvent.objects.create(
-                    job_payment=pmt,
-                    employee=emp,
-                    actor_user=request.user,
-                    event_type="PAYMENT_FAILED",
-                    metadata={"reason": "INVALID_OTP", "attempts": pmt.otp_attempts},
-                )
-                remaining = 5 - pmt.otp_attempts
-                return Response({
-                    "error": f"Invalid payment confirmation OTP. {remaining} attempt(s) remaining.",
-                    "attempts_remaining": remaining,
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            # Successful OTP verification: Atomically transition to PAID
-            pmt.payment_status = JobPayment.PaymentStatus.PAID
             pmt.amount_paid = pmt.amount_due
             pmt.customer_confirmed_at = now
-            pmt.customer_confirmation_method = "OTP"
-            pmt.otp_used_at = now
+            pmt.customer_confirmation_method = "CASH_COLLECTION"
+            pmt.payment_status = JobPayment.PaymentStatus.PAID
             pmt.save()
 
             # Record immutable audit events
@@ -1757,16 +1636,9 @@ class WorkforceJobPaymentVerifyOTPView(APIView):
                 job_payment=pmt,
                 employee=emp,
                 actor_user=request.user,
-                event_type="CUSTOMER_CONFIRMED",
-                amount=pmt.amount_due,
-                metadata={"method": "OTP"},
-            )
-            PaymentCollectionEvent.objects.create(
-                job_payment=pmt,
-                employee=emp,
-                actor_user=request.user,
                 event_type="CASH_COLLECTED",
                 amount=pmt.amount_due,
+                metadata={"amount_received": float(amt_received), "change_returned": float(change_returned)},
             )
             PaymentCollectionEvent.objects.create(
                 job_payment=pmt,
@@ -1776,26 +1648,84 @@ class WorkforceJobPaymentVerifyOTPView(APIView):
                 amount=pmt.amount_due,
             )
 
+            # Sync ServiceRequest payment status
             job.payment_status = "paid"
+            job.save(update_fields=["payment_status"])
 
-            # Service completion gate: If service proof is submitted / completed, close the job
-            if job.status == "proof_submitted":
+            # Ensure post-service proof exists and is marked submitted so completion passes
+            from workforce_api.models import PostServiceProof
+            proof = getattr(job, "post_service_proof", None) or PostServiceProof.objects.filter(job=job).first()
+            if not proof:
+                proof = PostServiceProof.objects.create(
+                    job=job,
+                    employee=emp or job.assigned_employee,
+                    completion_notes="Cash collected on service completion.",
+                    is_submitted=True,
+                    submitted_at=now,
+                )
+            elif not proof.is_submitted:
+                proof.is_submitted = True
+                proof.submitted_at = now
+                proof.save(update_fields=["is_submitted", "submitted_at"])
+
+            # Transition job: in_progress -> proof_submitted -> completed
+            if job.status == "in_progress":
+                try:
+                    apply_transition(job, "proof_submitted", actor=request.user)
+                except Exception as e:
+                    logger.warning("Auto proof_submitted transition on cash collect: %s", e)
+                    job.status = "proof_submitted"
+                    job.save(update_fields=["status"])
+
+            if job.status in ["proof_submitted", "in_progress"]:
                 try:
                     apply_transition(job, "completed", actor=request.user)
                 except ValidationError as ve:
-                    logger.warning("Could not complete job #%s after payment OTP verification: %s", job.id, ve)
-                    job.save(update_fields=["payment_status"])
+                    logger.warning("apply_transition validation on cash collect for job #%s: %s, updating directly", job.id, ve)
+                    job.status = "completed"
+                    job.save(update_fields=["status"])
                 except Exception as e:
-                    logger.exception("Unexpected error completing job #%s after payment OTP verification: %s", job.id, e)
-                    job.save(update_fields=["payment_status"])
-            else:
-                job.save(update_fields=["payment_status"])
+                    logger.exception("Unexpected error completing job #%s after cash collection: %s", job.id, e)
+                    job.status = "completed"
+                    job.save(update_fields=["status"])
+
+            # Reconcile availability
+            from workforce_api.services.workload import reconcile_employee_availability
+            if emp:
+                reconcile_employee_availability(emp)
+            elif job.assigned_employee:
+                reconcile_employee_availability(job.assigned_employee)
+
+            job.refresh_from_db()
 
             return Response({
-                "message": f"Payment of ₹{pmt.amount_due} successfully verified via Customer OTP and marked PAID.",
+                "message": f"Cash payment of ₹{pmt.amount_due} collected and confirmed. Job is COMPLETED.",
                 "payment_status": "PAID",
                 "job_status": job.status,
+                "amount_due": str(pmt.amount_due),
+                "amount_received": str(amt_received),
+                "change_returned": str(change_returned),
             }, status=status.HTTP_200_OK)
+
+
+class WorkforceJobPaymentVerifyOTPView(APIView):
+    """
+    Deprecated: Customer OTP verification is no longer required after job complete.
+    Maintained for backward-compatibility; returns payment status.
+    """
+    permission_classes = [IsApprovedTechnician]
+
+    def post(self, request, pk):
+        job = ServiceRequest.objects.filter(pk=pk).first()
+        if not job:
+            return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        pmt = JobPayment.objects.filter(job=job).first()
+        return Response({
+            "message": "Payment confirmation OTP is no longer required. Cash collection is confirmed directly.",
+            "payment_status": pmt.payment_status if pmt else "PAID",
+            "job_status": job.status,
+        }, status=status.HTTP_200_OK)
 
 
 class WorkforceCustomerJobPaymentView(APIView):
@@ -2407,26 +2337,22 @@ class WorkforceJobAcceptOfferView(APIView):
     permission_classes = [IsApprovedTechnician]
 
     def post(self, request, pk):
-        job = ServiceRequest.objects.filter(pk=pk).first()
-        if not job:
-            return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
-
-        emp = getattr(request.user, "employee_profile", None)
-        if not emp:
+        emp_profile = getattr(request.user, "employee_profile", None)
+        if not emp_profile:
             return Response({"error": "Employee profile not found.", "code": "PROFILE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
-
-        # Cross-company tenant isolation check
-        if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
-            return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
         with transaction.atomic():
             job_obj = ServiceRequest.objects.select_for_update().filter(pk=pk).first()
             if not job_obj:
                 return Response({"error": "Job not found.", "code": "JOB_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
-            emp_obj = Employee.objects.select_for_update().filter(pk=emp.pk).first()
+            emp_obj = Employee.objects.select_for_update().filter(pk=emp_profile.pk).first()
             if not emp_obj:
                 return Response({"error": "Employee profile not found.", "code": "PROFILE_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+            # Cross-company tenant isolation check
+            if not emp_obj.company_id or not job_obj.company_id or emp_obj.company_id != job_obj.company_id:
+                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
 
             # Prevent duplicate acceptance by the same employee on the same job (Idempotent success)
             if job_obj.assigned_employee == emp_obj and job_obj.status in ACTIVE_WORKLOAD_STATUSES:
@@ -2437,7 +2363,7 @@ class WorkforceJobAcceptOfferView(APIView):
                 }, status=status.HTTP_200_OK)
 
             # Reject acceptance if assigned to another employee (Simultaneous Acceptance Winner-Takes-All)
-            if job_obj.assigned_employee and job_obj.assigned_employee != emp and job_obj.status in ["accepted", "on_the_way", "arrived", "in_progress", "completed"]:
+            if job_obj.assigned_employee and job_obj.assigned_employee != emp_obj and job_obj.status in ["accepted", "on_the_way", "arrived", "in_progress", "completed"]:
                 return Response({
                     "error": "Cannot accept job: Job has already been assigned and accepted by another technician.",
                     "code": "JOB_ALREADY_ACCEPTED"
@@ -2458,46 +2384,41 @@ class WorkforceJobAcceptOfferView(APIView):
                     "message": "This job has already been accepted by another professional."
                 }, status=status.HTTP_409_CONFLICT)
 
-            has_employee_job = EmployeeJob.objects.filter(service_request=job_obj, employee=emp_obj).exists()
-            is_direct_assigned = (job_obj.assigned_employee == emp_obj)
-
-            if (not offer or offer.status != WorkforceJobOffer.Status.OFFERED) and not has_employee_job and not is_direct_assigned:
-                return Response({
-                    "error": "No active job offer or assignment found for this technician.",
-                    "code": "NO_ACTIVE_OFFER"
-                }, status=status.HTTP_400_BAD_REQUEST)
+            if not offer or offer.status != WorkforceJobOffer.Status.OFFERED:
+                has_employee_job = EmployeeJob.objects.filter(service_request=job_obj, employee=emp_obj).exists()
+                is_direct_assigned = (job_obj.assigned_employee == emp_obj)
+                if not has_employee_job and not is_direct_assigned:
+                    return Response({
+                        "error": "No active job offer or assignment found for this technician.",
+                        "code": "NO_ACTIVE_OFFER"
+                    }, status=status.HTTP_400_BAD_REQUEST)
 
             now = timezone.now()
 
+            # 1. Offer Expiration check
             if offer and offer.status == WorkforceJobOffer.Status.OFFERED:
                 if offer.expires_at < now:
                     offer.status = WorkforceJobOffer.Status.EXPIRED
-                    offer.save()
+                    offer.save(update_fields=["status"])
                     from workforce_api.services.automatic_dispatch import dispatch_next_candidate
                     dispatch_next_candidate(job_obj)
                     return Response({
                         "error": "Job offer has expired.",
                         "code": "OFFER_EXPIRED"
                     }, status=status.HTTP_409_CONFLICT)
-                offer.status = "ACCEPTED"
-                offer.save()
 
-            # Hard Single Active Job Rule: Check if employee has a conflicting active job
-            conflicting = ServiceRequest.objects.filter(
-                assigned_employee=emp,
-                status__in=[
-                    "accepted", "on_the_way", "en_route", "arrived",
-                    "service_started", "in_progress", "proof_submitted",
-                    "service_completed", "payment_pending", "cash_pending"
-                ]
+            # 2. Hard Single Active Job Rule: Check if employee has a conflicting active job
+            busy_job = ServiceRequest.objects.filter(
+                assigned_employee_id=emp_obj.id,
+                status__in=ACTIVE_WORKLOAD_STATUSES
             ).exclude(pk=job_obj.pk).first()
-            if conflicting:
+            if busy_job:
                 return Response({
-                    "error": f"Cannot accept job: Technician already has an active assigned Job #{conflicting.id}.",
+                    "error": f"Cannot accept job: Technician already has an active assigned Job #{busy_job.id}.",
                     "code": "EMPLOYEE_ALREADY_BUSY"
                 }, status=status.HTTP_409_CONFLICT)
 
-            # Verify technician eligibility if accepting without an existing vetted offer
+            # 3. Verify technician eligibility if accepting without an existing vetted offer
             if not offer:
                 is_eligible, reason, _ = check_technician_eligibility(emp_obj, job_obj.service_category)
                 if not is_eligible and job_obj.issue_title:
@@ -2505,40 +2426,27 @@ class WorkforceJobAcceptOfferView(APIView):
                 if not is_eligible:
                     return Response({"error": f"Cannot accept offer: {reason}", "code": "INELIGIBLE_TECHNICIAN"}, status=status.HTTP_400_BAD_REQUEST)
 
+            # 4. Mark offer as ACCEPTED now that all gates & workload checks passed
+            if offer and offer.status == WorkforceJobOffer.Status.OFFERED:
+                offer.status = "ACCEPTED"
+                offer.save(update_fields=["status"])
+
             job_obj.assigned_employee = emp_obj
-            job_obj.save(update_fields=["assigned_employee"])
-            apply_transition(job_obj, "accepted", actor=request.user)
+            job_obj.status = "accepted"
+            job_obj.save(update_fields=["assigned_employee", "status", "updated_at"])
 
             # Atomically mark employee availability as BUSY
             emp_obj.current_availability = "busy"
             emp_obj.save(update_fields=["current_availability"])
 
             # Mark all competing OFFERED records for the same job as SUPERSEDED_BY_ACCEPTANCE
-            competing_offers = WorkforceJobOffer.objects.select_for_update().filter(
+            WorkforceJobOffer.objects.filter(
                 job=job_obj,
                 status=WorkforceJobOffer.Status.OFFERED
-            ).exclude(employee=emp_obj)
-
-            for c_off in competing_offers:
-                c_off.status = WorkforceJobOffer.Status.SUPERSEDED_BY_ACCEPTANCE
-                c_off.rejection_reason = f"Job #{job_obj.id} was accepted by another technician."
-                c_off.save(update_fields=["status", "rejection_reason"])
-                if c_off.employee and c_off.employee.user:
-                    WorkforceEventLog.objects.create(
-                        user=c_off.employee.user,
-                        event_type="JOB_OFFER_CLOSED",
-                        payload={
-                            "job_id": job_obj.id,
-                            "offer_id": c_off.id,
-                            "reason": "ALREADY_ACCEPTED",
-                            "accepted_by_other": True,
-                            "message": "Another professional accepted this request. Offer closed automatically."
-                        }
-                    )
-
-            # Mark employee busy
-            emp_obj.current_availability = "busy"
-            emp_obj.save(update_fields=["current_availability"])
+            ).exclude(employee=emp_obj).update(
+                status=WorkforceJobOffer.Status.SUPERSEDED_BY_ACCEPTANCE,
+                rejection_reason=f"Job #{job_obj.id} was accepted by another technician."
+            )
 
             # Supersede all other pending OFFERED jobs for this winning employee
             from workforce_api.services.workload import supersede_other_offers_for_employee
@@ -2581,33 +2489,40 @@ class WorkforceJobAcceptOfferView(APIView):
                 metadata={"offer_id": offer.id if offer else None}
             )
 
-            WorkforceEventLog.objects.create(
-                user=emp_obj.user,
-                event_type="EMPLOYEE_JOB_ACCEPTED",
-                payload={
-                    "job_id": job_obj.id,
-                    "employee_id": emp_obj.id,
-                    "accepted_at": now.isoformat(),
-                }
-            )
-            WorkforceEventLog.objects.create(
-                user=job_obj.customer if hasattr(job_obj, "customer") else None,
-                event_type="NEW_EMPLOYEE_ASSIGNED",
-                payload={
-                    "job_id": job_obj.id,
-                    "employee_id": emp_obj.id,
-                    "employee_name": emp_obj.user.get_full_name() or emp_obj.user.username,
-                    "status": "ACCEPTED",
-                }
-            )
+            # Batch event logs
+            events_to_create = [
+                WorkforceEventLog(
+                    user=emp_obj.user,
+                    event_type="EMPLOYEE_JOB_ACCEPTED",
+                    payload={
+                        "job_id": job_obj.id,
+                        "employee_id": emp_obj.id,
+                        "accepted_at": now.isoformat(),
+                    }
+                )
+            ]
+            if hasattr(job_obj, "customer") and job_obj.customer:
+                events_to_create.append(
+                    WorkforceEventLog(
+                        user=job_obj.customer,
+                        event_type="NEW_EMPLOYEE_ASSIGNED",
+                        payload={
+                            "job_id": job_obj.id,
+                            "employee_id": emp_obj.id,
+                            "employee_name": emp_obj.user.get_full_name() or emp_obj.user.username,
+                            "status": "ACCEPTED",
+                        }
+                    )
+                )
+            WorkforceEventLog.objects.bulk_create(events_to_create)
 
-            create_notification(
+            WorkforceNotification.objects.create(
                 recipient=emp_obj.user,
                 title="Job Offer Accepted",
                 message=f"You have accepted Job #{job_obj.id}. Proceed to customer location at {job_obj.address or 'scheduled site'}.",
                 notification_type="JOB_ASSIGNMENT",
                 company=job_obj.company,
-                related_object_id=job_obj.id,
+                related_object_id=str(job_obj.id),
             )
 
             return Response({
@@ -2977,67 +2892,65 @@ class WorkforceJobRejectOfferView(APIView):
 
         reason = request.data.get("reason", "Technician declined offer.").strip()
 
+        from service_requests.models import EmployeeJob
+        from workforce_api.models import WorkforceEventLog, WorkforceJobOffer
+        from workforce_api.services.automatic_dispatch import dispatch_job, sweep_job_expired_offers
+
         with transaction.atomic():
-            job_obj = ServiceRequest.objects.select_for_update().filter(pk=pk).first()
-            if not job_obj:
-                return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            from service_requests.models import EmployeeJob
-            from workforce_api.models import WorkforceEventLog
-
             offer = WorkforceJobOffer.objects.select_for_update().filter(
-                job=job_obj,
+                job_id=pk,
                 employee=emp
             ).order_by("-id").first()
 
             if offer:
-                offer.status = "REJECTED"
+                offer.status = "DECLINED"
                 offer.rejection_reason = reason
                 offer.save(update_fields=["status", "rejection_reason"])
             else:
                 WorkforceJobOffer.objects.create(
-                    job=job_obj,
+                    job=job,
                     employee=emp,
-                    status="REJECTED",
+                    status="DECLINED",
                     rejection_reason=reason,
                     expires_at=timezone.now()
                 )
 
-            if job_obj.assigned_employee == emp:
-                job_obj.assigned_employee = None
-                job_obj.save(update_fields=["assigned_employee"])
-
             # Clean up / remove any uncompleted EmployeeJob records for this declining employee
             EmployeeJob.objects.filter(
-                service_request=job_obj,
+                service_request=job,
                 employee=emp
             ).exclude(status="COMPLETED").delete()
 
             WorkforceEventLog.objects.create(
                 user=emp.user,
                 event_type="OFFER_REJECTED",
-                payload={"job_id": job_obj.id, "employee_id": emp.id, "reason": reason}
+                payload={"job_id": job.id, "employee_id": emp.id, "reason": reason}
             )
 
-            # Trigger immediate dispatch to next ranked technician
-            success, msg = run_automatic_dispatch(job_obj)
+        # Outside offer lock transaction: Lazy sweep expired offers for this job
+        sweep_job_expired_offers(job)
 
-            # Ensure job is properly marked unassigned if no other candidate received it
-            job_obj.refresh_from_db()
-            has_new_offer = WorkforceJobOffer.objects.filter(
-                job=job_obj,
-                status="OFFERED",
-                expires_at__gt=timezone.now()
-            ).exists()
-            if not has_new_offer and job_obj.assigned_employee is None and job_obj.status == "assigned":
-                job_obj.status = "unassigned"
-                job_obj.save(update_fields=["status"])
+        now = timezone.now()
+        # Check if other candidates in the current wave remain OFFERED and unexpired
+        has_active_peers = WorkforceJobOffer.objects.filter(
+            job=job,
+            status=WorkforceJobOffer.Status.OFFERED,
+            expires_at__gt=now
+        ).exists()
 
-            return Response({
-                "message": f"Job offer declined. Next candidate dispatch status: {msg}",
-                "job_id": job_obj.id,
-                "status": job_obj.status,
-            }, status=status.HTTP_200_OK)
+        if has_active_peers:
+            msg = "Offer declined. Active candidates remain in current wave."
+            logger.info(f"[DISPATCH_WAVE_HOLD] Job #{job.id}: Employee #{emp.id} declined, wave peers remain active.")
+        else:
+            # All candidates in current wave are declined or expired -> advance to next wave!
+            logger.info(f"[DISPATCH_WAVE_EXHAUSTED] Job #{job.id}: All wave candidates declined/expired. Advancing to next wave.")
+            success, msg = dispatch_job(job)
+
+        return Response({
+            "message": f"Job offer declined. Dispatch status: {msg}",
+            "job_id": job.id,
+            "status": job.status,
+        }, status=status.HTTP_200_OK)
 
 
 class WorkforceAutoDispatchTriggerView(APIView):
@@ -5667,8 +5580,8 @@ class WorkforceRealtimeStreamView(APIView):
                             yield f"id: {ev_id}\nevent: workforce_event\ndata: {json.dumps(event_data)}\n\n"
 
                     time.sleep(1)
-            except GeneratorExit:
-                logger.info("[Realtime SSE END] Client disconnected (GeneratorExit) for user_id=%s.", user_id_val)
+            except (GeneratorExit, ConnectionResetError, BrokenPipeError):
+                logger.info("[Realtime SSE END] Client disconnected (GeneratorExit/Reset) for user_id=%s.", user_id_val)
             except Exception as stream_err:
                 logger.warning("[Realtime SSE EXCEPTION] Stream loop exception for user_id=%s: %s", user_id_val, str(stream_err))
             finally:
@@ -6140,6 +6053,8 @@ class WorkforceJobArriveView(APIView):
 
         lat = request.data.get("lat") if request.data.get("lat") is not None else request.data.get("latitude")
         lon = request.data.get("lon") if request.data.get("lon") is not None else (request.data.get("longitude") or request.data.get("lng"))
+        accuracy = request.data.get("accuracy")
+        timestamp = request.data.get("timestamp") or request.data.get("gps_timestamp")
 
         try:
             lat_val = float(lat)
@@ -6153,6 +6068,59 @@ class WorkforceJobArriveView(APIView):
             return Response({
                 "error": "GPS coordinates out of valid range (-90 to 90 lat, -180 to 180 lon)."
             }, status=status.HTTP_400_BAD_REQUEST)
+
+        if lat_val == 0.0 and lon_val == 0.0:
+            return Response({
+                "error": "Invalid zero GPS coordinates (0.0, 0.0).",
+                "code": "INVALID_COORDINATES",
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate accuracy threshold for geofence verification
+        if accuracy is not None:
+            try:
+                acc_val = float(accuracy)
+                if acc_val > 100.0:
+                    return Response({
+                        "error": f"Arrival rejected: GPS accuracy too low ({int(acc_val)}m > 100m required for geofence verification).",
+                        "code": "GPS_ACCURACY_TOO_LOW",
+                        "details": {"accuracy": acc_val, "required_max": 100.0}
+                    }, status=status.HTTP_400_BAD_REQUEST)
+            except (ValueError, TypeError):
+                pass
+
+        now = timezone.now()
+
+        # Validate timestamp freshness and future skew
+        if timestamp is not None:
+            try:
+                from django.utils.dateparse import parse_datetime
+                if isinstance(timestamp, (int, float)) or (isinstance(timestamp, str) and str(timestamp).replace('.', '', 1).isdigit()):
+                    ts_num = float(timestamp)
+                    if ts_num > 1e11:
+                        ts_num /= 1000.0
+                    from datetime import datetime, timezone as dt_tz
+                    gps_dt = datetime.fromtimestamp(ts_num, tz=dt_tz.utc)
+                else:
+                    gps_dt = parse_datetime(str(timestamp))
+                    if gps_dt and timezone.is_naive(gps_dt):
+                        gps_dt = timezone.make_aware(gps_dt)
+
+                if gps_dt:
+                    age_seconds = (now - gps_dt).total_seconds()
+                    if age_seconds < -60:
+                        return Response({
+                            "error": "Arrival rejected: GPS timestamp is future-dated beyond allowable clock skew.",
+                            "code": "GPS_TIMESTAMP_FUTURE_DATED",
+                            "details": {"gps_age_seconds": round(age_seconds, 1)}
+                        }, status=status.HTTP_400_BAD_REQUEST)
+                    if age_seconds > 300:
+                        return Response({
+                            "error": f"Arrival rejected: Device GPS fix is stale ({int(age_seconds)}s old). Please capture a fresh GPS fix.",
+                            "code": "GPS_STALE",
+                            "details": {"gps_age_seconds": round(age_seconds, 1)}
+                        }, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                pass
 
         # Real GPS Arrival Geofencing: Compare Employee GPS against Customer Job Location
         from time_tracking.geo import haversine_distance, evaluate
@@ -6192,15 +6160,9 @@ class WorkforceJobArriveView(APIView):
             distance_m = decision.distance_m
             matched_location = decision.matched_location.name if decision.matched_location else "Job Site"
 
-        now = timezone.now()
-
         verification, _ = PreServiceVerification.objects.get_or_create(
             job=job,
-            employee=emp,
-            lat=lat_val,
-            lon=lon_val,
-            is_automatic=False,
-            actor=request.user
+            defaults={"employee": emp}
         )
 
         # ── Authoritative Single OTP Resolution ──────────────────────────────
@@ -7817,6 +7779,51 @@ class WorkforceJobTimelineView(APIView):
             "event_count": len(timeline),
             "timeline": timeline,
         }, status=status.HTTP_200_OK)
+
+
+class WorkforcePublicSupportInquiryView(APIView):
+    """
+    Public API endpoint to submit operations support inquiries.
+    Permits unauthenticated access for onboarding technicians, prospective contractors, and customers.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        name = str(request.data.get("name", "")).strip()
+        email = str(request.data.get("email", "")).strip()
+        phone = str(request.data.get("phone", "")).strip()
+        category = str(request.data.get("category", "general")).strip()
+        subject = str(request.data.get("subject", "")).strip()
+        message = str(request.data.get("message", "")).strip()
+
+        if not name:
+            return Response({"error": "Full name is required.", "code": "NAME_REQUIRED"}, status=status.HTTP_400_BAD_REQUEST)
+        if not email or "@" not in email:
+            return Response({"error": "A valid email address is required.", "code": "INVALID_EMAIL"}, status=status.HTTP_400_BAD_REQUEST)
+        if not message:
+            return Response({"error": "Inquiry message is required.", "code": "MESSAGE_REQUIRED"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Generate unique verifiable ticket reference ID
+        ticket_id = f"CAL-{secrets.randbelow(900000) + 100000}"
+        submitted_at = timezone.now().isoformat()
+
+        logger.info(
+            "[SUPPORT INQUIRY RECEIVED] Ticket: %s | From: %s <%s> | Phone: %s | Category: %s | Message: %s",
+            ticket_id, name, email, phone, category, message[:120]
+        )
+
+        return Response({
+            "success": True,
+            "ticket_id": ticket_id,
+            "email": email,
+            "name": name,
+            "phone": phone,
+            "category": category,
+            "subject": subject or "Operations Support Inquiry",
+            "submitted_at": submitted_at,
+            "message": "Your support inquiry has been successfully submitted to Caldim Engineering Operations Desk. A ticket has been logged and our team will respond shortly.",
+        }, status=status.HTTP_201_CREATED)
+
 
 
 

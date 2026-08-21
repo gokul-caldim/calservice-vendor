@@ -92,6 +92,53 @@ def apply_transition(service_request, target_status: str, actor=None) -> str:
     service_request.status = target
     service_request.save(update_fields=["status"])
 
+    # ── Employee Wallet Credit ──────────────────────────────────────────────
+    # Triggered only on COMPLETED transition. Non-blocking: a wallet error must
+    # never roll back a successfully completed job. Failures are logged for
+    # admin reconciliation via `python manage.py reconcile_wallets`.
+    if target == "completed":
+        try:
+            from workforce_api.models import JobPayment
+            from vendor_wallet.services.wallet_service import credit_job_earning
+            from vendor_wallet.exceptions import IdempotentTransactionError, CommissionConfigMissingError
+
+            job_payment = JobPayment.objects.filter(job=service_request).first()
+            employee = service_request.assigned_employee
+            if not employee:
+                logger.warning(
+                    "[WALLET_SKIP] Job #%s: assigned_employee is null. Employee wallet credit skipped.",
+                    service_request.pk,
+                )
+            elif job_payment and job_payment.payment_status == "PAID":
+                credit_job_earning(
+                    employee=employee,
+                    job=service_request,
+                    job_payment=job_payment,
+                    actor=actor,
+                )
+            else:
+                logger.info(
+                    "[WALLET_SKIP] Job #%s: payment not PAID (status=%s). Wallet credit deferred.",
+                    service_request.pk,
+                    getattr(job_payment, "payment_status", "NO_PAYMENT"),
+                )
+        except IdempotentTransactionError:
+            # Already credited — safe to ignore on retries
+            logger.info("[WALLET_IDEMPOTENT] Job #%s already credited.", service_request.pk)
+        except CommissionConfigMissingError as _wce:
+            logger.error(
+                "[WALLET_CREDIT_FAILED] Job #%s — COMMISSION_CONFIG_MISSING: %s. "
+                "Admin must create an EmployeeCommissionConfig and run reconcile_wallets.",
+                service_request.pk, _wce,
+            )
+        except Exception as _wce:
+            logger.error(
+                "[WALLET_CREDIT_FAILED] Job #%s: %s. Run `reconcile_wallets` to detect and correct.",
+                service_request.pk, _wce,
+                exc_info=True,
+            )
+    # ── End Wallet Credit ───────────────────────────────────────────────────
+
     # Sync EmployeeJob status and timestamps
     try:
         from service_requests.models import EmployeeJob

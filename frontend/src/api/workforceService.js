@@ -37,6 +37,13 @@ export async function apiWorkforceLogout() {
   });
 }
 
+export async function apiSubmitSupportInquiry(payload) {
+  return await apiRequest('/workforce/support/inquiry/', {
+    method: 'POST',
+    json: payload,
+  });
+}
+
 // ── Onboarding Wizard (Phases 5–7) ───────────────────────────────────────────
 
 export async function apiGetOnboardingProfile() {
@@ -146,12 +153,20 @@ export async function apiCancelJob(jobId, reasonCode, reasonDetail = '') {
   });
 }
 
-export async function apiVerifyArrival(jobId, lat, lon) {
+export async function apiVerifyArrival(jobId, lat, lon, accuracy = null, timestamp = null) {
   return await apiRequest(`/workforce/jobs/${jobId}/arrive/`, {
     method: 'POST',
-    json: { lat, lon },
+    json: {
+      lat,
+      lon,
+      latitude: lat,
+      longitude: lon,
+      accuracy,
+      timestamp: timestamp || Date.now(),
+    },
   });
 }
+
 
 export async function apiVerifyOTP(jobId, otp) {
   return await apiRequest(`/workforce/jobs/${jobId}/verify-otp/`, {
@@ -197,13 +212,6 @@ export async function apiCollectJobCash(jobId, amountReceived) {
   return await apiRequest(`/workforce/jobs/${jobId}/payment/collect/`, {
     method: 'POST',
     json: { amount_received: amountReceived },
-  });
-}
-
-export async function apiVerifyPaymentOTP(jobId, otp) {
-  return await apiRequest(`/workforce/jobs/${jobId}/payment/verify-otp/`, {
-    method: 'POST',
-    json: { otp },
   });
 }
 

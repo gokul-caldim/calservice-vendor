@@ -283,11 +283,9 @@ class ServiceRequest(models.Model):
             from workforce_api.models import JobPayment
             pmt = getattr(self, "payment_record", None) or JobPayment.objects.filter(job=self).first()
             if pmt:
-                if pmt.payment_status == JobPayment.PaymentStatus.CASH_PENDING:
-                    pending_dependencies.append("Cash payment collection has been reported but is awaiting customer confirmation.")
-                elif pmt.payment_status == JobPayment.PaymentStatus.PENDING and pmt.payment_method == JobPayment.PaymentMethod.CASH_ON_SERVICE:
-                    pending_dependencies.append("Cash on service payment collection and confirmation is required before closing job.")
-                elif pmt.payment_status not in [JobPayment.PaymentStatus.PAID, "PAID", "paid"]:
+                if pmt.payment_status == JobPayment.PaymentStatus.PENDING and pmt.payment_method == JobPayment.PaymentMethod.CASH_ON_SERVICE:
+                    pending_dependencies.append("Cash on service payment collection is required before closing job.")
+                elif pmt.payment_status not in [JobPayment.PaymentStatus.PAID, "PAID", "paid", JobPayment.PaymentStatus.CASH_PENDING]:
                     pending_dependencies.append(f"Payment is in '{pmt.payment_status}' state (must be PAID before closing job).")
             else:
                 if str(self.payment_status).lower() not in ["paid", "collected"]:

@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthProvider.jsx';
 import { Wrench, Smartphone, Mail, Lock, User, Eye, EyeOff } from 'lucide-react';
 import { ErrorState } from '../../components/enterprise/ErrorState.jsx';
+import { LegalComplianceModal } from '../../components/common/LegalComplianceModal.jsx';
 
 export function SignupPage() {
   const { signup } = useAuth();
@@ -21,6 +22,15 @@ export function SignupPage() {
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [error, setError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Legal Modal Popup
+  const [legalModalOpen, setLegalModalOpen] = useState(false);
+  const [legalModalTab, setLegalModalTab] = useState('contact');
+
+  const openLegalModal = (tab = 'contact') => {
+    setLegalModalTab(tab);
+    setLegalModalOpen(true);
+  };
 
   const handleChange = (e) => {
     setFormData({ ...formData, [e.target.name]: e.target.value });
@@ -65,6 +75,13 @@ export function SignupPage() {
 
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col justify-center py-12 sm:px-6 lg:px-8 font-sans text-slate-900">
+      {/* ── LEGAL & COMPLIANCE POPUP MODAL ── */}
+      <LegalComplianceModal
+        isOpen={legalModalOpen}
+        onClose={() => setLegalModalOpen(false)}
+        initialTab={legalModalTab}
+      />
+
       <div className="sm:mx-auto sm:w-full sm:max-w-md text-center">
         <div className="inline-flex w-10 h-10 rounded bg-blue-600 items-center justify-center text-white font-bold mb-2 shadow-sm">
           <Wrench className="w-5 h-5" />
@@ -215,7 +232,7 @@ export function SignupPage() {
             <button
               type="submit"
               disabled={isSubmitting}
-              className="w-full mt-2 py-2 px-4 rounded bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs shadow-sm transition-colors disabled:opacity-50"
+              className="w-full mt-2 py-2 px-4 rounded bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs shadow-sm transition-colors disabled:opacity-50 cursor-pointer"
             >
               {isSubmitting ? 'Creating Account...' : 'Create Account & Start Onboarding'}
             </button>
@@ -231,6 +248,54 @@ export function SignupPage() {
             </p>
           </div>
         </div>
+
+        {/* ── FOOTER: PRIVACY, TERMS, SUPPORT & COMPLIANCE ── */}
+        <footer className="w-full max-w-md mx-auto pt-6 pb-2 text-center">
+          <div className="flex flex-wrap justify-center items-center gap-x-3 gap-y-1 text-[11px] text-slate-500 font-medium">
+            <button
+              type="button"
+              onClick={() => openLegalModal('privacy')}
+              className="hover:text-blue-600 transition-colors cursor-pointer"
+            >
+              Privacy Policy
+            </button>
+            <span className="text-slate-300">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('terms')}
+              className="hover:text-blue-600 transition-colors cursor-pointer"
+            >
+              Terms of Service
+            </button>
+            <span className="text-slate-300">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('contact')}
+              className="hover:text-blue-600 transition-colors cursor-pointer"
+            >
+              Support & Contact
+            </button>
+            <span className="text-slate-300">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('refunds')}
+              className="hover:text-blue-600 transition-colors cursor-pointer"
+            >
+              Cancellation & Refunds
+            </button>
+            <span className="text-slate-300">&bull;</span>
+            <button
+              type="button"
+              onClick={() => openLegalModal('shipping')}
+              className="hover:text-blue-600 transition-colors cursor-pointer"
+            >
+              Service Delivery
+            </button>
+          </div>
+          <p className="text-[10px] text-slate-400 mt-2">
+            &copy; {new Date().getFullYear()} CALDIM ENGINEERING PRIVATE LIMITED. All rights reserved.
+          </p>
+        </footer>
       </div>
     </div>
   );

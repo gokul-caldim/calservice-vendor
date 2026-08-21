@@ -419,6 +419,9 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     offered_at = serializers.SerializerMethodField()
     can_cancel = serializers.SerializerMethodField()
 
+    wave_id = serializers.SerializerMethodField()
+    wave_number = serializers.SerializerMethodField()
+
     class Meta:
         model = ServiceRequest
         fields = [
@@ -463,6 +466,8 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "server_time",
             "offer_id",
             "offered_at",
+            "wave_id",
+            "wave_number",
             "can_cancel",
         ]
 
@@ -554,30 +559,6 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         return (obj.updated_at or obj.created_at).isoformat() if (obj.updated_at or obj.created_at) else None
 
     def get_cancellation_deadline(self, obj):
-        if not self.get_is_accepted_by_current_employee(obj):
-            return None
-        if obj.status not in ["accepted", "on_the_way"]:
-            return None
-        emp = self._get_context_emp()
-        lifecycle_events_map = self.context.get("lifecycle_events_map")
-        if lifecycle_events_map is not None:
-            accept_event = lifecycle_events_map.get(obj.id)
-        else:
-            from .models import WorkforceJobLifecycleEvent
-            accept_event = WorkforceJobLifecycleEvent.objects.filter(
-                job=obj,
-                employee=emp,
-                event_type=WorkforceJobLifecycleEvent.EventType.EMPLOYEE_JOB_ACCEPTED,
-            ).order_by("-created_at").first()
-        if accept_event and accept_event.cancellation_deadline:
-            return accept_event.cancellation_deadline.isoformat()
-        from datetime import timedelta
-        from django.utils import timezone
-        accepted_at = accept_event.accepted_at if accept_event else (obj.updated_at or obj.created_at)
-        if accepted_at:
-            deadline = accepted_at + timedelta(minutes=5)
-            if deadline > timezone.now():
-                return deadline.isoformat()
         return None
 
     def get_distance_km(self, obj):
@@ -590,9 +571,8 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         if emp_lat is None or emp_lon is None or obj.latitude is None or obj.longitude is None:
             return None
         try:
-            from time_tracking.geo import haversine_distance
-            dist_m = haversine_distance(float(emp_lat), float(emp_lon), float(obj.latitude), float(obj.longitude))
-            return round(dist_m / 1000.0, 2)
+            from workforce_api.services.geo_spatial import calculate_distance_km
+            return calculate_distance_km(float(emp_lat), float(emp_lon), float(obj.latitude), float(obj.longitude))
         except Exception:
             return None
 
@@ -616,6 +596,20 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             return None
         offer = self._get_emp_offer(obj, emp)
         return offer.id if offer else None
+
+    def get_wave_id(self, obj):
+        emp = self._get_context_emp()
+        if not emp:
+            return None
+        offer = self._get_emp_offer(obj, emp)
+        return str(offer.wave_id) if (offer and getattr(offer, "wave_id", None)) else None
+
+    def get_wave_number(self, obj):
+        emp = self._get_context_emp()
+        if not emp:
+            return None
+        offer = self._get_emp_offer(obj, emp)
+        return getattr(offer, "wave_number", None) if offer else None
 
     def get_offered_at(self, obj):
         emp = self._get_context_emp()
@@ -661,8 +655,10 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "job_id": offer.job_id,
             "employee_id": offer.employee_id,
             "status": "OFFERED",
-            "offered_at": offer.offered_at.isoformat(),
-            "expires_at": offer.expires_at.isoformat(),
+            "wave_id": str(offer.wave_id) if getattr(offer, "wave_id", None) else "",
+            "wave_number": getattr(offer, "wave_number", 1),
+            "offered_at": offer.offered_at.isoformat() if offer.offered_at else "",
+            "expires_at": offer.expires_at.isoformat() if offer.expires_at else "",
             "server_time": timezone.now().isoformat(),
             "is_expired": False,
         }
@@ -765,32 +761,34 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         if not emp or obj.assigned_employee_id != emp.id:
             return None
 
-        if obj.status not in ["accepted", "on_the_way", "en_route"]:
+        # Cancellation allowed in accepted, on_the_way, en_route, arrived states BEFORE customer OTP verification
+        if obj.status not in ["accepted", "on_the_way", "en_route", "arrived"]:
             return {
                 "can_cancel": False,
+                "cancellation_available": False,
                 "reason": "Not in cancellable state",
-                "remaining_seconds": 0,
+            }
+
+        # Check if customer OTP is already verified
+        from workforce_api.models import PreServiceVerification
+        verification = PreServiceVerification.objects.filter(job=obj).first()
+        if verification and verification.otp_verified:
+            return {
+                "can_cancel": False,
+                "cancellation_available": False,
+                "reason": "Cancellation locked after customer OTP verification",
             }
 
         from service_requests.models import EmployeeJob
-        from django.utils import timezone
-        from datetime import timedelta
-
         emp_job = EmployeeJob.objects.filter(service_request=obj, employee=emp).first()
         accepted_at = (emp_job.accepted_date if emp_job and emp_job.accepted_date else None) or obj.updated_at
-        if not accepted_at:
-            return None
-
-        deadline = accepted_at + timedelta(minutes=5)
-        now = timezone.now()
-        remaining_seconds = max(0, int((deadline - now).total_seconds()))
-        can_cancel = remaining_seconds > 0
 
         return {
-            "can_cancel": can_cancel,
-            "accepted_at": accepted_at.isoformat(),
-            "cancellation_deadline": deadline.isoformat(),
-            "remaining_seconds": remaining_seconds,
+            "can_cancel": True,
+            "cancellation_available": True,
+            "accepted_at": accepted_at.isoformat() if accepted_at else None,
+            "cancellation_deadline": None,
+            "remaining_seconds": None,
         }
 
 

@@ -21,9 +21,8 @@ export function getEmployeeJobPresentation(job, hasActiveJob = false) {
     ].includes((job.status || '').toLowerCase()))
   );
 
-  // 2. Authoritative Pending Offer Verification (strictly not accepted and not busy on another active job)
+  // 2. Authoritative Pending Offer Verification (strictly not accepted)
   const isOfferPending = Boolean(
-    !hasActiveJob &&
     !isAcceptedByMe &&
     (job.is_offer === true || job.offer_status === 'OFFERED' || job.active_offer?.status === 'OFFERED') &&
     job.offer_status !== 'EXPIRED' &&
@@ -42,7 +41,7 @@ export function getEmployeeJobPresentation(job, hasActiveJob = false) {
       badgeDotClass: 'bg-amber-500 animate-pulse',
       isOffer: true,
       isAccepted: false,
-      canAccept: true,
+      canAccept: !hasActiveJob,
       canDecline: true,
       canCancel: false,
       canTrack: false,
@@ -57,9 +56,12 @@ export function getEmployeeJobPresentation(job, hasActiveJob = false) {
   // ── State B: Authoritatively Accepted Job ──────────────────────────────────
   if (isAcceptedByMe) {
     const rawStatus = (job.status || 'accepted').toLowerCase();
+    const isCancelAvail = Boolean(
+      job.cancellation_info?.cancellation_available ??
+      (job.cancellation_info?.can_cancel ?? ['accepted', 'on_the_way', 'en_route', 'arrived'].includes(rawStatus))
+    );
 
-    if (rawStatus === 'on_the_way') {
-      const isCancelAvail = Boolean(job.cancellation_info?.cancellation_available);
+    if (rawStatus === 'on_the_way' || rawStatus === 'en_route') {
       return {
         state: 'ON_THE_WAY',
         displayStatus: 'ON THE WAY',
@@ -74,10 +76,10 @@ export function getEmployeeJobPresentation(job, hasActiveJob = false) {
         canCancel: isCancelAvail,
         canTrack: true,
         showOfferCountdown: false,
-        showCancellationCountdown: Boolean(job.cancellation_info?.cancellation_deadline),
+        showCancellationCountdown: false,
         offerExpiresAt: null,
         acceptedAt: job.accepted_at || job.cancellation_info?.accepted_at || null,
-        cancellationDeadline: job.cancellation_deadline || job.cancellation_info?.cancellation_deadline || null,
+        cancellationDeadline: null,
       };
     }
 
@@ -93,12 +95,12 @@ export function getEmployeeJobPresentation(job, hasActiveJob = false) {
         isAccepted: true,
         canAccept: false,
         canDecline: false,
-        canCancel: false,
+        canCancel: isCancelAvail,
         canTrack: true,
         showOfferCountdown: false,
         showCancellationCountdown: false,
         offerExpiresAt: null,
-        acceptedAt: job.accepted_at || null,
+        acceptedAt: job.accepted_at || job.cancellation_info?.accepted_at || null,
         cancellationDeadline: null,
       };
     }
@@ -148,7 +150,6 @@ export function getEmployeeJobPresentation(job, hasActiveJob = false) {
     }
 
     // Default Accepted State (prior to heading out)
-    const isCancelAvail = Boolean(job.cancellation_info?.cancellation_available);
     return {
       state: 'ACCEPTED',
       displayStatus: 'ACCEPTED / ASSIGNED TO YOU',
@@ -163,10 +164,10 @@ export function getEmployeeJobPresentation(job, hasActiveJob = false) {
       canCancel: isCancelAvail,
       canTrack: true,
       showOfferCountdown: false,
-      showCancellationCountdown: Boolean(job.cancellation_info?.cancellation_deadline),
+      showCancellationCountdown: false,
       offerExpiresAt: null,
       acceptedAt: job.accepted_at || job.cancellation_info?.accepted_at || null,
-      cancellationDeadline: job.cancellation_deadline || job.cancellation_info?.cancellation_deadline || null,
+      cancellationDeadline: null,
     };
   }
 

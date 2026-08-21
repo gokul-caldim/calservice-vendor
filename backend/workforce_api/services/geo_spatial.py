@@ -22,10 +22,20 @@ LATITUDE_KM_APPROX: float = 111.32
 
 # Production Constants
 ADMIN_DISPATCH_RADIUS_KM: float = 20.0
+MAX_DISPATCH_RADIUS_KM: float = 20.0
 MAX_GPS_AGE_SECONDS: int = 120
 DISTANCE_TOLERANCE_KM: float = 0.005  # 5 meters numerical precision buffer for boundary testing
 
-# Standard Distance Bands
+# Standard Distance Waves / Bands (0 to 20 km)
+WAVE_RANGES: List[Tuple[int, str, float, float]] = [
+    (1, "Wave 1 (0–1 km)", 0.0, 1.0),
+    (2, "Wave 2 (>1–2 km)", 1.0, 2.0),
+    (3, "Wave 3 (>2–5 km)", 2.0, 5.0),
+    (4, "Wave 4 (>5–10 km)", 5.0, 10.0),
+    (5, "Wave 5 (>10–15 km)", 10.0, 15.0),
+    (6, "Wave 6 (>15–20 km)", 15.0, 20.0),
+]
+
 DISTANCE_BANDS: List[Tuple[str, float, float]] = [
     ("0-1km", 0.0, 1.0),
     ("1-2km", 1.0, 2.0),
@@ -96,11 +106,13 @@ def get_spatial_bounding_box(
 ) -> Tuple[float, float, float, float]:
     """
     Computes a mathematically correct geographic bounding box prefilter
-    surrounding (lat, lon) with given radius_km.
+    surrounding (lat, lon) with given radius_km (including 5% safety buffer
+    to prevent spherical distortion clipping).
 
     Returns: (min_lat, max_lat, min_lon, max_lon)
     """
-    delta_lat = radius_km / LATITUDE_KM_APPROX
+    buffered_radius = radius_km * 1.05
+    delta_lat = buffered_radius / LATITUDE_KM_APPROX
     min_lat = max(-90.0, lat - delta_lat)
     max_lat = min(90.0, lat + delta_lat)
 
@@ -123,27 +135,77 @@ def get_spatial_bounding_box(
     return min_lat, max_lat, min_lon, max_lon
 
 
+def classify_wave(distance_km: float) -> Optional[int]:
+    """
+    Authoritative sequential distance wave classifier (Phase 1):
+      Wave 1: 0.0 to 1.0 km (0 <= d <= 1.0)
+      Wave 2: >1.0 to 2.0 km (1.0 < d <= 2.0)
+      Wave 3: >2.0 to 5.0 km (2.0 < d <= 5.0)
+      Wave 4: >5.0 to 10.0 km (5.0 < d <= 10.0)
+      Wave 5: >10.0 to 15.0 km (10.0 < d <= 15.0)
+      Wave 6: >15.0 to 20.0 km (15.0 < d <= 20.0)
+      > 20.0 km: None (strictly outside automatic dispatch)
+
+    Uses exact mathematical floating-point comparison without pre-rounding.
+    """
+    if distance_km is None or distance_km < 0.0 or distance_km > 20.0:
+        return None
+    if distance_km <= 1.0:
+        return 1
+    elif distance_km <= 2.0:
+        return 2
+    elif distance_km <= 5.0:
+        return 3
+    elif distance_km <= 10.0:
+        return 4
+    elif distance_km <= 15.0:
+        return 5
+    elif distance_km <= 20.0:
+        return 6
+    return None
+
+
 def get_distance_band(distance_km: float) -> str:
     """
     Categorizes distance into standard operational display bands:
     '0-1km', '1-2km', '2-5km', '5-10km', '10-15km', '15-20km', or '>20km'.
     """
-    if distance_km is None:
+    if distance_km is None or distance_km < 0.0:
         return "unknown"
-    for label, min_d, max_d in DISTANCE_BANDS:
-        if min_d <= distance_km <= max_d:
-            return label
+    wave = classify_wave(distance_km)
+    if wave == 1:
+        return "0-1km"
+    elif wave == 2:
+        return "1-2km"
+    elif wave == 3:
+        return "2-5km"
+    elif wave == 4:
+        return "5-10km"
+    elif wave == 5:
+        return "10-15km"
+    elif wave == 6:
+        return "15-20km"
     return ">20km"
+
+
+def is_within_automatic_radius(distance_km: float) -> bool:
+    """
+    Strictly checks if distance is within the 20.0 km automatic dispatch boundary.
+    No numerical tolerance expansion is applied to extend the business radius.
+    """
+    if distance_km is None:
+        return False
+    return 0.0 <= distance_km <= 20.0
 
 
 def is_within_radius(
     distance_km: float,
     radius_km: float = ADMIN_DISPATCH_RADIUS_KM,
-    tolerance_km: float = DISTANCE_TOLERANCE_KM,
+    tolerance_km: float = 0.0,
 ) -> bool:
     """
-    Authoritatively checks if distance_km is within radius_km,
-    accounting for numerical precision buffer.
+    Authoritatively checks if distance_km is within radius_km.
+    Strictly adheres to boundary: <= 20.000 km eligible, > 20.000 km ineligible.
     """
     if distance_km is None:
         return False

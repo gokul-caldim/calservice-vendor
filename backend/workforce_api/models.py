@@ -2,8 +2,10 @@
 workforce-app/backend/workforce_api/models.py
 Relational database models for Workforce Scheduling, Skills, Compliance, Notifications, Events, Payroll, and Reports.
 """
+import uuid
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 
 class WorkforceEmployeeSchedule(models.Model):
@@ -417,17 +419,35 @@ class WorkforceJobOffer(models.Model):
         default=Status.OFFERED,
         db_index=True,
     )
+    wave_id = models.UUIDField(default=uuid.uuid4, db_index=True)
+    wave_number = models.IntegerField(default=1, db_index=True)
     rank_score = models.FloatField(default=0.0)
-    offered_at = models.DateTimeField(auto_now_add=True)
-    expires_at = models.DateTimeField()
+    offered_at = models.DateTimeField(default=timezone.now, db_index=True)
+    expires_at = models.DateTimeField(db_index=True)
     rejection_reason = models.TextField(blank=True, default="")
 
     class Meta:
         db_table = "workforce_job_offer"
         ordering = ["-offered_at"]
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(wave_number__gte=1, wave_number__lte=6),
+                name="valid_wave_number_1_to_6",
+            ),
+            models.UniqueConstraint(
+                fields=["job", "employee"],
+                condition=models.Q(status="OFFERED"),
+                name="unique_active_job_offer_per_employee",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["job", "status", "expires_at"], name="wf_offer_job_st_exp_idx"),
+            models.Index(fields=["job", "wave_id", "status", "expires_at"], name="wf_offer_job_wave_idx"),
+            models.Index(fields=["employee", "status", "expires_at"], name="wf_offer_emp_st_exp_idx"),
+        ]
 
     def __str__(self):
-        return f"Offer Job #{self.job_id} to {self.employee} ({self.status})"
+        return f"Offer Job #{self.job_id} to {self.employee} (Wave {self.wave_number}, {self.status})"
 
 
 class WorkforceJobLifecycleEvent(models.Model):
@@ -765,9 +785,7 @@ class PostServiceProof(models.Model):
         db_table = "workforce_post_service_proof"
 
     def check_submission(self):
-        ready = bool(
-            self.after_presence_photo or self.after_appliance_photo or self.after_work_area_photo
-        )
+        ready = bool(self.after_presence_photo)
         if ready and not self.is_submitted:
             from django.utils import timezone
             self.is_submitted = True
@@ -1230,6 +1248,16 @@ class JobPayment(models.Model):
             models.Index(fields=["employee", "payment_status"]),
             models.Index(fields=["company", "payment_status"]),
         ]
+
+    @property
+    def is_cash_collected(self):
+        """Authoritative check if cash collection is persisted or job is fully paid."""
+        return bool(self.cash_collected_at is not None or self.payment_status == self.PaymentStatus.PAID)
+
+    @property
+    def is_cash_received(self):
+        """Authoritative check if cash collection is persisted or job is fully paid (Phase 2 Requirement)."""
+        return self.is_cash_collected
 
     def __str__(self):
         return f"Payment #{self.id} for Job #{self.job_id} ({self.payment_method} - {self.payment_status} - ₹{self.amount_due})"

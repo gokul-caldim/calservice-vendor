@@ -18,6 +18,8 @@ from django.urls import include, path
 urlpatterns = [
     # Dedicated Workforce API namespace
     path("api/workforce/", include("workforce_api.urls")),
+    # Vendor Wallet API (vendor + admin wallet endpoints)
+    path("api/workforce/", include("vendor_wallet.urls")),
     # Shared /api/auth/ endpoints for login/me/logout
     path("api/auth/", include("accounts.urls")),
 ]
