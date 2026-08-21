@@ -419,6 +419,9 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
     offered_at = serializers.SerializerMethodField()
     can_cancel = serializers.SerializerMethodField()
 
+    wave_id = serializers.SerializerMethodField()
+    wave_number = serializers.SerializerMethodField()
+
     class Meta:
         model = ServiceRequest
         fields = [
@@ -463,6 +466,8 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "server_time",
             "offer_id",
             "offered_at",
+            "wave_id",
+            "wave_number",
             "can_cancel",
         ]
 
@@ -590,9 +595,8 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
         if emp_lat is None or emp_lon is None or obj.latitude is None or obj.longitude is None:
             return None
         try:
-            from time_tracking.geo import haversine_distance
-            dist_m = haversine_distance(float(emp_lat), float(emp_lon), float(obj.latitude), float(obj.longitude))
-            return round(dist_m / 1000.0, 2)
+            from workforce_api.services.geo_spatial import calculate_distance_km
+            return calculate_distance_km(float(emp_lat), float(emp_lon), float(obj.latitude), float(obj.longitude))
         except Exception:
             return None
 
@@ -616,6 +620,20 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             return None
         offer = self._get_emp_offer(obj, emp)
         return offer.id if offer else None
+
+    def get_wave_id(self, obj):
+        emp = self._get_context_emp()
+        if not emp:
+            return None
+        offer = self._get_emp_offer(obj, emp)
+        return str(offer.wave_id) if (offer and getattr(offer, "wave_id", None)) else None
+
+    def get_wave_number(self, obj):
+        emp = self._get_context_emp()
+        if not emp:
+            return None
+        offer = self._get_emp_offer(obj, emp)
+        return getattr(offer, "wave_number", None) if offer else None
 
     def get_offered_at(self, obj):
         emp = self._get_context_emp()
@@ -661,8 +679,10 @@ class WorkforceJobSerializer(serializers.ModelSerializer):
             "job_id": offer.job_id,
             "employee_id": offer.employee_id,
             "status": "OFFERED",
-            "offered_at": offer.offered_at.isoformat(),
-            "expires_at": offer.expires_at.isoformat(),
+            "wave_id": str(offer.wave_id) if getattr(offer, "wave_id", None) else "",
+            "wave_number": getattr(offer, "wave_number", 1),
+            "offered_at": offer.offered_at.isoformat() if offer.offered_at else "",
+            "expires_at": offer.expires_at.isoformat() if offer.expires_at else "",
             "server_time": timezone.now().isoformat(),
             "is_expired": False,
         }

@@ -42,8 +42,7 @@ import { LiveCameraCaptureModal } from '../../components/common/LiveCameraCaptur
 import { classifyApiError } from '../../utils/apiErrorHandler.js';
 import { getEmployeeJobPresentation } from '../../utils/jobPresentation.js';
 import { useEmployeeRuntime, ACTIVE_QUEUE_STATUSES } from '../../context/EmployeeRuntimeContext.jsx';
-import { getGPSPosition } from '../../hooks/useGPSPosition.js';
-import { apiUpdateLocationFull } from '../../api/workforceService.js';
+import { formatDistanceDisplay } from '../../utils/distanceFormatter.js';
 import {
   Wrench,
   Clock,
@@ -142,6 +141,10 @@ export function EmployeeDashboardPage() {
     refreshActiveJobs,
     refreshCompletedJobs,
     liveLocation,
+    scanCurrentLocation,
+    autoClockIn,
+    getClockInReadiness,
+    gpsState,
   } = useEmployeeRuntime();
 
   const location = useLocation();
@@ -181,10 +184,10 @@ export function EmployeeDashboardPage() {
     return Array.from(map.values());
   }, [activeJobs, completedJobs]);
 
-  // While technician is working on an active assignment: NO NEW JOB OFFERS SHOULD APPEAR
+  // Incoming offers are visible even if technician is currently on an active job (Accept is gated)
   const incomingOffers = useMemo(() => {
-    return hasActiveJob || !incomingOffer ? [] : [incomingOffer];
-  }, [hasActiveJob, incomingOffer]);
+    return incomingOffer ? [incomingOffer] : [];
+  }, [incomingOffer]);
 
   const displayedJobs = useMemo(() => {
     if (jobQueueTab === 'completed') return completedJobs;
@@ -258,7 +261,6 @@ export function EmployeeDashboardPage() {
     otp_verified: false,
     presence_photo: false,
     appliance_photo: false,
-    work_area_photo: false,
     is_complete: false,
   });
   const [otpInput, setOtpInput] = useState('');
@@ -378,8 +380,14 @@ export function EmployeeDashboardPage() {
       setActionLoading(selectedJob.id);
       const res = await apiVerifyOTP(selectedJob.id, otpInput.trim());
       setSuccessMsg(res.message || 'Customer OTP verified!');
-      setPreServiceState((prev) => ({ ...prev, otp_verified: true, is_complete: res.is_complete }));
+      const updatedState = { ...preServiceState, otp_verified: true, is_complete: res.is_complete };
+      setPreServiceState(updatedState);
       await loadDashboard();
+      // Auto Clock-In Trigger: if all 3 mandatory conditions are now satisfied
+      if (res.is_complete || (updatedState.geofence_passed && updatedState.presence_photo)) {
+        console.info('[EmployeeDashboard] All mandatory pre-checks complete after OTP verification. Triggering auto clock-in...');
+        await handleDirectJobClockIn();
+      }
       setTimeout(() => setSuccessMsg(''), 4000);
     } catch (err) {
       setError(err.message || 'Invalid Customer OTP code.');
@@ -408,12 +416,18 @@ export function EmployeeDashboardPage() {
       setActionLoading(selectedJob.id);
       const res = await apiUploadPreServicePhoto(selectedJob.id, photoType, file);
       setSuccessMsg(res.message || 'Photo uploaded!');
-      setPreServiceState((prev) => ({
-        ...prev,
+      const updatedState = {
+        ...preServiceState,
         [`${photoType}_photo`]: true,
         is_complete: res.is_complete,
-      }));
+      };
+      setPreServiceState(updatedState);
       await loadDashboard();
+      // Auto Clock-In Trigger: if all 3 mandatory conditions are now satisfied
+      if (res.is_complete || (updatedState.geofence_passed && updatedState.otp_verified && (photoType === 'presence' || updatedState.presence_photo))) {
+        console.info('[EmployeeDashboard] All mandatory pre-checks complete after photo upload. Triggering auto clock-in...');
+        await handleDirectJobClockIn();
+      }
       setTimeout(() => setSuccessMsg(''), 4000);
     } catch (err) {
       setError(err.message || 'Photo upload failed.');
@@ -422,22 +436,14 @@ export function EmployeeDashboardPage() {
     }
   };
 
+  const isClockingInRef = useRef(false);
   const handleDirectJobClockIn = async () => {
-    if (!selectedJob) return;
+    if (!selectedJob || isClockingInRef.current) return;
+    isClockingInRef.current = true;
     setActionLoading(selectedJob.id);
     setError('');
     try {
-      const pos = await getGPSPosition(true);
-      const lat = pos?.coords?.latitude ?? pos?.latitude;
-      const lon = pos?.coords?.longitude ?? pos?.longitude;
-      const accuracy = pos?.coords?.accuracy ?? pos?.accuracy;
-      if (lat == null || lon == null) throw new Error('Unable to retrieve GPS coordinates for clock-in.');
-      const res = await apiClockIn({
-        job_id: selectedJob.id,
-        lat,
-        lon,
-        accuracy,
-        timestamp: pos?.timestamp || Date.now(),
+      const res = await autoClockIn(selectedJob.id, {
         address: selectedJob.address || 'GPS Verified Customer Location',
       });
       setSuccessMsg(res.message || 'Clocked in successfully! Job is now IN PROGRESS.');
@@ -448,6 +454,7 @@ export function EmployeeDashboardPage() {
       setError(err.message || 'Clock-in failed');
     } finally {
       setActionLoading(null);
+      isClockingInRef.current = false;
     }
   };
 
@@ -456,11 +463,15 @@ export function EmployeeDashboardPage() {
     try {
       setActionLoading(selectedJob.id);
       setError('');
-      const pos = await getGPSPosition(true);
-      const lat = pos?.coords?.latitude ?? pos?.latitude;
-      const lon = pos?.coords?.longitude ?? pos?.longitude;
-      if (lat == null || lon == null) throw new Error('Unable to retrieve GPS coordinates.');
-      const res = await apiVerifyArrival(selectedJob.id, lat, lon);
+      const loc = liveLocation || (await scanCurrentLocation());
+      if (!loc?.latitude || !loc?.longitude) throw new Error('Unable to retrieve GPS coordinates.');
+      const res = await apiVerifyArrival(
+        selectedJob.id,
+        loc.latitude,
+        loc.longitude,
+        loc.accuracy,
+        loc.timestamp || Date.now()
+      );
       setSuccessMsg(res.message || 'Arrival verified! Work Start OTP generated for customer.');
       setPreServiceState((prev) => ({ ...prev, geofence_passed: true }));
       setSelectedJob((prev) => (prev ? { ...prev, status: 'arrived' } : prev));
@@ -477,9 +488,7 @@ export function EmployeeDashboardPage() {
   const [proofModalJob, setProofModalJob] = useState(null);
   const [afterFaceFile, setAfterFaceFile] = useState(null);
   const [afterFacePreviewUrl, setAfterFacePreviewUrl] = useState(null);
-  const [beforeFile, setBeforeFile] = useState(null);
   const [afterFile, setAfterFile] = useState(null);
-  const [beforePreviewUrl, setBeforePreviewUrl] = useState(null);
   const [afterPreviewUrl, setAfterPreviewUrl] = useState(null);
   const [workNotes, setWorkNotes] = useState('');
   const [isUploadingProof, setIsUploadingProof] = useState(false);
@@ -676,25 +685,26 @@ export function EmployeeDashboardPage() {
       e.preventDefault();
       if (!proofModalJob) return;
 
+      if (!afterFaceFile) {
+        setError('Live After Face Selfie is required for service completion.');
+        return;
+      }
+
       try {
         setIsUploadingProof(true);
         const formData = new FormData();
-        if (afterFaceFile) formData.append('after_presence_photo', afterFaceFile);
+        formData.append('after_presence_photo', afterFaceFile);
         if (afterFile) formData.append('after_appliance_photo', afterFile);
-        if (beforeFile) formData.append('after_work_area_photo', beforeFile);
         if (workNotes) formData.append('notes', workNotes);
 
         await apiUploadJobProof(proofModalJob.id, formData);
         const finishedJob = proofModalJob;
         setProofModalJob(null);
         setAfterFaceFile(null);
-        setBeforeFile(null);
         setAfterFile(null);
         if (afterFacePreviewUrl) URL.revokeObjectURL(afterFacePreviewUrl);
-        if (beforePreviewUrl) URL.revokeObjectURL(beforePreviewUrl);
         if (afterPreviewUrl) URL.revokeObjectURL(afterPreviewUrl);
         setAfterFacePreviewUrl(null);
-        setBeforePreviewUrl(null);
         setAfterPreviewUrl(null);
         setWorkNotes('');
 
@@ -1667,7 +1677,7 @@ export function EmployeeDashboardPage() {
                             </div>
                             {offerJob.distance_km != null && (
                               <span className="font-mono text-xs font-bold text-emerald-800 bg-emerald-50 px-2 py-1 rounded border border-emerald-200 shrink-0">
-                                📍 {offerJob.distance_km.toFixed(1)} km away
+                                📍 {formatDistanceDisplay(offerJob.distance_km)} away
                               </span>
                             )}
                           </div>
@@ -1689,11 +1699,22 @@ export function EmployeeDashboardPage() {
                             <button
                               type="button"
                               onClick={() => handleAcceptOffer(offerJob.id)}
-                              disabled={actionLoading === offerJob.id}
-                              className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                              disabled={actionLoading === offerJob.id || hasActiveJob}
+                              className={`flex-1 py-2 font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 ${
+                                hasActiveJob
+                                  ? 'bg-slate-400 text-white cursor-not-allowed'
+                                  : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                              }`}
+                              title={hasActiveJob ? 'Finish your current active job to accept this offer' : 'Accept Job'}
                             >
                               <CheckCircle2 className="w-4 h-4" />
-                              <span>{actionLoading === offerJob.id ? 'Accepting...' : 'ACCEPT JOB'}</span>
+                              <span>
+                                {actionLoading === offerJob.id
+                                  ? 'Accepting...'
+                                  : hasActiveJob
+                                  ? 'BUSY ON CURRENT JOB'
+                                  : 'ACCEPT JOB'}
+                              </span>
                             </button>
                             <button
                               type="button"
@@ -1912,7 +1933,7 @@ export function EmployeeDashboardPage() {
                               </div>
                               {offerJob.distance_km != null && (
                                 <span className="font-mono text-xs font-bold text-emerald-800 bg-emerald-50 px-2 py-1 rounded border border-emerald-200 shrink-0">
-                                  📍 {offerJob.distance_km.toFixed(1)} km away
+                                  📍 {formatDistanceDisplay(offerJob.distance_km)} away
                                 </span>
                               )}
                             </div>
@@ -1939,11 +1960,22 @@ export function EmployeeDashboardPage() {
                               <button
                                 type="button"
                                 onClick={() => handleAcceptOffer(offerJob.id)}
-                                disabled={actionLoading === offerJob.id}
-                                className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                                disabled={actionLoading === offerJob.id || hasActiveJob}
+                                className={`flex-1 py-2 font-bold rounded text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 ${
+                                  hasActiveJob
+                                    ? 'bg-slate-400 text-white cursor-not-allowed'
+                                    : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                }`}
+                                title={hasActiveJob ? 'Finish your current active job to accept this offer' : 'Accept Job'}
                               >
                                 <CheckCircle2 className="w-4 h-4" />
-                                <span>{actionLoading === offerJob.id ? 'Accepting...' : 'ACCEPT JOB'}</span>
+                                <span>
+                                  {actionLoading === offerJob.id
+                                    ? 'Accepting...'
+                                    : hasActiveJob
+                                    ? 'BUSY ON CURRENT JOB'
+                                    : 'ACCEPT JOB'}
+                                </span>
                               </button>
                               <button
                                 type="button"
@@ -2173,7 +2205,7 @@ export function EmployeeDashboardPage() {
                           </span>
                           {job.distance_km != null && (
                             <span className="shrink-0 font-mono font-bold text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200">
-                              {job.distance_km.toFixed(1)} km away
+                              {formatDistanceDisplay(job.distance_km)} away
                             </span>
                           )}
                         </div>
@@ -2192,10 +2224,15 @@ export function EmployeeDashboardPage() {
                               <button
                                 type="button"
                                 onClick={(e) => { e.stopPropagation(); handleAcceptOffer(job.id); }}
-                                disabled={actionLoading === job.id}
-                                className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg text-xs shadow-xs transition-colors cursor-pointer"
+                                disabled={actionLoading === job.id || hasActiveJob}
+                                className={`flex-1 py-1.5 font-bold rounded-lg text-xs shadow-xs transition-colors cursor-pointer disabled:opacity-60 ${
+                                  hasActiveJob
+                                    ? 'bg-slate-400 text-white cursor-not-allowed'
+                                    : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                }`}
+                                title={hasActiveJob ? 'Finish your current active job to accept this offer' : 'Accept Job'}
                               >
-                                {actionLoading === job.id ? 'ACCEPTING...' : 'ACCEPT'}
+                                {actionLoading === job.id ? 'ACCEPTING...' : hasActiveJob ? 'BUSY' : 'ACCEPT'}
                               </button>
                               <button
                                 type="button"
@@ -2608,44 +2645,20 @@ export function EmployeeDashboardPage() {
                                   </button>
                                 )}
                               </div>
-
-                              {/* Work Area Photo */}
-                              <div className="flex items-center justify-between text-xs pt-2 border-t border-slate-100">
-                                <div>
-                                  <span className="font-semibold text-slate-800">
-                                    Before Work-Area Photo <span className="text-slate-400 font-normal text-[10px]">(optional)</span>
-                                  </span>
-                                  <p className="text-[10px] text-slate-500">Live photo of work area condition before work</p>
-                                </div>
-                                {preServiceState.work_area_photo ? (
-                                  <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 font-bold rounded text-[10px] border border-emerald-200">
-                                    Uploaded ✓
-                                  </span>
-                                ) : (
-                                  <button
-                                    type="button"
-                                    onClick={() => openLiveCamera('Capture Before Work-Area Photo', 'environment', 'pre_work_area', (file) => handlePhotoUploadSubmit('work_area', file))}
-                                    className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded text-xs transition-colors flex items-center gap-1.5 border border-slate-300 shadow-xs active:scale-95 cursor-pointer"
-                                  >
-                                    <Camera className="w-3.5 h-3.5" />
-                                    <span>📸 Take Photo</span>
-                                  </button>
-                                )}
-                              </div>
                             </div>
                           ) : (
                             <div className="p-3 bg-slate-100/70 border border-slate-200 rounded space-y-2 text-slate-500">
                               <div className="flex items-center justify-between">
                                 <h4 className="text-xs font-bold text-slate-600 flex items-center gap-1.5">
                                   <Camera className="w-3.5 h-3.5 text-slate-400" />
-                                  2. Required Pre-Service Evidence (OTP & Photos)
+                                  2. Required Pre-Service Evidence (OTP & Presence Selfie)
                                 </h4>
                                 <span className="text-[10px] font-bold px-2 py-0.5 bg-slate-200 text-slate-600 rounded">
                                   🔒 UNLOCKS ON ARRIVAL
                                 </span>
                               </div>
                               <p className="text-[10px] text-slate-500">
-                                Customer OTP input and 3 photo upload buttons will unlock immediately once Step 1 Arrival is verified.
+                                Customer OTP verification and live presence selfie will unlock immediately once Step 1 Arrival is verified.
                               </p>
                             </div>
                           )}
@@ -2659,17 +2672,17 @@ export function EmployeeDashboardPage() {
                                   Pre-Service Verification Complete!
                                 </h4>
                                 <p className="text-[10px] text-emerald-700 mt-0.5">
-                                  All arrival, OTP, and evidence verified. Click below to verify fresh GPS and clock in.
+                                  All arrival, OTP, and presence identity verified. Shift clock-in is ready.
                                 </p>
                               </div>
                               <button
                                 type="button"
                                 onClick={handleDirectJobClockIn}
                                 disabled={actionLoading === selectedJob.id}
-                                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs shadow transition-colors flex items-center gap-1.5 shrink-0 justify-center"
+                                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded text-xs shadow transition-colors flex items-center gap-1.5 shrink-0 justify-center cursor-pointer"
                               >
                                 <Play className="w-3.5 h-3.5" />
-                                <span>{actionLoading === selectedJob.id ? 'Verifying GPS & Clocking In...' : 'CLOCK IN & START WORK'}</span>
+                                <span>{actionLoading === selectedJob.id ? 'Clocking In...' : 'CLOCK IN & START WORK'}</span>
                               </button>
                             </div>
                           ) : null}
@@ -3158,75 +3171,7 @@ export function EmployeeDashboardPage() {
               )}
             </div>
 
-            {/* Optional Step 2: Before Product Photo */}
-            <div>
-              <label className="block text-slate-700 font-semibold mb-1">
-                Before Product Photo <span className="text-slate-400 font-normal text-[11px]">(optional)</span>
-              </label>
-              {beforeFile ? (
-                <div className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
-                  <div className="flex items-center gap-2.5">
-                    {beforePreviewUrl ? (
-                      <img
-                        src={beforePreviewUrl}
-                        alt="Before"
-                        className="w-12 h-12 object-cover rounded-lg border border-slate-300 shadow-sm"
-                      />
-                    ) : (
-                      <div className="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center text-blue-600">
-                        <Camera className="w-6 h-6" />
-                      </div>
-                    )}
-                    <div>
-                      <span className="font-bold text-xs text-slate-800 block truncate max-w-[180px]">
-                        {beforeFile.name || 'Before Photo Captured'}
-                      </span>
-                      <span className="text-[10px] text-emerald-600 font-semibold flex items-center gap-1">
-                        <CheckCircle2 className="w-3 h-3" /> Live snapshot attached
-                      </span>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      openLiveCamera(
-                        'Capture Before Photo',
-                        'environment',
-                        'before_work',
-                        (file, previewUrl) => {
-                          setBeforeFile(file);
-                          setBeforePreviewUrl(previewUrl);
-                        }
-                      )
-                    }
-                    className="px-2.5 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
-                  >
-                    <RefreshCw className="w-3 h-3" /> Retake
-                  </button>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() =>
-                    openLiveCamera(
-                      'Capture Before Photo',
-                      'environment',
-                      'before_work',
-                      (file, previewUrl) => {
-                        setBeforeFile(file);
-                        setBeforePreviewUrl(previewUrl);
-                      }
-                    )
-                  }
-                  className="w-full py-2.5 px-4 border border-dashed border-slate-300 hover:border-slate-400 bg-slate-50 hover:bg-slate-100/70 text-slate-700 rounded-xl font-semibold text-xs flex items-center justify-center gap-2 transition-all active:scale-[0.99] cursor-pointer"
-                >
-                  <Camera className="w-4 h-4 text-slate-500" />
-                  <span>📸 Add Before Product Photo (optional)</span>
-                </button>
-              )}
-            </div>
-
-            {/* Optional Step 3: After Product Photo */}
+            {/* Optional Step 2: After Product Photo */}
             <div>
               <label className="block text-slate-700 font-semibold mb-1">
                 After Product Photo (Completed Result) <span className="text-slate-400 font-normal text-[11px]">(optional)</span>
@@ -3312,13 +3257,10 @@ export function EmployeeDashboardPage() {
                 onClick={() => {
                   setProofModalJob(null);
                   setAfterFaceFile(null);
-                  setBeforeFile(null);
                   setAfterFile(null);
                   if (afterFacePreviewUrl) URL.revokeObjectURL(afterFacePreviewUrl);
-                  if (beforePreviewUrl) URL.revokeObjectURL(beforePreviewUrl);
                   if (afterPreviewUrl) URL.revokeObjectURL(afterPreviewUrl);
                   setAfterFacePreviewUrl(null);
-                  setBeforePreviewUrl(null);
                   setAfterPreviewUrl(null);
                 }}
                 className="px-3 py-1.5 rounded border border-slate-300 text-slate-700 font-semibold cursor-pointer"

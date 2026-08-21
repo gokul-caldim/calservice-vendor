@@ -1,10 +1,12 @@
 """
-Authoritative Automatic Geo-Based Dispatch Service.
+Authoritative Automatic Geo-Based Distance Wave Dispatch Service.
 
 Single source of truth for all automatic job dispatch, candidate ranking,
-proximity evaluation, offer creation, fallback re-assignment, and cross-application
-job reconciliation across Workforce and Marketplace.
+6-wave sequential proximity evaluation (0-1km, 1-2km, 2-5km, 5-10km, 10-15km, 15-20km),
+synchronized 2-minute offer creation with UUID wave IDs, lazy and scheduled wave progression,
+and cross-application job reconciliation across Workforce and Marketplace.
 """
+import uuid
 import logging
 from datetime import timedelta
 from typing import List, Dict, Any, Tuple, Optional
@@ -24,15 +26,19 @@ from workforce_api.models import (
     WorkforceEmployeeSkill,
     WorkforceEmployeeCompliance,
     WorkforceEmployeeSchedule,
+    WorkforceEventLog,
 )
 from workforce_api.services.geo_spatial import (
     ADMIN_DISPATCH_RADIUS_KM,
+    MAX_DISPATCH_RADIUS_KM,
     MAX_GPS_AGE_SECONDS,
     DISTANCE_TOLERANCE_KM,
     calculate_distance_km,
     calculate_distance_meters,
     get_spatial_bounding_box,
+    classify_wave,
     get_distance_band,
+    is_within_automatic_radius,
     is_within_radius,
     validate_coordinates,
 )
@@ -43,38 +49,34 @@ logger = logging.getLogger("workforce.dispatch")
 # Backward compatibility alias
 haversine_distance = calculate_distance_meters
 
-# Maximum geographic dispatch radius (5.0 km) & Distance Bands / Rings
-MAX_DISPATCH_RADIUS_KM = 5.0
-RING_1_MAX_KM = 1.0
-RING_2_MAX_KM = 2.0
-RING_3_MAX_KM = 5.0
-
-# Default job offer duration before auto-expiry and fallback
-DEFAULT_OFFER_DURATION_MINUTES = 5
+# Phase 1: Exact 2-minute offer duration
+DEFAULT_OFFER_DURATION_MINUTES = 2
 
 # Dispatchable database statuses
-DISPATCHABLE_STATUSES = ["draft", "new_request", "confirmed", "unassigned", "assigned", "redispatching"]
+DISPATCHABLE_STATUSES = ["draft", "new_request", "received", "confirmed", "unassigned", "assigned", "redispatching"]
 
-# Canonical service synonyms and explicit alias dictionary
+# Explicit canonical alias dictionary covering normal and specialized categories
 EXPLICIT_SERVICE_ALIASES = {
-    "hvac": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
-    "ac": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
-    "air conditioning": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
-    "ac repair & diagnostics": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
-    "ac service & cleaning": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
-    "ac gas & refrigerant": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
-    "ac installation & uninstallation": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair & diagnostics", "ac service & cleaning", "ac gas & refrigerant", "ac installation & uninstallation"},
+    "hvac": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair and diagnostics", "ac service and cleaning", "ac gas and refrigerant", "ac installation and uninstallation"},
+    "ac": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair and diagnostics", "ac service and cleaning", "ac gas and refrigerant", "ac installation and uninstallation"},
+    "air conditioning": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair and diagnostics", "ac service and cleaning", "ac gas and refrigerant", "ac installation and uninstallation"},
+    "ac repair and diagnostics": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair and diagnostics", "ac service and cleaning", "ac gas and refrigerant", "ac installation and uninstallation"},
+    "ac service and cleaning": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair and diagnostics", "ac service and cleaning", "ac gas and refrigerant", "ac installation and uninstallation"},
+    "ac gas and refrigerant": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair and diagnostics", "ac service and cleaning", "ac gas and refrigerant", "ac installation and uninstallation"},
+    "ac installation and uninstallation": {"hvac", "ac", "air conditioning", "ac service", "ac repair", "ac installation", "ac gas", "ac repair and diagnostics", "ac service and cleaning", "ac gas and refrigerant", "ac installation and uninstallation"},
     "plumbing": {"plumbing", "plumber", "pipe repair", "water leakage", "drainage", "tap repair", "sanitary"},
     "electrical": {"electrical", "electrician", "wiring", "switchboard", "fan repair", "fuse repair", "light fitting"},
     "electrician": {"electrical", "electrician", "wiring", "switchboard", "fan repair", "fuse repair", "light fitting"},
-    "refrigerator": {"refrigerator", "fridge", "freezer", "single door fridge", "double door fridge"},
-    "washing machine": {"washing machine", "washer", "dryer", "top load", "front load"},
-    "tv & display": {"tv & display", "tv", "television", "led tv", "smart tv", "display"},
-    "microwave oven repair": {"microwave", "microwave oven", "microwave oven repair", "oven"},
+    "refrigerator": {"refrigerator", "fridge", "freezer", "single door fridge", "double door fridge", "appliance repair"},
+    "washing machine": {"washing machine", "washer", "dryer", "top load", "front load", "appliance repair"},
+    "tv and display": {"tv and display", "tv", "television", "led tv", "smart tv", "display", "appliance repair"},
+    "microwave oven repair": {"microwave", "microwave oven", "microwave oven repair", "oven", "appliance repair"},
+    "appliance repair": {"appliance repair", "refrigerator", "fridge", "washing machine", "microwave", "tv", "appliance"},
     "carpentry services": {"carpentry", "carpenter", "wood work", "furniture repair", "door repair", "carpentry services"},
-    "pest control": {"pest control", "cockroach control", "ants & bed bugs control", "termite control", "bed bugs", "cockroach", "termite"},
+    "carpentry": {"carpentry", "carpenter", "wood work", "furniture repair", "door repair", "carpentry services"},
+    "pest control": {"pest control", "cockroach control", "ants and bed bugs control", "termite control", "bed bugs", "cockroach", "termite"},
     "cockroach control": {"cockroach control", "cockroach", "pest control"},
-    "ants & bed bugs control": {"ants & bed bugs control", "ants", "bed bugs", "pest control"},
+    "ants and bed bugs control": {"ants and bed bugs control", "ants", "bed bugs", "pest control"},
     "termite control": {"termite control", "termite", "pest control"},
     "cleaning": {"cleaning", "kitchen cleaning", "bathroom cleaning", "full house cleaning", "sofa cleaning", "deep cleaning", "house cleaning"},
     "kitchen cleaning": {"kitchen cleaning", "cleaning", "deep cleaning"},
@@ -82,9 +84,27 @@ EXPLICIT_SERVICE_ALIASES = {
     "full house cleaning": {"full house cleaning", "cleaning", "deep cleaning", "house cleaning"},
     "sofa cleaning": {"sofa cleaning", "cleaning", "couch cleaning"},
     "two wheeler": {"two wheeler", "bike", "scooter", "motorcycle", "bike repair", "two wheeler repair"},
-    "truck": {"truck", "packer & mover", "packers & movers", "logistics", "shifting"},
-    "packer & mover": {"packer & mover", "packers & movers", "truck", "shifting", "relocation"},
+    "goods and transport": {"goods and transport", "goods transport", "transport", "logistics", "truck", "cargo", "delivery", "shifting", "commercial transport"},
+    "goods transport": {"goods and transport", "goods transport", "transport", "logistics", "truck", "cargo", "delivery", "shifting", "commercial transport"},
+    "transport": {"goods and transport", "goods transport", "transport", "logistics", "truck", "cargo", "delivery", "shifting"},
+    "packers and movers": {"packers and movers", "packers movers", "packer and mover", "packer mover", "truck", "shifting", "relocation", "house shifting", "goods and transport"},
+    "packers movers": {"packers and movers", "packers movers", "packer and mover", "packer mover", "truck", "shifting", "relocation", "house shifting", "goods and transport"},
+    "packer and mover": {"packers and movers", "packers movers", "packer and mover", "packer mover", "truck", "shifting", "relocation", "house shifting", "goods and transport"},
+    "truck": {"truck", "packer and mover", "packers and movers", "logistics", "shifting", "goods and transport", "goods transport", "transport", "relocation"},
 }
+
+
+def normalize_service_name(name: str) -> str:
+    """
+    Normalizes service names by lowercasing, replacing dashes, underscores,
+    unicode hyphens, and ampersands with standard words.
+    """
+    if not name:
+        return ""
+    s = str(name).lower()
+    s = s.replace("—", " ").replace("–", " ").replace("-", " ").replace("_", " ")
+    s = s.replace("&", " and ")
+    return " ".join(s.split())
 
 
 def canonical_service_match(requested_service: str, approved_services: List[str], verified_skills: List[str]) -> Tuple[bool, str, str]:
@@ -95,14 +115,14 @@ def canonical_service_match(requested_service: str, approved_services: List[str]
     if not requested_service:
         return True, "EMPTY_SERVICE_BYPASS", ""
 
-    req_clean = requested_service.lower().replace("—", " ").replace("-", " ").strip()
+    req_clean = normalize_service_name(requested_service)
     req_words = set(w for w in req_clean.split() if len(w) >= 2)
 
     # 1. Check exact or direct match against approved employee services
     for it in approved_services:
         if not it:
             continue
-        it_clean = it.lower().replace("—", " ").replace("-", " ").strip()
+        it_clean = normalize_service_name(it)
         if req_clean == it_clean or req_clean in it_clean or it_clean in req_clean:
             return True, "EXACT_OR_SUBSTRING_SERVICE", it
 
@@ -110,32 +130,37 @@ def canonical_service_match(requested_service: str, approved_services: List[str]
     for sk in verified_skills:
         if not sk:
             continue
-        sk_clean = sk.lower().replace("—", " ").replace("-", " ").strip()
+        sk_clean = normalize_service_name(sk)
         if req_clean == sk_clean or req_clean in sk_clean or sk_clean in req_clean:
             return True, "VERIFIED_SKILL_MATCH", sk
 
     # 3. Check explicit canonical alias table
     for alias_key, alias_group in EXPLICIT_SERVICE_ALIASES.items():
-        # If requested service matches this alias key/group
         if req_clean == alias_key or req_clean in alias_group or any(req_word in alias_group for req_word in req_words):
-            # Check if employee has any matching service in that alias group
             for it in approved_services:
-                it_clean = it.lower().replace("—", " ").replace("-", " ").strip()
+                it_clean = normalize_service_name(it)
                 if it_clean in alias_group or any(w in alias_group for w in it_clean.split() if len(w) >= 2):
                     return True, "EXPLICIT_ALIAS_SERVICE", it
             for sk in verified_skills:
-                sk_clean = sk.lower().replace("—", " ").replace("-", " ").strip()
+                sk_clean = normalize_service_name(sk)
                 if sk_clean in alias_group or any(w in alias_group for w in sk_clean.split() if len(w) >= 2):
                     return True, "EXPLICIT_ALIAS_SKILL", sk
 
     return False, "NO_MATCH", ""
 
 
-def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = None) -> Tuple[bool, str, Dict[str, bool]]:
+def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = None, check_workload: bool = True) -> Tuple[bool, str, Dict[str, bool]]:
     """
     9-Gate Employee Eligibility Engine:
     Authoritative server-side evaluation of 9 mandatory operational gates.
-    Every gate fails closed.
+    
+    Parameters:
+      emp: Employee model instance
+      service_name: Optional requested service name
+      check_workload: If True (default, for acceptance), Gate 9 fails if the technician has an active job.
+                      If False (for offer discovery), Gate 9 passes so that busy technicians can still
+                      receive and view upcoming job offers.
+    
     Returns (is_eligible, reason_message, gate_results_dict).
     """
     gate_results = {f"G{i}": True for i in range(1, 10)}
@@ -295,17 +320,18 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
 
     if service_name:
         is_match, method, matched = canonical_service_match(service_name, approved_svcs, verified_skills)
-        logger.info(f"[DISPATCH_SERVICE_MATCH] job_service=\"{service_name}\" employee_services={approved_svcs} verified_skills={verified_skills} match_method={method} result={'PASS' if is_match else 'FAIL'}")
+        logger.debug(f"[DISPATCH_SERVICE_MATCH] job_service=\"{service_name}\" employee_services={approved_svcs} verified_skills={verified_skills} match_method={method} result={'PASS' if is_match else 'FAIL'}")
         if not is_match:
             gate_results["G6"] = False
             logger.debug(f"[9GATE_REJECT_GATE6_SKILL_MISMATCH] Employee #{emp.id} not authorized/verified for '{service_name}'.")
             return False, f"Gate 6: Technician is not authorized or verified for requested service '{service_name}'.", gate_results
 
     # ── Gate 7: Live Presence (Online & Available) ────────────────────────────
-    if not emp.is_online or emp.current_availability != "available":
+    # For offer receipt, technician must be online; current_availability can be 'busy' if they are currently executing another job
+    if not emp.is_online:
         gate_results["G7"] = False
-        logger.debug(f"[9GATE_REJECT_GATE7_PRESENCE_OFFLINE] Employee #{emp.id} presence is is_online={emp.is_online}, avail={emp.current_availability}.")
-        return False, "Gate 7: Technician is currently OFFLINE or unavailable.", gate_results
+        logger.debug(f"[9GATE_REJECT_GATE7_PRESENCE_OFFLINE] Employee #{emp.id} presence is is_online={emp.is_online}.")
+        return False, "Gate 7: Technician is currently OFFLINE.", gate_results
 
     # ── Gate 8: Leave Check ───────────────────────────────────────────────────
     today_str = timezone.now().date().isoformat()
@@ -320,24 +346,21 @@ def check_candidate_eligibility(emp: Employee, service_name: Optional[str] = Non
                 return False, f"Gate 8: Technician is on approved leave from {start_date} to {end_date}.", gate_results
 
     # ── Gate 9: Workload Concurrency (Single-Active-Job Isolation) ──────────────
-    if hasattr(emp, "is_busy_job"):
-        if emp.is_busy_job:
-            gate_results["G9"] = False
-            logger.info(
-                f"[DISPATCH_REJECT] employee={emp.id} reason=EMPLOYEE_ALREADY_BUSY (annotated)"
-            )
-            return False, f"Gate 9: Technician #{emp.id} is busy on an active job.", gate_results
-    else:
-        from workforce_api.services.workload import get_employee_active_job
-        active_job = get_employee_active_job(emp)
-        if active_job:
-            gate_results["G9"] = False
-            logger.info(
-                f"[DISPATCH_REJECT] employee={emp.id} reason=EMPLOYEE_ALREADY_BUSY active_job={active_job.id}"
-            )
-            return False, f"Gate 9: Technician is busy on active Job #{active_job.id} ({active_job.request_id}).", gate_results
+    # Checked strictly on Accept. Bypassed for offer recipient discovery so busy technicians can see upcoming offers.
+    if check_workload:
+        if hasattr(emp, "is_busy_job"):
+            if emp.is_busy_job:
+                gate_results["G9"] = False
+                logger.info(f"[DISPATCH_REJECT] employee={emp.id} reason=EMPLOYEE_ALREADY_BUSY (annotated)")
+                return False, f"Gate 9: Technician #{emp.id} is busy on an active job.", gate_results
+        else:
+            active_job = get_employee_active_job(emp)
+            if active_job:
+                gate_results["G9"] = False
+                logger.info(f"[DISPATCH_REJECT] employee={emp.id} reason=EMPLOYEE_ALREADY_BUSY active_job={active_job.id}")
+                return False, f"Gate 9: Technician is busy on active Job #{active_job.id} ({active_job.request_id}).", gate_results
 
-    return True, "All 9 Eligibility Gates Passed", gate_results
+    return True, "All Eligibility Gates Passed", gate_results
 
 
 def get_eligible_candidates(
@@ -345,10 +368,13 @@ def get_eligible_candidates(
     max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS,
     radius_km: float = MAX_DISPATCH_RADIUS_KM,
     exclude_employee_ids: Optional[List[int]] = None,
+    check_workload: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Finds and ranks all eligible candidate employees for a given ServiceRequest.
-    Uses mathematical bounding-box prefiltering and exact Haversine calculation.
+    Finds and ranks all eligible candidate employees for a given ServiceRequest within 20 km.
+    Uses mathematical bounding-box prefiltering and exact Haversine distance calculation.
+    
+    By default check_workload=False so busy employees are eligible to receive and view offers.
     """
     if hasattr(job_id_or_obj, "latitude"):
         job_obj = job_id_or_obj
@@ -366,7 +392,6 @@ def get_eligible_candidates(
     min_lat, max_lat, min_lon, max_lon = get_spatial_bounding_box(cust_lat, cust_lon, radius_km=radius_km)
 
     today_dow = timezone.now().weekday()
-    from workforce_api.services.workload import ACTIVE_WORKLOAD_STATUSES, get_employee_active_job
     busy_subquery = ServiceRequest.objects.filter(
         assigned_employee_id=OuterRef("pk"),
         status__in=ACTIVE_WORKLOAD_STATUSES
@@ -376,7 +401,6 @@ def get_eligible_candidates(
         Employee.objects.filter(
             is_active=True,
             is_online=True,
-            current_availability="available",
         )
         .select_related("user", "company")
         .annotate(is_busy_job=Exists(busy_subquery))
@@ -410,12 +434,12 @@ def get_eligible_candidates(
     )
 
     if not job_obj.company_id:
-        logger.warning(f"[DISPATCH_COMPANY_MISSING] Job #{job_obj.id} lacks an associated company/vendor tenant. Cannot dispatch without company context.")
+        logger.warning(f"[DISPATCH_COMPANY_MISSING] Job #{job_obj.id} lacks an associated company/vendor tenant.")
         return []
 
     candidates_qs = candidates_qs.filter(company_id=job_obj.company_id)
 
-    # Exclude candidates who have already received or rejected/cancelled an offer for this job, or explicitly excluded
+    # Exclude candidates who have already received or rejected/cancelled an offer for this job
     previous_offers = set(
         WorkforceJobOffer.objects.filter(
             job=job_obj,
@@ -459,21 +483,24 @@ def get_eligible_candidates(
             except Exception:
                 pass
 
+        # Exact geodesic distance
         dist_km = calculate_distance_km(cust_lat, cust_lon, emp_lat_f, emp_lon_f)
 
-        logger.info(
-            f"[9GATE_EVALUATION] employee={emp.id} online={emp.is_online} availability={emp.current_availability} "
-            f"gps_age={f'{gps_age_s:.1f}s' if gps_age_s is not None else 'MISSING'} "
-            f"distance_km={f'{dist_km:.2f}km' if dist_km is not None else 'UNKNOWN'}"
-        )
+        # Strict boundary enforcement: strictly <= 20.0 km
+        if not is_within_automatic_radius(dist_km):
+            logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=RADIUS_EXCEEDED distance_km={dist_km}")
+            continue
+
+        # Classify sequential distance wave (1 to 6)
+        wave_number = classify_wave(dist_km)
+        if wave_number is None:
+            logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=OUTSIDE_AUTOMATIC_WAVES distance_km={dist_km}")
+            continue
 
         # Check eligibility against service_category, then issue_title
-        is_eligible, reason, gate_results = check_candidate_eligibility(emp, job_obj.service_category)
+        is_eligible, reason, gate_results = check_candidate_eligibility(emp, job_obj.service_category, check_workload=check_workload)
         if not is_eligible and job_obj.issue_title:
-            is_eligible, reason, gate_results = check_candidate_eligibility(emp, job_obj.issue_title)
-
-        g_str = " ".join(f"{k}={'PASS' if v else 'FAIL'}" for k, v in gate_results.items())
-        logger.info(f"[9GATE_RESULT] employee={emp.id} {g_str}")
+            is_eligible, reason, gate_results = check_candidate_eligibility(emp, job_obj.issue_title, check_workload=check_workload)
 
         if not is_eligible:
             logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason={reason}")
@@ -483,21 +510,17 @@ def get_eligible_candidates(
             logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=GPS_STALE gps_age={gps_age_s}s")
             continue
 
-        if not is_within_radius(dist_km, radius_km=radius_km):
-            logger.info(f"[DISPATCH_REJECT] job={job_obj.id} employee={emp.id} reason=RADIUS_EXCEEDED distance_km={dist_km}")
-            continue
-
         # Proximity score (closer = higher score, max 100)
         proximity_score = max(0.0, 100.0 - (dist_km * 2.0))
 
-        # Skill proficiency score bonus from prefetched skills
+        # Skill proficiency score bonus
         skills = getattr(emp, "prefetched_verified_skills", [])
         max_prof = 0
         for sk in skills:
             sk_name = sk.skill.name.lower()
             matches = False
             for term in [job_obj.service_category, job_obj.issue_title]:
-                if term and (term.lower() in sk_name or sk_name in term.lower()):
+                if term and (normalize_service_name(term) in sk_name or sk_name in normalize_service_name(term)):
                     matches = True
                     break
             if matches:
@@ -519,11 +542,15 @@ def get_eligible_candidates(
 
         total_score = proximity_score + max_prof + territory_bonus + clock_in_bonus
 
-        logger.info(f"[DISPATCH_CANDIDATE_FOUND] Employee #{emp.id} ({emp.user.username}) eligible for Job #{job_obj.id}: {dist_km:.2f}km away, score={total_score:.1f}")
+        logger.info(
+            f"[DISPATCH_CANDIDATE_FOUND] Employee #{emp.id} ({emp.user.username}) eligible for Job #{job_obj.id}: "
+            f"{dist_km:.2f}km away (Wave {wave_number}), score={total_score:.1f}"
+        )
 
         ranked_candidates.append({
             "employee": emp,
-            "distance_km": round(dist_km, 3),
+            "distance_km": dist_km,
+            "wave_number": wave_number,
             "distance_band": get_distance_band(dist_km),
             "latitude": emp_lat_f,
             "longitude": emp_lon_f,
@@ -536,18 +563,32 @@ def get_eligible_candidates(
     return ranked_candidates
 
 
+def sweep_job_expired_offers(job_obj) -> int:
+    """
+    Lazy reconciliation helper: sweeps and marks EXPIRED any overdue OFFERED offers
+    for the given job.
+    """
+    now = timezone.now()
+    return WorkforceJobOffer.objects.filter(
+        job=job_obj,
+        status=WorkforceJobOffer.Status.OFFERED,
+        expires_at__lte=now,
+    ).update(status=WorkforceJobOffer.Status.EXPIRED)
+
+
 def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, exclude_employee_ids: Optional[List[int]] = None) -> Tuple[bool, str]:
     """
-    Executes automatic dispatch for a single ServiceRequest:
+    Authoritative sequential distance-wave dispatch engine (Phase 1):
     1. Locks ServiceRequest row with select_for_update inside transaction.atomic()
-    2. Validates dispatchable state and coordinates
-    3. Checks if an active exclusive offer already exists (idempotent guard)
-    4. Evaluates eligible candidates in 3 sequential geographic rings (≤1km, 1-2km, 2-5km)
-    5. Creates single exclusive WorkforceJobOffer (5-min expiry), sends JOB_OFFER notification
-    6. Falls back to Admin notification when all rings/candidates are exhausted
+    2. Sweeps and expires any overdue offers for this job (Lazy Reconciliation)
+    3. Checks if an active unexpired wave is currently pending (Idempotency & Same-Wave Stability)
+    4. Evaluates eligible candidates in 6 sequential waves (0-1km, 1-2km, 2-5km, 5-10km, 10-15km, 15-20km)
+    5. Picks the lowest non-empty wave (empty waves are skipped immediately without delay)
+    6. Generates a unique UUID wave_id and synchronized timestamps (offered_at = now, expires_at = now + 2 min)
+    7. Atomically creates WorkforceJobOffer for ALL candidates in the wave
+    8. Falls back to Admin escalation when all 20 km waves are exhausted
     """
     job_id = job_id_or_obj.pk if hasattr(job_id_or_obj, "pk") else job_id_or_obj
-    from workforce_api.models import WorkforceEventLog
 
     with transaction.atomic():
         job_obj = ServiceRequest.objects.select_for_update().filter(pk=job_id).first()
@@ -557,29 +598,32 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
         if job_obj.status in ["completed", "cancelled"]:
             return False, f"Job #{job_id} is {job_obj.status} and cannot be dispatched."
 
-        if job_obj.status in ["accepted", "on_the_way", "arrived", "in_progress"] and job_obj.assigned_employee:
+        if job_obj.status in ["accepted", "on_the_way", "en_route", "arrived", "in_progress", "proof_submitted", "service_completed", "payment_pending", "cash_pending"] and job_obj.assigned_employee:
             return False, f"Job #{job_id} is already accepted and in progress with Employee #{job_obj.assigned_employee_id}."
 
         now = timezone.now()
 
-        logger.info(
-            f"[DISPATCH_EVALUATION] job_id={job_obj.id} "
-            f"service=\"{job_obj.service_category or job_obj.issue_title}\" "
-            f"customer_lat={job_obj.latitude} customer_lng={job_obj.longitude}"
+        # Step 1: Lazy reconciliation of expired offers for this job
+        sweep_job_expired_offers(job_obj)
+
+        # Step 2: Idempotency check: Is there an active unexpired wave running for this job?
+        active_offers = list(
+            WorkforceJobOffer.objects.select_for_update().filter(
+                job=job_obj,
+                status=WorkforceJobOffer.Status.OFFERED,
+                expires_at__gt=now,
+            )
         )
 
-        # Idempotency: Check if an active, non-expired offer already exists
-        active_offer = WorkforceJobOffer.objects.select_for_update().filter(
-            job=job_obj,
-            status=WorkforceJobOffer.Status.OFFERED,
-            expires_at__gt=now,
-        ).first()
+        if active_offers:
+            current_wave_num = active_offers[0].wave_number
+            logger.info(
+                f"[DISPATCH_WAVE_ACTIVE] Job #{job_id} already has active Wave {current_wave_num} "
+                f"with {len(active_offers)} pending offer(s)."
+            )
+            return True, f"Active Wave {current_wave_num} already pending ({len(active_offers)} offers)."
 
-        if active_offer:
-            logger.info(f"[DISPATCH_OFFER_EXISTS] Job #{job_id} already has active offer #{active_offer.id} for Employee #{active_offer.employee_id}.")
-            return True, f"Active offer already pending for Employee #{active_offer.employee_id}."
-
-        # Validate customer booking coordinates
+        # Step 3: Validate customer booking coordinates
         if job_obj.latitude is None or job_obj.longitude is None:
             if job_obj.status != "unassigned":
                 apply_transition(job_obj, "unassigned")
@@ -591,35 +635,38 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
             payload={"job_id": job_obj.id, "service": job_obj.service_category}
         )
 
-        # Find eligible candidate technicians
-        candidates = get_eligible_candidates(job_obj, max_gps_age_seconds=max_gps_age_seconds, exclude_employee_ids=exclude_employee_ids)
+        # Step 4: Find eligible candidate technicians across 0 to 20 km
+        candidates = get_eligible_candidates(
+            job_obj,
+            max_gps_age_seconds=max_gps_age_seconds,
+            radius_km=MAX_DISPATCH_RADIUS_KM,
+            exclude_employee_ids=exclude_employee_ids,
+            check_workload=False,
+        )
 
         WorkforceEventLog.objects.create(
             event_type="CANDIDATES_EVALUATED",
             payload={"job_id": job_obj.id, "eligible_count": len(candidates)}
         )
 
-        # Multi-Ring Wave Selection:
-        # Ring 1: <= 1.0 km
-        # Ring 2: > 1.0 km and <= 2.0 km
-        # Ring 3: > 2.0 km and <= 5.0 km
-        ring1 = [c for c in candidates if c["distance_km"] <= RING_1_MAX_KM]
-        ring2 = [c for c in candidates if RING_1_MAX_KM < c["distance_km"] <= RING_2_MAX_KM]
-        ring3 = [c for c in candidates if RING_2_MAX_KM < c["distance_km"] <= RING_3_MAX_KM]
+        # Step 5: Group candidates by sequential distance wave (1 to 6)
+        wave_groups: Dict[int, List[Dict[str, Any]]] = {w: [] for w in range(1, 7)}
+        for c in candidates:
+            w_num = c.get("wave_number")
+            if w_num and 1 <= w_num <= 6:
+                wave_groups[w_num].append(c)
 
-        top_candidate = None
-        wave_label = ""
-        if ring1:
-            top_candidate = ring1[0]
-            wave_label = "Ring 1 (≤ 1.0 km)"
-        elif ring2:
-            top_candidate = ring2[0]
-            wave_label = "Ring 2 (1.0 - 2.0 km)"
-        elif ring3:
-            top_candidate = ring3[0]
-            wave_label = "Ring 3 (2.0 - 5.0 km)"
+        # Step 6: Select lowest non-empty wave (skip empty waves immediately)
+        target_wave_number = None
+        target_wave_candidates = []
+        for w_idx in range(1, 7):
+            if wave_groups[w_idx]:
+                target_wave_number = w_idx
+                target_wave_candidates = wave_groups[w_idx]
+                break
 
-        if not top_candidate:
+        # Step 7: If all 6 waves are exhausted, escalate to Admin fallback
+        if not target_wave_number or not target_wave_candidates:
             if job_obj.status != "unassigned" or job_obj.assigned_employee is not None:
                 job_obj.status = "unassigned"
                 job_obj.assigned_employee = None
@@ -627,7 +674,7 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
 
             WorkforceEventLog.objects.create(
                 event_type="DISPATCH_ADMIN_FALLBACK",
-                payload={"job_id": job_obj.id, "reason": "ALL_RINGS_EXHAUSTED", "candidates_considered": len(candidates)}
+                payload={"job_id": job_obj.id, "reason": "ALL_WAVES_EXHAUSTED", "candidates_considered": len(candidates)}
             )
 
             admin_user = None
@@ -644,89 +691,90 @@ def dispatch_job(job_id_or_obj, max_gps_age_seconds: int = MAX_GPS_AGE_SECONDS, 
                 WorkforceNotification.objects.create(
                     recipient=admin_user,
                     title="Automatic Dispatch: Awaiting Technician",
-                    message=f"No eligible nearby technician available within 5 km for Job #{job_obj.id} ({service_name}). Job escalated to Admin dispatch.",
+                    message=f"No eligible nearby technician available within 20 km for Job #{job_obj.id} ({service_name}). Job escalated to Admin dispatch.",
                     notification_type="DISPATCH_UNASSIGNED",
                     company=job_obj.company,
                     related_object_id=str(job_obj.id),
                 )
-            return False, "No eligible technicians available for automatic dispatch within 5 km. Job escalated to Admin dispatch."
+            return False, "No eligible technicians available for automatic dispatch within 20 km. Job escalated to Admin dispatch."
 
-        top_emp = top_candidate["employee"]
-        top_dist_km = top_candidate["distance_km"]
-        top_score = top_candidate["score"]
+        # Step 8: Wave Synchronization Constants (computed ONCE outside employee loop)
+        wave_uuid = uuid.uuid4()
+        wave_created_at = timezone.now()
+        wave_expires_at = wave_created_at + timedelta(minutes=DEFAULT_OFFER_DURATION_MINUTES)
+        wave_label = f"Wave {target_wave_number}"
 
-        # Final workload concurrency verification boundary
-        busy_check = get_employee_active_job(top_emp)
-        if busy_check:
-            logger.warning(
-                f"[DISPATCH_REJECT] employee={top_emp.id} job={job_obj.id} "
-                f"reason=EMPLOYEE_ALREADY_BUSY active_job={busy_check.id}"
-            )
-            return False, f"Technician #{top_emp.id} is busy on active Job #{busy_check.id}. Cannot offer Job #{job_obj.id}."
-
-        # Expire any previous offers for this job that might be dangling
-        WorkforceJobOffer.objects.filter(job=job_obj, status=WorkforceJobOffer.Status.OFFERED).update(status=WorkforceJobOffer.Status.EXPIRED)
-
-        # Create new exclusive job offer valid for 5 minutes
-        expires_at = now + timedelta(minutes=DEFAULT_OFFER_DURATION_MINUTES)
-        offer = WorkforceJobOffer.objects.create(
-            job=job_obj,
-            employee=top_emp,
-            status=WorkforceJobOffer.Status.OFFERED,
-            rank_score=top_score,
-            expires_at=expires_at,
-        )
-
-        # Keep ServiceRequest unassigned until candidate accepts via backend atomic transaction
-        if job_obj.status in ["draft", "new_request", "confirmed"]:
+        # Keep ServiceRequest in unassigned status until an employee accepts
+        if job_obj.status in ["draft", "new_request", "received", "confirmed"]:
             apply_transition(job_obj, "unassigned")
 
-        WorkforceEventLog.objects.create(
-            user=top_emp.user,
-            event_type="OFFER_CREATED",
-            payload={
-                "job_id": job_obj.id,
-                "offer_id": offer.id,
-                "employee_id": top_emp.id,
-                "distance_km": round(top_dist_km, 2),
-                "wave": wave_label,
-            }
-        )
+        created_offers = []
+        for cand in target_wave_candidates:
+            cand_emp = cand["employee"]
+            cand_dist = cand["distance_km"]
+            cand_score = cand["score"]
 
-        loc_str = f" at {job_obj.address}" if job_obj.address else ""
-        req_id_str = f" ({job_obj.request_id})" if job_obj.request_id else f" #{job_obj.id}"
-        service_label = job_obj.issue_title or job_obj.service_category or "Service Request"
-        expiry_str = expires_at.strftime("%H:%M:%S UTC")
+            offer = WorkforceJobOffer.objects.create(
+                job=job_obj,
+                employee=cand_emp,
+                status=WorkforceJobOffer.Status.OFFERED,
+                wave_id=wave_uuid,
+                wave_number=target_wave_number,
+                rank_score=cand_score,
+                offered_at=wave_created_at,
+                expires_at=wave_expires_at,
+            )
+            created_offers.append(offer)
 
-        WorkforceNotification.objects.create(
-            recipient=top_emp.user,
-            title="New Job Offer Available!",
-            message=f"You have a new exclusive job offer for '{service_label}'{req_id_str}{loc_str} ({top_dist_km:.1f} km away via {wave_label}). Expiry: {expiry_str}. Open your dashboard to Accept or Decline.",
-            notification_type="JOB_OFFER",
-            company=job_obj.company,
-            related_object_id=str(job_obj.id),
-        )
+            WorkforceEventLog.objects.create(
+                user=cand_emp.user,
+                event_type="OFFER_CREATED",
+                payload={
+                    "job_id": job_obj.id,
+                    "offer_id": offer.id,
+                    "employee_id": cand_emp.id,
+                    "wave_id": str(wave_uuid),
+                    "wave_number": target_wave_number,
+                    "distance_km": round(cand_dist, 3),
+                    "expires_at": wave_expires_at.isoformat(),
+                }
+            )
 
-        logger.info(
-            f"[DISPATCH_DECISION] job={job_obj.id} employee={top_emp.id} "
-            f"distance_km={top_dist_km:.2f} score={top_score:.1f} wave={wave_label} status=OFFER_CREATED"
-        )
-        return True, f"Job #{job_obj.id} offered to {top_emp.user.get_full_name() or top_emp.user.username} ({top_dist_km:.1f}km away via {wave_label}, Score: {top_score:.1f})."
+            loc_str = f" at {job_obj.address}" if job_obj.address else ""
+            req_id_str = f" ({job_obj.request_id})" if job_obj.request_id else f" #{job_obj.id}"
+            service_label = job_obj.issue_title or job_obj.service_category or "Service Request"
+            expiry_str = wave_expires_at.strftime("%H:%M:%S UTC")
+
+            WorkforceNotification.objects.create(
+                recipient=cand_emp.user,
+                title="New Job Offer Available!",
+                message=f"You have a new job offer for '{service_label}'{req_id_str}{loc_str} ({cand_dist:.1f} km away via {wave_label}). Expiry: {expiry_str}. Open your dashboard to review.",
+                notification_type="JOB_OFFER",
+                company=job_obj.company,
+                related_object_id=str(job_obj.id),
+            )
+
+            logger.info(
+                f"[DISPATCH_DECISION] job={job_obj.id} employee={cand_emp.id} wave_id={wave_uuid} "
+                f"wave_number={target_wave_number} distance_km={cand_dist:.3f} score={cand_score:.1f} status=OFFER_CREATED"
+            )
+
+        return True, f"Job #{job_obj.id} dispatched to Wave {target_wave_number} ({len(created_offers)} technicians offered)."
 
 
 def dispatch_next_candidate(job_id_or_obj) -> Tuple[bool, str]:
     """
-    Triggered when an offer is declined or expired:
-    Recalculates eligibility and dispatches to the next nearest candidate.
+    Triggered when a wave expires or all offers in a wave are declined:
+    Advances dispatch to the next appropriate distance wave.
     """
-    logger.info(f"[DISPATCH_FALLBACK] Triggering fallback dispatch for Job #{job_id_or_obj}.")
+    logger.info(f"[DISPATCH_FALLBACK] Triggering next wave dispatch for Job #{job_id_or_obj}.")
     return dispatch_job(job_id_or_obj)
 
 
 def expire_and_reassign_offers() -> int:
     """
     Scans for expired job offers in OFFERED state, marks them EXPIRED,
-    and automatically triggers fallback dispatch for each affected job.
+    and automatically triggers next wave dispatch for jobs whose wave has completed.
     Returns the count of expired offers handled.
     """
     now = timezone.now()
@@ -737,19 +785,36 @@ def expire_and_reassign_offers() -> int:
         ).select_related("job")
     )
 
+    if not expired_offers:
+        return 0
+
+    affected_job_ids = set()
     count = 0
+
     for offer in expired_offers:
         with transaction.atomic():
-            off_locked = WorkforceJobOffer.objects.select_for_update().filter(pk=offer.pk, status=WorkforceJobOffer.Status.OFFERED).first()
+            off_locked = WorkforceJobOffer.objects.select_for_update().filter(
+                pk=offer.pk,
+                status=WorkforceJobOffer.Status.OFFERED,
+            ).first()
             if not off_locked:
                 continue
             off_locked.status = WorkforceJobOffer.Status.EXPIRED
             off_locked.save(update_fields=["status"])
             count += 1
-            logger.info(f"[DISPATCH_OFFER_EXPIRED] Offer #{offer.id} for Job #{offer.job_id} expired. Triggering fallback dispatch.")
+            affected_job_ids.add(offer.job_id)
+            logger.info(f"[DISPATCH_OFFER_EXPIRED] Offer #{offer.id} for Job #{offer.job_id} expired.")
 
-        # Re-dispatch job outside the offer lock transaction
-        dispatch_next_candidate(offer.job_id)
+    # For each affected job, check if any active offers remain; if not, trigger next wave dispatch
+    for j_id in affected_job_ids:
+        has_active_peers = WorkforceJobOffer.objects.filter(
+            job_id=j_id,
+            status=WorkforceJobOffer.Status.OFFERED,
+            expires_at__gt=now,
+        ).exists()
+        if not has_active_peers:
+            logger.info(f"[DISPATCH_WAVE_EXPIRED] All offers for Job #{j_id} expired. Advancing to next wave.")
+            dispatch_job(j_id)
 
     return count
 
@@ -778,7 +843,7 @@ def dispatch_pending_jobs(company_id=None, limit: int = 50) -> Dict[str, Any]:
     # Find all jobs in dispatchable states
     pending_jobs = list(
         qs.exclude(
-            # Exclude jobs that already have an active exclusive offer
+            # Exclude jobs that already have an active unexpired offer
             job_offers__status=WorkforceJobOffer.Status.OFFERED,
             job_offers__expires_at__gt=now,
         ).order_by("-created_at").distinct()[:limit]
@@ -812,7 +877,7 @@ def reconsider_jobs_for_employee(employee_or_id) -> int:
     """
     emp_id = employee_or_id.pk if hasattr(employee_or_id, "pk") else employee_or_id
     emp = Employee.objects.filter(pk=emp_id).first()
-    if not emp or not emp.is_active or not emp.is_online or emp.current_availability != "available" or get_employee_active_job(emp):
+    if not emp or not emp.is_active or not emp.is_online:
         return 0
 
     now = timezone.now()

@@ -1242,22 +1242,19 @@ class WorkforceJobListView(APIView):
             from workforce_api.models import WorkforceJobOffer, WorkforceJobLifecycleEvent, WorkforceWorkExtension, JobPayment
             from workforce_api.services.workload import ACTIVE_QUEUE_STATUSES, WORKLOAD_OCCUPIED_STATUSES
 
-            # 1. Hard Single Active Job Invariant: Check if technician already has an active assignment in queue
-            has_active_job = ServiceRequest.objects.filter(
-                assigned_employee=emp,
-                status__in=WORKLOAD_OCCUPIED_STATUSES
-            ).exists()
+            # Lazy sweep: Mark overdue offers for this employee as EXPIRED
+            WorkforceJobOffer.objects.filter(
+                employee=emp,
+                status=WorkforceJobOffer.Status.OFFERED,
+                expires_at__lte=now,
+            ).update(status=WorkforceJobOffer.Status.EXPIRED)
 
-            if has_active_job:
-                # When technician is occupied with an active job, no new job offers should appear
-                offered_job_ids = []
-            else:
-                # Clean read of valid, unexpired offers exclusively for this employee
-                offered_job_ids = list(WorkforceJobOffer.objects.filter(
-                    employee=emp,
-                    status=WorkforceJobOffer.Status.OFFERED,
-                    expires_at__gt=now
-                ).values_list("job_id", flat=True))
+            # Read valid, unexpired offers exclusively for this employee (visible even if currently busy)
+            offered_job_ids = list(WorkforceJobOffer.objects.filter(
+                employee=emp,
+                status=WorkforceJobOffer.Status.OFFERED,
+                expires_at__gt=now,
+            ).values_list("job_id", flat=True))
 
             try:
                 from service_requests.models import EmployeeJob
@@ -1441,11 +1438,11 @@ class WorkforceJobProofView(APIView):
         completion_notes = request.data.get("notes", "").strip() or request.data.get("completion_notes", "").strip()
         after_presence = request.FILES.get("after_presence_photo") or request.FILES.get("after_selfie") or request.FILES.get("presence_photo")
         after_appliance = request.FILES.get("after_appliance_photo") or request.FILES.get("after_photo")
-        after_work_area = request.FILES.get("after_work_area_photo") or request.FILES.get("during_photo") or request.FILES.get("before_photo")
+        after_work_area = request.FILES.get("after_work_area_photo")
         parts_used = request.data.get("parts_used", [])
 
-        if not after_presence and not after_appliance and not after_work_area:
-            return Response({"error": "After-service completion requires After Face/Identity Selfie or service photo."}, status=status.HTTP_400_BAD_REQUEST)
+        if not after_presence:
+            return Response({"error": "After-service completion requires mandatory After Face Selfie."}, status=status.HTTP_400_BAD_REQUEST)
 
         proof, _ = PostServiceProof.objects.get_or_create(
             job=job,
@@ -2469,20 +2466,19 @@ class WorkforceJobAcceptOfferView(APIView):
 
             now = timezone.now()
 
+            # 1. Offer Expiration check
             if offer and offer.status == WorkforceJobOffer.Status.OFFERED:
                 if offer.expires_at < now:
                     offer.status = WorkforceJobOffer.Status.EXPIRED
-                    offer.save()
+                    offer.save(update_fields=["status"])
                     from workforce_api.services.automatic_dispatch import dispatch_next_candidate
                     dispatch_next_candidate(job_obj)
                     return Response({
                         "error": "Job offer has expired.",
                         "code": "OFFER_EXPIRED"
                     }, status=status.HTTP_409_CONFLICT)
-                offer.status = "ACCEPTED"
-                offer.save()
 
-            # Hard Single Active Job Rule: Check if employee has a conflicting active job
+            # 2. Hard Single Active Job Rule: Check if employee has a conflicting active job
             conflicting = ServiceRequest.objects.filter(
                 assigned_employee=emp,
                 status__in=[
@@ -2497,13 +2493,18 @@ class WorkforceJobAcceptOfferView(APIView):
                     "code": "EMPLOYEE_ALREADY_BUSY"
                 }, status=status.HTTP_409_CONFLICT)
 
-            # Verify technician eligibility if accepting without an existing vetted offer
+            # 3. Verify technician eligibility if accepting without an existing vetted offer
             if not offer:
                 is_eligible, reason, _ = check_technician_eligibility(emp_obj, job_obj.service_category)
                 if not is_eligible and job_obj.issue_title:
                     is_eligible, reason, _ = check_technician_eligibility(emp_obj, job_obj.issue_title)
                 if not is_eligible:
                     return Response({"error": f"Cannot accept offer: {reason}", "code": "INELIGIBLE_TECHNICIAN"}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 4. Mark offer as ACCEPTED now that all gates & workload checks passed
+            if offer and offer.status == WorkforceJobOffer.Status.OFFERED:
+                offer.status = "ACCEPTED"
+                offer.save(update_fields=["status"])
 
             job_obj.assigned_employee = emp_obj
             job_obj.save(update_fields=["assigned_employee"])
@@ -2514,31 +2515,13 @@ class WorkforceJobAcceptOfferView(APIView):
             emp_obj.save(update_fields=["current_availability"])
 
             # Mark all competing OFFERED records for the same job as SUPERSEDED_BY_ACCEPTANCE
-            competing_offers = WorkforceJobOffer.objects.select_for_update().filter(
+            WorkforceJobOffer.objects.select_for_update().filter(
                 job=job_obj,
                 status=WorkforceJobOffer.Status.OFFERED
-            ).exclude(employee=emp_obj)
-
-            for c_off in competing_offers:
-                c_off.status = WorkforceJobOffer.Status.SUPERSEDED_BY_ACCEPTANCE
-                c_off.rejection_reason = f"Job #{job_obj.id} was accepted by another technician."
-                c_off.save(update_fields=["status", "rejection_reason"])
-                if c_off.employee and c_off.employee.user:
-                    WorkforceEventLog.objects.create(
-                        user=c_off.employee.user,
-                        event_type="JOB_OFFER_CLOSED",
-                        payload={
-                            "job_id": job_obj.id,
-                            "offer_id": c_off.id,
-                            "reason": "ALREADY_ACCEPTED",
-                            "accepted_by_other": True,
-                            "message": "Another professional accepted this request. Offer closed automatically."
-                        }
-                    )
-
-            # Mark employee busy
-            emp_obj.current_availability = "busy"
-            emp_obj.save(update_fields=["current_availability"])
+            ).exclude(employee=emp_obj).update(
+                status=WorkforceJobOffer.Status.SUPERSEDED_BY_ACCEPTANCE,
+                rejection_reason=f"Job #{job_obj.id} was accepted by another technician."
+            )
 
             # Supersede all other pending OFFERED jobs for this winning employee
             from workforce_api.services.workload import supersede_other_offers_for_employee
@@ -2977,67 +2960,65 @@ class WorkforceJobRejectOfferView(APIView):
 
         reason = request.data.get("reason", "Technician declined offer.").strip()
 
+        from service_requests.models import EmployeeJob
+        from workforce_api.models import WorkforceEventLog, WorkforceJobOffer
+        from workforce_api.services.automatic_dispatch import dispatch_job, sweep_job_expired_offers
+
         with transaction.atomic():
-            job_obj = ServiceRequest.objects.select_for_update().filter(pk=pk).first()
-            if not job_obj:
-                return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            from service_requests.models import EmployeeJob
-            from workforce_api.models import WorkforceEventLog
-
             offer = WorkforceJobOffer.objects.select_for_update().filter(
-                job=job_obj,
+                job_id=pk,
                 employee=emp
             ).order_by("-id").first()
 
             if offer:
-                offer.status = "REJECTED"
+                offer.status = "DECLINED"
                 offer.rejection_reason = reason
                 offer.save(update_fields=["status", "rejection_reason"])
             else:
                 WorkforceJobOffer.objects.create(
-                    job=job_obj,
+                    job=job,
                     employee=emp,
-                    status="REJECTED",
+                    status="DECLINED",
                     rejection_reason=reason,
                     expires_at=timezone.now()
                 )
 
-            if job_obj.assigned_employee == emp:
-                job_obj.assigned_employee = None
-                job_obj.save(update_fields=["assigned_employee"])
-
             # Clean up / remove any uncompleted EmployeeJob records for this declining employee
             EmployeeJob.objects.filter(
-                service_request=job_obj,
+                service_request=job,
                 employee=emp
             ).exclude(status="COMPLETED").delete()
 
             WorkforceEventLog.objects.create(
                 user=emp.user,
                 event_type="OFFER_REJECTED",
-                payload={"job_id": job_obj.id, "employee_id": emp.id, "reason": reason}
+                payload={"job_id": job.id, "employee_id": emp.id, "reason": reason}
             )
 
-            # Trigger immediate dispatch to next ranked technician
-            success, msg = run_automatic_dispatch(job_obj)
+        # Outside offer lock transaction: Lazy sweep expired offers for this job
+        sweep_job_expired_offers(job)
 
-            # Ensure job is properly marked unassigned if no other candidate received it
-            job_obj.refresh_from_db()
-            has_new_offer = WorkforceJobOffer.objects.filter(
-                job=job_obj,
-                status="OFFERED",
-                expires_at__gt=timezone.now()
-            ).exists()
-            if not has_new_offer and job_obj.assigned_employee is None and job_obj.status == "assigned":
-                job_obj.status = "unassigned"
-                job_obj.save(update_fields=["status"])
+        now = timezone.now()
+        # Check if other candidates in the current wave remain OFFERED and unexpired
+        has_active_peers = WorkforceJobOffer.objects.filter(
+            job=job,
+            status=WorkforceJobOffer.Status.OFFERED,
+            expires_at__gt=now
+        ).exists()
 
-            return Response({
-                "message": f"Job offer declined. Next candidate dispatch status: {msg}",
-                "job_id": job_obj.id,
-                "status": job_obj.status,
-            }, status=status.HTTP_200_OK)
+        if has_active_peers:
+            msg = "Offer declined. Active candidates remain in current wave."
+            logger.info(f"[DISPATCH_WAVE_HOLD] Job #{job.id}: Employee #{emp.id} declined, wave peers remain active.")
+        else:
+            # All candidates in current wave are declined or expired -> advance to next wave!
+            logger.info(f"[DISPATCH_WAVE_EXHAUSTED] Job #{job.id}: All wave candidates declined/expired. Advancing to next wave.")
+            success, msg = dispatch_job(job)
+
+        return Response({
+            "message": f"Job offer declined. Dispatch status: {msg}",
+            "job_id": job.id,
+            "status": job.status,
+        }, status=status.HTTP_200_OK)
 
 
 class WorkforceAutoDispatchTriggerView(APIView):
@@ -6140,6 +6121,8 @@ class WorkforceJobArriveView(APIView):
 
         lat = request.data.get("lat") if request.data.get("lat") is not None else request.data.get("latitude")
         lon = request.data.get("lon") if request.data.get("lon") is not None else (request.data.get("longitude") or request.data.get("lng"))
+        accuracy = request.data.get("accuracy")
+        timestamp = request.data.get("timestamp") or request.data.get("gps_timestamp")
 
         try:
             lat_val = float(lat)
@@ -6153,6 +6136,59 @@ class WorkforceJobArriveView(APIView):
             return Response({
                 "error": "GPS coordinates out of valid range (-90 to 90 lat, -180 to 180 lon)."
             }, status=status.HTTP_400_BAD_REQUEST)
+
+        if lat_val == 0.0 and lon_val == 0.0:
+            return Response({
+                "error": "Invalid zero GPS coordinates (0.0, 0.0).",
+                "code": "INVALID_COORDINATES",
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate accuracy threshold for geofence verification
+        if accuracy is not None:
+            try:
+                acc_val = float(accuracy)
+                if acc_val > 100.0:
+                    return Response({
+                        "error": f"Arrival rejected: GPS accuracy too low ({int(acc_val)}m > 100m required for geofence verification).",
+                        "code": "GPS_ACCURACY_TOO_LOW",
+                        "details": {"accuracy": acc_val, "required_max": 100.0}
+                    }, status=status.HTTP_400_BAD_REQUEST)
+            except (ValueError, TypeError):
+                pass
+
+        now = timezone.now()
+
+        # Validate timestamp freshness and future skew
+        if timestamp is not None:
+            try:
+                from django.utils.dateparse import parse_datetime
+                if isinstance(timestamp, (int, float)) or (isinstance(timestamp, str) and str(timestamp).replace('.', '', 1).isdigit()):
+                    ts_num = float(timestamp)
+                    if ts_num > 1e11:
+                        ts_num /= 1000.0
+                    from datetime import datetime, timezone as dt_tz
+                    gps_dt = datetime.fromtimestamp(ts_num, tz=dt_tz.utc)
+                else:
+                    gps_dt = parse_datetime(str(timestamp))
+                    if gps_dt and timezone.is_naive(gps_dt):
+                        gps_dt = timezone.make_aware(gps_dt)
+
+                if gps_dt:
+                    age_seconds = (now - gps_dt).total_seconds()
+                    if age_seconds < -60:
+                        return Response({
+                            "error": "Arrival rejected: GPS timestamp is future-dated beyond allowable clock skew.",
+                            "code": "GPS_TIMESTAMP_FUTURE_DATED",
+                            "details": {"gps_age_seconds": round(age_seconds, 1)}
+                        }, status=status.HTTP_400_BAD_REQUEST)
+                    if age_seconds > 300:
+                        return Response({
+                            "error": f"Arrival rejected: Device GPS fix is stale ({int(age_seconds)}s old). Please capture a fresh GPS fix.",
+                            "code": "GPS_STALE",
+                            "details": {"gps_age_seconds": round(age_seconds, 1)}
+                        }, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                pass
 
         # Real GPS Arrival Geofencing: Compare Employee GPS against Customer Job Location
         from time_tracking.geo import haversine_distance, evaluate
@@ -6192,15 +6228,9 @@ class WorkforceJobArriveView(APIView):
             distance_m = decision.distance_m
             matched_location = decision.matched_location.name if decision.matched_location else "Job Site"
 
-        now = timezone.now()
-
         verification, _ = PreServiceVerification.objects.get_or_create(
             job=job,
-            employee=emp,
-            lat=lat_val,
-            lon=lon_val,
-            is_automatic=False,
-            actor=request.user
+            defaults={"employee": emp}
         )
 
         # ── Authoritative Single OTP Resolution ──────────────────────────────
