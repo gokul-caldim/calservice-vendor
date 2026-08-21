@@ -215,13 +215,6 @@ export async function apiCollectJobCash(jobId, amountReceived) {
   });
 }
 
-export async function apiVerifyPaymentOTP(jobId, otp) {
-  return await apiRequest(`/workforce/jobs/${jobId}/payment/verify-otp/`, {
-    method: 'POST',
-    json: { otp },
-  });
-}
-
 export async function apiGetCustomerJobPayment(jobId) {
   return await apiRequest(`/workforce/customer/jobs/${jobId}/payment/`);
 }

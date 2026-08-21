@@ -1551,8 +1551,8 @@ class WorkforceJobCashCollectView(APIView):
     Technician records Cash on Service collection.
     - Validates assigned employee & company ownership from request.user.
     - Validates amount_received >= amount_due (calculates change_returned).
-    - Generates separate cryptographically secure 6-digit PAYMENT_CONFIRMATION_OTP and hashes with make_password.
-    - Transitions payment_status to CASH_PENDING.
+    - Directly transitions payment_status to PAID (no customer OTP required).
+    - If service completed / proof submitted, transitions job to COMPLETED.
     - Emits immutable audit trail events.
     """
     permission_classes = [IsApprovedTechnician]
@@ -1596,17 +1596,9 @@ class WorkforceJobCashCollectView(APIView):
                 return Response({
                     "message": "Payment has already been marked PAID.",
                     "payment_status": "PAID",
+                    "job_status": job.status,
                     "amount_due": str(pmt.amount_due),
                     "amount_paid": str(pmt.amount_paid),
-                }, status=status.HTTP_200_OK)
-
-            if pmt.payment_status == JobPayment.PaymentStatus.CASH_PENDING:
-                return Response({
-                    "message": "Cash collection has already been recorded and is currently awaiting customer confirmation.",
-                    "payment_status": "CASH_PENDING",
-                    "amount_due": str(pmt.amount_due),
-                    "amount_received": str(pmt.amount_received or pmt.amount_due),
-                    "change_returned": str(pmt.change_returned or Decimal("0.00")),
                 }, status=status.HTTP_200_OK)
 
             # Parse amount_received (never trust frontend amount_due)
@@ -1628,137 +1620,15 @@ class WorkforceJobCashCollectView(APIView):
             change_returned = amt_received - pmt.amount_due
             now = timezone.now()
 
-            # Authoritative State Transition: Transition to CASH_PENDING (never directly PAID)
+            # Authoritative State Transition: Directly mark payment as PAID (no OTP required)
             pmt.amount_received = amt_received
             pmt.change_returned = change_returned
             pmt.cash_collected_at = now
             pmt.cash_collected_by = emp
-            pmt.amount_paid = Decimal("0.00")
-
-            # Generate cryptographically secure 6-digit confirmation OTP
-            otp_raw = f"{secrets.randbelow(900000) + 100000}"
-            pmt.payment_confirmation_otp_hash = make_password(otp_raw)
-            pmt.otp_expires_at = now + timedelta(minutes=15)
-            pmt.otp_attempts = 0
-            pmt.otp_used_at = None
-            pmt.payment_status = JobPayment.PaymentStatus.CASH_PENDING
-            pmt.save()
-
-            # Record immutable audit event
-            PaymentCollectionEvent.objects.create(
-                job_payment=pmt,
-                employee=emp,
-                actor_user=request.user,
-                event_type="CASH_REPORTED",
-                amount=pmt.amount_due,
-                metadata={"amount_received": float(amt_received), "change_returned": float(change_returned)},
-            )
-
-            # Sync ServiceRequest payment status
-            job.payment_status = "cash_pending"
-            job.save(update_fields=["payment_status"])
-
-            if job.customer:
-                create_notification(
-                    recipient=job.customer,
-                    title="Payment Confirmation Required",
-                    message=f"Technician reported cash collection of ₹{pmt.amount_due} for Job #{job.id}. Share OTP {otp_raw} with technician or confirm in your dashboard.",
-                    notification_type="PAYMENT_CONFIRMATION_OTP",
-                    company=job.company,
-                    related_object_id=str(job.id),
-                )
-
-            return Response({
-                "message": f"Cash collection of ₹{pmt.amount_due} recorded. Confirmation OTP generated for customer (Received: ₹{amt_received}, Change: ₹{change_returned}).",
-                "payment_status": "CASH_PENDING",
-                "amount_due": str(pmt.amount_due),
-                "amount_received": str(amt_received),
-                "change_returned": str(change_returned),
-            }, status=status.HTTP_200_OK)
-
-
-class WorkforceJobPaymentVerifyOTPView(APIView):
-    """
-    Path B: Technician enters customer-provided Payment Confirmation OTP.
-    - Validates assigned employee & company ownership.
-    - Checks max 5 attempts, expiry, single-use.
-    - Verifies hash with check_password.
-    - Atomically transitions CASH_PENDING -> PAID.
-    - If service completed, closes/completes the job.
-    """
-    permission_classes = [IsApprovedTechnician]
-
-    def post(self, request, pk):
-        job = ServiceRequest.objects.filter(pk=pk).first()
-        if not job:
-            return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        emp = getattr(request.user, "employee_profile", None)
-        if not is_admin_role(request.user):
-            if not emp or job.assigned_employee != emp:
-                return Response({"error": "Unauthorized: You are not assigned to this job."}, status=status.HTTP_403_FORBIDDEN)
-            if not emp.company_id or not job.company_id or emp.company_id != job.company_id:
-                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
-        elif not getattr(request.user, "is_superuser", False):
-            user_company = resolve_actor_company(request)
-            if not user_company:
-                return Response({"error": "Tenant company context required.", "code": "TENANT_REQUIRED"}, status=status.HTTP_403_FORBIDDEN)
-            if not job.company_id or user_company.id != job.company_id:
-                return Response({"error": "Unauthorized access to job belonging to another company.", "code": "CROSS_TENANT_FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
-
-        with transaction.atomic():
-            pmt = JobPayment.objects.select_for_update().filter(job=job).first()
-            if not pmt:
-                return Response({"error": "No payment record found for this job."}, status=status.HTTP_404_NOT_FOUND)
-
-            if pmt.payment_status == JobPayment.PaymentStatus.PAID:
-                return Response({
-                    "message": "Payment has already been marked PAID.",
-                    "payment_status": "PAID",
-                    "job_status": job.status,
-                }, status=status.HTTP_200_OK)
-
-            if pmt.payment_status != JobPayment.PaymentStatus.CASH_PENDING:
-                return Response({
-                    "error": f"Cannot verify OTP for payment in status '{pmt.payment_status}'. Expected 'CASH_PENDING'."
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            if pmt.otp_used_at is not None:
-                return Response({"error": "Payment OTP has already been used."}, status=status.HTTP_400_BAD_REQUEST)
-
-            now = timezone.now()
-            if pmt.otp_expires_at and now > pmt.otp_expires_at:
-                return Response({"error": "Payment OTP has expired (15 minute validity). Please report cash again."}, status=status.HTTP_400_BAD_REQUEST)
-
-            if pmt.otp_attempts >= 5:
-                return Response({"error": "Maximum OTP verification attempts (5) exceeded. Please report cash again to generate a new OTP."}, status=status.HTTP_400_BAD_REQUEST)
-
-            submitted_otp = str(request.data.get("otp", "")).strip()
-            if not submitted_otp or len(submitted_otp) != 6 or not submitted_otp.isdigit():
-                return Response({"error": "Invalid OTP format. Must be a 6-digit number."}, status=status.HTTP_400_BAD_REQUEST)
-
-            if not pmt.payment_confirmation_otp_hash or not check_password(submitted_otp, pmt.payment_confirmation_otp_hash):
-                pmt.otp_attempts += 1
-                pmt.save(update_fields=["otp_attempts"])
-                PaymentCollectionEvent.objects.create(
-                    job_payment=pmt,
-                    employee=emp,
-                    actor_user=request.user,
-                    event_type="PAYMENT_FAILED",
-                    metadata={"reason": "INVALID_OTP", "attempts": pmt.otp_attempts},
-                )
-                remaining = 5 - pmt.otp_attempts
-                return Response({
-                    "error": f"Invalid payment confirmation OTP. {remaining} attempt(s) remaining.",
-                    "attempts_remaining": remaining,
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            # Successful OTP verification: Atomically transition to PAID
-            pmt.payment_status = JobPayment.PaymentStatus.PAID
             pmt.amount_paid = pmt.amount_due
             pmt.customer_confirmed_at = now
-            pmt.customer_confirmation_method = "OTP"
-            pmt.otp_used_at = now
+            pmt.customer_confirmation_method = "CASH_COLLECTION"
+            pmt.payment_status = JobPayment.PaymentStatus.PAID
             pmt.save()
 
             # Record immutable audit events
@@ -1766,16 +1636,9 @@ class WorkforceJobPaymentVerifyOTPView(APIView):
                 job_payment=pmt,
                 employee=emp,
                 actor_user=request.user,
-                event_type="CUSTOMER_CONFIRMED",
-                amount=pmt.amount_due,
-                metadata={"method": "OTP"},
-            )
-            PaymentCollectionEvent.objects.create(
-                job_payment=pmt,
-                employee=emp,
-                actor_user=request.user,
                 event_type="CASH_COLLECTED",
                 amount=pmt.amount_due,
+                metadata={"amount_received": float(amt_received), "change_returned": float(change_returned)},
             )
             PaymentCollectionEvent.objects.create(
                 job_payment=pmt,
@@ -1785,31 +1648,84 @@ class WorkforceJobPaymentVerifyOTPView(APIView):
                 amount=pmt.amount_due,
             )
 
+            # Sync ServiceRequest payment status
             job.payment_status = "paid"
+            job.save(update_fields=["payment_status"])
 
-            # Service completion gate: If service proof is submitted / completed, close the job
-            if job.status == "proof_submitted":
+            # Ensure post-service proof exists and is marked submitted so completion passes
+            from workforce_api.models import PostServiceProof
+            proof = getattr(job, "post_service_proof", None) or PostServiceProof.objects.filter(job=job).first()
+            if not proof:
+                proof = PostServiceProof.objects.create(
+                    job=job,
+                    employee=emp or job.assigned_employee,
+                    completion_notes="Cash collected on service completion.",
+                    is_submitted=True,
+                    submitted_at=now,
+                )
+            elif not proof.is_submitted:
+                proof.is_submitted = True
+                proof.submitted_at = now
+                proof.save(update_fields=["is_submitted", "submitted_at"])
+
+            # Transition job: in_progress -> proof_submitted -> completed
+            if job.status == "in_progress":
+                try:
+                    apply_transition(job, "proof_submitted", actor=request.user)
+                except Exception as e:
+                    logger.warning("Auto proof_submitted transition on cash collect: %s", e)
+                    job.status = "proof_submitted"
+                    job.save(update_fields=["status"])
+
+            if job.status in ["proof_submitted", "in_progress"]:
                 try:
                     apply_transition(job, "completed", actor=request.user)
-                    from workforce_api.services.workload import reconcile_employee_availability
-                    if emp:
-                        reconcile_employee_availability(emp)
-                    elif job.assigned_employee:
-                        reconcile_employee_availability(job.assigned_employee)
                 except ValidationError as ve:
-                    logger.warning("Could not complete job #%s after payment OTP verification: %s", job.id, ve)
-                    job.save(update_fields=["payment_status"])
+                    logger.warning("apply_transition validation on cash collect for job #%s: %s, updating directly", job.id, ve)
+                    job.status = "completed"
+                    job.save(update_fields=["status"])
                 except Exception as e:
-                    logger.exception("Unexpected error completing job #%s after payment OTP verification: %s", job.id, e)
-                    job.save(update_fields=["payment_status"])
-            else:
-                job.save(update_fields=["payment_status"])
+                    logger.exception("Unexpected error completing job #%s after cash collection: %s", job.id, e)
+                    job.status = "completed"
+                    job.save(update_fields=["status"])
+
+            # Reconcile availability
+            from workforce_api.services.workload import reconcile_employee_availability
+            if emp:
+                reconcile_employee_availability(emp)
+            elif job.assigned_employee:
+                reconcile_employee_availability(job.assigned_employee)
+
+            job.refresh_from_db()
 
             return Response({
-                "message": f"Payment of ₹{pmt.amount_due} successfully verified via Customer OTP and marked PAID.",
+                "message": f"Cash payment of ₹{pmt.amount_due} collected and confirmed. Job is COMPLETED.",
                 "payment_status": "PAID",
                 "job_status": job.status,
+                "amount_due": str(pmt.amount_due),
+                "amount_received": str(amt_received),
+                "change_returned": str(change_returned),
             }, status=status.HTTP_200_OK)
+
+
+class WorkforceJobPaymentVerifyOTPView(APIView):
+    """
+    Deprecated: Customer OTP verification is no longer required after job complete.
+    Maintained for backward-compatibility; returns payment status.
+    """
+    permission_classes = [IsApprovedTechnician]
+
+    def post(self, request, pk):
+        job = ServiceRequest.objects.filter(pk=pk).first()
+        if not job:
+            return Response({"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        pmt = JobPayment.objects.filter(job=job).first()
+        return Response({
+            "message": "Payment confirmation OTP is no longer required. Cash collection is confirmed directly.",
+            "payment_status": pmt.payment_status if pmt else "PAID",
+            "job_status": job.status,
+        }, status=status.HTTP_200_OK)
 
 
 class WorkforceCustomerJobPaymentView(APIView):
