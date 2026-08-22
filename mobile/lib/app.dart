@@ -64,7 +64,7 @@ class _AppState extends ConsumerState<App> with WidgetsBindingObserver {
     );
 
     return MaterialApp.router(
-      title: 'CalServices Vendor',
+      title: 'Sevo',
       debugShowCheckedModeBanner: false,
       theme: themeData,
       routerConfig: router,

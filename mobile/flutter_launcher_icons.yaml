@@ -1,0 +1,7 @@
+flutter_launcher_icons:
+  android: "ic_launcher"
+  ios: false
+  image_path: "sevo_logo.png"
+  min_sdk_android: 21
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "sevo_logo.png"
